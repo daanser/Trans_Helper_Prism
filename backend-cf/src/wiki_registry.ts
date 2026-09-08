@@ -32,7 +32,7 @@ export const DEFAULT_WIKIS: readonly WikiConfig[] = [
   {
     id: "mtf-wiki",
     repo: "project-trans/MtF-wiki",
-    branch: "main",
+    branch: "master", // MtF-wiki 默认分支是 master（实测 via GitHub defaultBranch）
     content_dir: "content/zh-cn",
     site_url: "https://mtf.wiki",
   },

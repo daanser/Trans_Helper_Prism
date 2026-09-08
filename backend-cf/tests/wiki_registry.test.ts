@@ -51,8 +51,14 @@ describe("四库默认配置", () => {
     expect(byId.get("ftm-wiki")).toMatchObject({ repo: "project-trans/FtM-wiki", content_dir: "content" })
     expect(byId.get("rle-wiki")).toMatchObject({ repo: "project-trans/rle-wiki", content_dir: "docs" })
     expect(byId.get("miomtfwiki")).toMatchObject({ repo: "KitsuMio/MioMtFWiki", content_dir: "docs" })
-    // branch 全为 main（plan.md §7.2）
-    for (const w of DEFAULT_WIKIS) expect(w.branch).toBe("main")
+    // 分支：MtF-wiki 实测默认分支为 master（GitHub defaultBranch），其余为 main。
+    const branchById: Record<string, string> = {
+      "mtf-wiki": "master",
+      "ftm-wiki": "main",
+      "rle-wiki": "main",
+      miomtfwiki: "main",
+    }
+    for (const w of DEFAULT_WIKIS) expect(w.branch).toBe(branchById[w.id])
   })
 })
 
