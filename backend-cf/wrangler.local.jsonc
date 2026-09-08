@@ -1,0 +1,53 @@
+// 本地联调专用。已启用 miniflare 本地模拟绑定（D1/KV/Queue LOCAL，不连线上、不部署）：
+//   - D1：本地 SQLite（.wrangler/state 持久化），用 wrangler d1 execute --local 初始化 schema
+//   - KV：本地内存持久化
+//   - Queue：本地队列（scheduled 发消息 → queue consumer 可在本地 worker 内触发）
+// 目的：在本地 workerd 里完整验证 scheduled / queue / D1 / bigram 回退 / 增量 ingestion 链路。
+// 生产用 wrangler.jsonc（已配线上 D1/KV/Queue ID），此文件仅本地。
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "transhelper-prism-backend-local",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-02-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "transhelper-prism-local",
+      "database_id": "local-d1"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "SEARCH_CACHE",
+      "id": "local-kv"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "INGEST_QUEUE",
+        "queue": "transhelper-prism-ingest-local"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "transhelper-prism-ingest-local",
+        "max_batch_size": 10,
+        "max_retries": 3,
+        "dead_letter_queue": "transhelper-prism-ingest-dlq-local"
+      }
+    ]
+  },
+  "triggers": {
+    "crons": ["1 0 * * *"]
+  },
+  "vars": {
+    "ALLOWED_ORIGINS": "http://localhost:3000,http://127.0.0.1:3000",
+    "EMBEDDING_ENDPOINT": "https://api.siliconflow.cn/v1/embeddings",
+    "EMBEDDING_MODEL": "BAAI/bge-m3",
+    "EMBEDDING_DIM": "1024",
+    "RERANK_ENDPOINT": "https://api.siliconflow.cn/v1/rerank",
+    "RERANK_MODEL": "BAAI/bge-reranker-v2-m3"
+  }
+}

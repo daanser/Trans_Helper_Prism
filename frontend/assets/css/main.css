@@ -1,0 +1,197 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   TransHelper Prism — 全局现代设计系统样式表
+   - 温润、专业、清晰、高可读性
+   - 彻底摒弃全大写终端伪极客风与死寂纯黑白
+   - 采用低饱和、高雅质感的微色彩辅助体系（玫瑰粉、沉静蓝、淡紫罗兰、鼠尾草绿） */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --bg-canvas: #F8FAFC;
+  --bg-subtle: #F1F5F9;
+  --bg-surface: #FFFFFF;
+  --bg-surface-hover: #F8FAFC;
+  --border-color: #E2E8F0;
+  --border-color-hover: #CBD5E1;
+
+  --text-title: #0F172A;
+  --text-body: #334155;
+  --text-sub: #64748B;
+  --text-muted: #94A3B8;
+
+  --primary: #2563EB;
+  --primary-hover: #1D4ED8;
+  --primary-subtle: #EFF6FF;
+
+  --danger: #EF4444;
+  --danger-subtle: #FEF2F2;
+
+  --scrollbar-bg: #F8FAFC;
+  --scrollbar-thumb: #CBD5E1;
+  --scrollbar-thumb-hover: #94A3B8;
+}
+
+:root.dark {
+  color-scheme: dark;
+  --bg-canvas: #0B1120;
+  --bg-subtle: #111B2E;
+  --bg-surface: #172338;
+  --bg-surface-hover: #1E2D47;
+  --border-color: #243452;
+  --border-color-hover: #33476E;
+
+  --text-title: #F8FAFC;
+  --text-body: #CBD5E1;
+  --text-sub: #94A3B8;
+  --text-muted: #64748B;
+
+  --primary: #3B82F6;
+  --primary-hover: #60A5FA;
+  --primary-subtle: rgba(59, 130, 246, 0.15);
+
+  --danger: #F87171;
+  --danger-subtle: rgba(239, 68, 68, 0.15);
+
+  --scrollbar-bg: #0B1120;
+  --scrollbar-thumb: #243452;
+  --scrollbar-thumb-hover: #33476E;
+}
+
+body {
+  @apply min-h-screen font-sans;
+  background-color: var(--bg-canvas);
+  color: var(--text-body);
+  transition: background-color 0.2s ease, color 0.2s ease;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 统一细致滚动条 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+  background-color: var(--scrollbar-bg);
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar-thumb);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scrollbar-thumb-hover);
+}
+
+* {
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-bg);
+  scrollbar-width: thin;
+}
+
+/* 检索摘要高亮与排版 */
+.snippet-reading {
+  font-size: 0.875rem;
+  line-height: 1.75;
+  color: var(--text-body);
+  word-break: break-word;
+}
+
+.snippet-reading p {
+  margin-bottom: 0.5rem;
+}
+
+.snippet-reading p:last-child {
+  margin-bottom: 0;
+}
+
+.snippet-reading mark {
+  background-color: rgba(59, 130, 246, 0.14);
+  color: var(--primary);
+  font-weight: 600;
+  padding: 0.1rem 0.3rem;
+  border-radius: 4px;
+}
+
+.dark .snippet-reading mark {
+  background-color: rgba(59, 130, 246, 0.28);
+  color: #93C5FD;
+}
+
+.snippet-reading a {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  transition: color 0.15s ease;
+}
+
+.snippet-reading a:hover {
+  color: var(--primary-hover);
+}
+
+.snippet-reading code {
+  font-family: var(--font-mono, monospace);
+  font-size: 0.8125rem;
+  background-color: var(--bg-subtle);
+  border: 1px solid var(--border-color);
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  color: var(--text-title);
+}
+
+.snippet-reading pre {
+  background-color: var(--bg-subtle);
+  border: 1px solid var(--border-color);
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0.5rem 0;
+}
+
+.snippet-reading blockquote {
+  border-left: 3px solid var(--primary);
+  padding-left: 0.875rem;
+  margin: 0.5rem 0;
+  color: var(--text-sub);
+  background-color: var(--bg-subtle);
+  padding-top: 0.4rem;
+  padding-bottom: 0.4rem;
+  border-radius: 0 4px 4px 0;
+}
+
+.snippet-reading ul {
+  list-style-type: disc;
+  padding-left: 1.25rem;
+  margin: 0.4rem 0;
+}
+
+.snippet-reading ol {
+  list-style-type: decimal;
+  padding-left: 1.25rem;
+  margin: 0.4rem 0;
+}
+
+.snippet-reading li {
+  margin-bottom: 0.25rem;
+}
+
+.snippet-reading table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.5rem 0;
+  font-size: 0.8125rem;
+}
+
+.snippet-reading th,
+.snippet-reading td {
+  border: 1px solid var(--border-color);
+  padding: 0.4rem 0.75rem;
+  text-align: left;
+}
+
+.snippet-reading th {
+  background-color: var(--bg-subtle);
+  font-weight: 600;
+  color: var(--text-title);
+}

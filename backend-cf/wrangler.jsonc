@@ -1,0 +1,50 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "transhelper-prism-backend",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-02-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "transhelper-prism",
+      "database_id": "57ade785-2c26-4050-926c-d3f96abe3c7b"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "SEARCH_CACHE",
+      "id": "08db2f7b6a1344b89d3c148b7ffda74f"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "INGEST_QUEUE",
+        "queue": "transhelper-prism-ingest"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "transhelper-prism-ingest",
+        "max_batch_size": 10,
+        "max_retries": 3,
+        "dead_letter_queue": "transhelper-prism-ingest-dlq"
+      }
+    ]
+  },
+  "triggers": {
+    "crons": ["1 0 * * *"]
+  },
+  "vars": {
+    "ALLOWED_ORIGINS": "*",
+    "EMBEDDING_ENDPOINT": "https://api.siliconflow.cn/v1/embeddings",
+    "EMBEDDING_MODEL": "BAAI/bge-m3",
+    "EMBEDDING_DIM": "1024",
+    "RERANK_ENDPOINT": "https://api.siliconflow.cn/v1/rerank",
+    "RERANK_MODEL": "BAAI/bge-reranker-v2-m3"
+  }
+}

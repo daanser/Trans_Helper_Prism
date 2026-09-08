@@ -1,0 +1,29 @@
+# ── Secrets（绝不提交 key/环境变量）──
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# ── 废弃旧项目（含真实 key 文件，公开仓库排除）──
+old-Trans-Search/
+
+# ── 依赖 / 构建产物 ──
+node_modules/
+dist/
+.wrangler/
+.npm-cache/
+coverage/
+*.log
+
+# ── OS / IDE ──
+.DS_Store
+.vscode/
+.idea/
+
+# 运行时状态（checkpoint 等）
+.ingest/

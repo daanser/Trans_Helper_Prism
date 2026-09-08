@@ -1,0 +1,22 @@
+# Dependencies / build
+node_modules/
+dist/
+.wrangler/
+.npm-cache/
+coverage/
+
+# Environment secrets (never commit keys)
+.env
+.env.*
+!.env.example
+.dev.vars
+!.dev.vars.example
+
+# Build / test artifacts
+coverage/
+*.log
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/

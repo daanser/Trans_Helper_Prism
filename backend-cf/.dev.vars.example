@@ -1,0 +1,17 @@
+# ── 必填：Worker 运行所需的环境变量 / secrets ──────────────────
+# keypool 复用这两组 secrets（Key 一律来自 secrets，绝不硬编码/落日志）。
+# embed_pool 与 llm_pool 各放一批 key，逗号分隔（key 只存 secret，不落库明文）。
+EMBED_POOL_KEYS=sk-xxxx,sk-yyyy
+LLM_POOL_KEYS=sk-aaaa,sk-bbbb
+
+# ── Qdrant Cloud（可选，M0 探测用）──────────────────────────
+QDRANT_URL=https://your-cluster.cloud.qdrant.io:6333
+QDRANT_API_KEY=your_qdrant_api_key
+
+# ── 可选覆盖 ────────────────────────────────────────────────
+ADMIN_API_KEY=your_admin_key
+ALLOWED_ORIGINS=http://localhost,http://127.0.0.1
+
+# 只用于 scripts/probe-connectivity.ts（本地运行时读环境变量，非 Worker secret）
+PROBE_SILICONFLOW_API_KEY=sk-xxxx
+# 注意：绝不可把真实 key 提交到仓库；.dev.vars 与 .env 均被 .gitignore 排除。

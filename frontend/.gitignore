@@ -1,0 +1,15 @@
+# Nuxt / Node
+node_modules
+.nuxt
+.output
+.data
+dist
+
+# npm cache (local, used as fallback for this workspace)
+.npm-cache
+
+# Logs
+*.log
+
+# OS
+.DS_Store
