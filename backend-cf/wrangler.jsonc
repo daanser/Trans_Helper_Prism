@@ -40,7 +40,7 @@
     "crons": ["1 0 * * *"]
   },
   "vars": {
-    "ALLOWED_ORIGINS": "*",
+    "ALLOWED_ORIGINS": "https://search.chengxi.moe,https://transhelper-prism.pages.dev",
     "EMBEDDING_ENDPOINT": "https://api.siliconflow.cn/v1/embeddings",
     "EMBEDDING_MODEL": "BAAI/bge-m3",
     "EMBEDDING_DIM": "1024",
