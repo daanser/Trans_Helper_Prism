@@ -33,8 +33,14 @@ export default defineNuxtConfig({
     head: {
       title: "TransHelper Prism",
       meta: [
-        { name: "description", content: "多 wiki 语义搜索引擎 — Project Trans" },
+        { name: "description", content: "TransHelper Prism — 跨性别与性少数中文 wiki 聚合语义检索" },
         { name: "theme-color", content: "#ede4cf" },
+        // 社交分享（Discord / 即时通讯等）统一用中性、准确的文案
+        { property: "og:title", content: "TransHelper Prism" },
+        { property: "og:description", content: "跨性别与性少数中文 wiki 聚合语义检索，覆盖 MtF / FtM / RLE / Mio 四部知识库。" },
+        { property: "og:site_name", content: "TransHelper Prism" },
+        { property: "og:type", content: "website" },
+        { property: "og:image", content: "/logo_foreground.svg" },
       ],
 
       link: [{ rel: "icon", type: "image/svg+xml", href: "/favicon.svg" }],
