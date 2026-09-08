@@ -109,3 +109,81 @@ describe("GET /api/v1/tree/:wiki_id", () => {
     expect(resp.status).toBe(502)
   })
 })
+
+// ── /api/v1/admin/ingest/trigger（T2.2 运维入口）──
+describe("POST /api/v1/admin/ingest/trigger", () => {
+  function adminEnv(): Env {
+    const del = vi.fn(async () => ({}))
+    const send = vi.fn(async () => undefined)
+    return {
+      DB: {
+        prepare: vi.fn(() => ({ bind: vi.fn(() => ({ run: del })) })),
+      } as unknown as Env["DB"],
+      INGEST_QUEUE: { send } as unknown as Env["INGEST_QUEUE"],
+      ADMIN_API_KEY: "admin-secret",
+      SEARCH_CACHE: undefined as never,
+      QDRANT_URL: undefined,
+    } as unknown as Env
+  }
+
+  it("未配置 ADMIN_API_KEY → 503", async () => {
+    const env = { ...adminEnv(), ADMIN_API_KEY: undefined as never } as Env
+    const resp = await app.request(
+      "/api/v1/admin/ingest/trigger?wiki_id=mtf-wiki",
+      { method: "POST", headers: { Authorization: "Bearer admin-secret" } },
+      env,
+    )
+    expect(resp.status).toBe(503)
+    expect(await resp.json()).toEqual({ error: "admin-key-unconfigured" })
+  })
+
+  it("无 Authorization 或错误 key → 401", async () => {
+    const env = adminEnv()
+    let resp = await app.request("/api/v1/admin/ingest/trigger", { method: "POST" }, env)
+    expect(resp.status).toBe(401)
+    resp = await app.request(
+      "/api/v1/admin/ingest/trigger",
+      { method: "POST", headers: { Authorization: "Bearer wrong" } },
+      env,
+    )
+    expect(resp.status).toBe(401)
+  })
+
+  it("合法 key + 触发全部 wiki → 对每个发 Queue 消息", async () => {
+    const env = adminEnv()
+    const resp = await app.request(
+      "/api/v1/admin/ingest/trigger",
+      { method: "POST", headers: { Authorization: "Bearer admin-secret" } },
+      env,
+    )
+    expect(resp.status).toBe(200)
+    const body = (await resp.json()) as { sent: string[] }
+    expect(body.sent.length).toBe(4) // mtf / ftm / rle / mio
+    expect((env.INGEST_QUEUE.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(4)
+  })
+
+  it("reset=1 → 清 D1 两张表 + 投递", async () => {
+    const env = adminEnv()
+    const resp = await app.request(
+      "/api/v1/admin/ingest/trigger?wiki_id=mtf-wiki&reset=1",
+      { method: "POST", headers: { Authorization: "Bearer admin-secret" } },
+      env,
+    )
+    expect(resp.status).toBe(200)
+    const body = (await resp.json()) as { reset: Record<string, string> }
+    expect(body.reset["mtf-wiki"]).toBe("ok")
+    // DB.prepare 被调用两次（ingest_runs 删除 + ingest_files 删除）
+    const prep = (env.DB.prepare as ReturnType<typeof vi.fn>)
+    expect(prep).toHaveBeenCalledTimes(2)
+    expect((env.INGEST_QUEUE.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1)
+  })
+
+  it("非法 wiki_id → 422", async () => {
+    const resp = await app.request(
+      "/api/v1/admin/ingest/trigger?wiki_id=not-a-wiki",
+      { method: "POST", headers: { Authorization: "Bearer admin-secret" } },
+      adminEnv(),
+    )
+    expect(resp.status).toBe(422)
+  })
+})

@@ -116,6 +116,53 @@ api.post("/chat", (c) => c.json({ error: "not-yet" }, 501)) // TODO(T3.4)
 api.get("/admin/keys", (c) => c.json({ error: "not-yet" }, 501)) // TODO(M3 admin)
 api.post("/admin/keys", (c) => c.json({ error: "not-yet" }, 501)) // TODO(M3 admin)
 
+// POST /api/v1/admin/ingest/trigger —— 手动触发 ingest（T2.2 运维入口，受 ADMIN_API_KEY 保护）
+//   query:  wiki_id=<id>  可选，只触发单个 wiki；缺省触发全部注册 wiki。
+//           reset=1       可选，先清 D1 的 ingest 状态（ingest_runs 成功 commit + ingest_files hash），
+//                         强制下次 ingest 全量重嵌（用于重刷 url / 重建向量）。危险，需 ADMIN_API_KEY。
+//   header:  Authorization: Bearer <ADMIN_API_KEY>
+// 返回：每个目标 wiki 的 Queue 投递结果（实际 ingest 在后台 queue consumer 异步执行）。
+api.post("/admin/ingest/trigger", async (c) => {
+  const key = c.env.ADMIN_API_KEY
+  if (!key) return c.json({ error: "admin-key-unconfigured" }, 503)
+  const auth = c.req.header("Authorization") ?? ""
+  if (auth !== `Bearer ${key}`) return c.json({ error: "unauthorized" }, 401)
+
+  const wikiId = c.req.query("wiki_id")
+  const reset = c.req.query("reset") === "1"
+  const targets = wikiId ? (isValidCorpus(wikiId) ? [wikiId] : []) : listWikis().map((w) => w.id)
+  if (targets.length === 0) return c.json({ error: wikiId ? "invalid-corpus" : "no-wikis" }, 422)
+
+  // reset=1：清 D1 的 ingest 状态，强制全量重嵌。逐个 try，避免一个失败阻断全部。
+  const resetResults: Record<string, string> = {}
+  if (reset && c.env.DB) {
+    for (const id of targets) {
+      try {
+        await c.env.DB.prepare("DELETE FROM ingest_runs WHERE wiki_id = ?").bind(id).run()
+        await c.env.DB.prepare("DELETE FROM ingest_files WHERE wiki_id = ?").bind(id).run()
+        resetResults[id] = "ok"
+      } catch (e) {
+        resetResults[id] = `error:${(e as Error)?.message ?? "db-failed"}`
+      }
+    }
+  } else if (reset && !c.env.DB) {
+    return c.json({ error: "db-unavailable-for-reset" }, 503)
+  }
+
+  // 发 Queue 消息（与实际 scheduled 完全一致：后台 queue consumer 异步 ingest）。
+  const sent: string[] = []
+  const failed: string[] = []
+  for (const id of targets) {
+    try {
+      await c.env.INGEST_QUEUE.send({ wikiId: id } as IngestMessage)
+      sent.push(id)
+    } catch {
+      failed.push(id)
+    }
+  }
+  return c.json({ reset: reset ? resetResults : undefined, sent, failed }, failed.length === 0 ? 200 : 503)
+})
+
 app.route("/api/v1", api)
 
 export default {
