@@ -34,28 +34,28 @@ export const DEFAULT_WIKIS: readonly WikiConfig[] = [
     repo: "project-trans/MtF-wiki",
     branch: "main",
     content_dir: "content/zh-cn",
-    site_url: "https://github.com/project-trans/MtF-wiki/blob/main",
+    site_url: "https://mtf.wiki",
   },
   {
     id: "ftm-wiki",
     repo: "project-trans/FtM-wiki",
     branch: "main",
     content_dir: "content",
-    site_url: "https://github.com/project-trans/FtM-wiki/blob/main",
+    site_url: "https://ftm.wiki",
   },
   {
     id: "rle-wiki",
     repo: "project-trans/rle-wiki",
     branch: "main",
     content_dir: "docs",
-    site_url: "https://github.com/project-trans/rle-wiki/blob/main",
+    site_url: "https://rle.wiki",
   },
   {
     id: "miomtfwiki",
     repo: "KitsuMio/MioMtFWiki",
     branch: "main",
     content_dir: "docs",
-    site_url: "https://github.com/KitsuMio/MioMtFWiki/blob/main",
+    site_url: "https://mio.chengxi.moe",
   },
 ] as const
 
