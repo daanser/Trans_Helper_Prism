@@ -10,6 +10,7 @@
 import { createEmbeddingProvider } from "../embeddings"
 import { splitBigrams, writeBigramRow } from "../bigram"
 import { getWiki } from "../wiki_registry"
+import { buildSiteUrl } from "../wikiUrl"
 import {
   downloadTarball,
   extractTarGz,
@@ -278,7 +279,7 @@ export async function ingestWiki(env: Env, wikiId: string, opts: { fetchImpl?: t
     const body = cleanBody(rawBody)
     const pathMeta = resolvePathMeta(f.contentDirRel, dirMeta, null)
     const title = String(meta.title ?? meta.name ?? base.replace(/\.md$/, "")).trim()
-    const url = `https://github.com/${wiki.repo}/blob/${wiki.branch}/${f.repoRootPath}`
+    const url = buildSiteUrl(wiki.id, { repoRootPath: f.repoRootPath, contentDirRel: f.contentDirRel, meta })
     const items = chunkMarkdownWithText(
       {
         wiki_id: wiki.id,
