@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // TransHelper Prism — fallback 真实现单测 (tasks.md T1.3)
-// 全 mock D1（模拟大行），绝不调真实上游 / Qdrant / embedding / 网络。
+// 全 mock fetch（Qdrant scroll 全文检索），绝不调真实上游 / embedding / 网络。
 // 覆盖：
-//   1) 断网场景：mock D1 已有 bigram 行 → runFallback("激素治疗", db) 按命中 gram 数降序返回 hits，0 fetch 调用
-//   2) DB undefined → 空 hits + notice（不抛错）
-//   3) splitBigrams 单测：中文 bigram、ASCII token、混合、空串
-//   4) runSearch（真实 search.ts）embedding 抛错 → 整链路落 fallback（fallback:true，notice 含「关键词」）
+//   1) 正常：Qdrant 全文命中 → 按本地 token 命中度降序返回 hits，并带上正确 filter
+//   2) 同 path 多 chunk 去重，取最高分
+//   3) 单库失败不影响其它库
+//   4) Qdrant 未配置 / 空 query → 空 hits + notice（不抛错）
+//   5) splitBigrams 切分
+//   6) runSearch（真实 search.ts）embedding 抛错 → 整链路落 fallback
 import { describe, it, expect, vi, afterEach } from "vitest"
 import { runFallback } from "../src/fallback"
 import { splitBigrams, writeBigramRow } from "../src/bigram"
 import { runSearch } from "../src/search"
 import type { FallbackResponse } from "../src/fallback"
 import type { RunSearchResult } from "../src/search"
-import type { BigramRow } from "../src/bigram"
 import type { Env, SearchResponse } from "../src/types"
 
 afterEach(() => {
@@ -20,93 +21,89 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-/** 构造 mock D1：prepare().bind(...grams).all() 按 gram 过滤返回预置行。纯内存，零网络。 */
-function makeDbMock(rows: BigramRow[]): D1Database {
-  const stmt = {
-    bind(...args: unknown[]) {
-      return {
-        all: async <T>(): Promise<{ results: T[] }> => {
-          const grams = args.filter((a): a is string => typeof a === "string")
-          const matched = rows.filter((r) => grams.includes(r.gram))
-          return { results: matched as T[] }
-        },
-        run: async () => ({ success: true, meta: { changes: 1 } }),
-      }
-    },
-  }
-  return {
-    prepare: () => stmt,
-  } as unknown as D1Database
+interface MockPoint {
+  id: string
+  payload: Record<string, unknown>
+}
+
+/** mock Qdrant scroll：按 collection 返回预置点；failColls 里的库返回 500。 */
+function makeQdrantFetch(byColl: Record<string, MockPoint[]>, failColls: string[] = []) {
+  const calls: Array<{ coll: string; body: Record<string, unknown> }> = []
+  const fetchImpl = vi.fn(async (url: unknown, init?: RequestInit): Promise<Response> => {
+    const u = String(url)
+    const m = /\/collections\/([^/]+)\/points\/scroll/.exec(u)
+    if (m) {
+      const coll = m[1]
+      calls.push({ coll, body: JSON.parse(String(init?.body ?? "{}")) })
+      if (failColls.includes(coll)) return new Response("boom", { status: 500 })
+      return new Response(JSON.stringify({ result: { points: byColl[coll] ?? [] } }), { status: 200 })
+    }
+    return new Response("unexpected", { status: 500 })
+  })
+  return { fetchImpl, calls }
 }
 
 function isFallback(res: RunSearchResult): res is FallbackResponse {
   return (res as FallbackResponse).fallback === true
 }
 
-describe("runFallback 断网场景（mock D1）", () => {
-  it("按 gram 命中数降序返回 hits，且 0 个 fetch/网络调用", async () => {
-    // 「激素治疗」切出 [激素, 素治, 治疗]；docA 命中 2 个 gram，docB 命中 1 个。
-    const rows: BigramRow[] = [
-      { id: "a", wiki_id: "mtf-wiki", path: "/p/a", title: "A 激素", section: null, url: "https://a", gram: "激素", snippet: "sa" },
-      { id: "a1", wiki_id: "mtf-wiki", path: "/p/a", title: "A 激素", section: null, url: "https://a", gram: "治疗", snippet: "sa" },
-      { id: "b", wiki_id: "ftm-wiki", path: "/p/b", title: "B 单一", section: null, url: "https://b", gram: "激素", snippet: "sb" },
-    ]
-    const db = makeDbMock(rows)
+const ENV = { QDRANT_URL: "https://q.example", QDRANT_API_KEY: "k" }
 
-    // 注入会抛错的 fetch，证明回退分支完全没用它。
-    const throwFetch = vi.fn(async () => {
-      throw new Error("network-should-not-hit")
-    })
-    vi.stubGlobal("fetch", throwFetch)
-
-    const res = await runFallback("激素治疗", db)
+describe("runFallback（Qdrant 全文索引）", () => {
+  it("按 token 命中度降序返回 hits，并带上 text match filter", async () => {
+    const byColl = {
+      mtf_wiki_v1: [
+        { id: "p1", payload: { path: "a.md", title: "A", text: "激素 治疗 激素", url: "https://mtf.wiki/a", wiki_id: "mtf-wiki" } },
+        { id: "p2", payload: { path: "b.md", title: "B", text: "仅治疗", url: "https://mtf.wiki/b", wiki_id: "mtf-wiki" } },
+      ],
+    }
+    const { fetchImpl, calls } = makeQdrantFetch(byColl)
+    const res = await runFallback("激素治疗", ["mtf-wiki"], ENV, { fetchImpl })
 
     expect(res.fallback).toBe(true)
+    expect(res.hits.map((h) => h.path)).toEqual(["a.md", "b.md"])
+    expect(res.hits[0].url).toBe("https://mtf.wiki/a")
+    expect(calls.length).toBe(1)
+    expect(calls[0].coll).toBe("mtf_wiki_v1")
+    expect(calls[0].body.filter).toEqual({ must: [{ key: "text", match: { text: "激素治疗" } }] })
     expect(res.notice).toContain("关键词模式")
-    // 按命中 gram 数降序：A（2 个）在 B（1 个）前
-    expect(res.hits.map((h) => h.path)).toEqual(["/p/a", "/p/b"])
-    expect(throwFetch).not.toHaveBeenCalled() // 0 个 fetch
   })
 
-  it("单个 gram 查询也能命中（\"激素\"）", async () => {
-    const rows: BigramRow[] = [
-      { id: "a", wiki_id: "mtf-wiki", path: "/p/a", title: "激素", section: null, url: "u", gram: "激素", snippet: "s" },
-    ]
-    const db = makeDbMock(rows)
-    const res = await runFallback("激素", db)
-    expect(res.hits).toHaveLength(1)
-    expect(res.hits[0].path).toBe("/p/a")
+  it("同 path 多 chunk → 去重取最高分", async () => {
+    const byColl = {
+      mtf_wiki_v1: [
+        { id: "p1", payload: { path: "a.md", text: "治疗", wiki_id: "mtf-wiki", url: "u1", title: "A" } },
+        { id: "p2", payload: { path: "a.md", text: "激素 治疗 激素", wiki_id: "mtf-wiki", url: "u1", title: "A" } },
+      ],
+    }
+    const { fetchImpl } = makeQdrantFetch(byColl)
+    const res = await runFallback("激素治疗", ["mtf-wiki"], ENV, { fetchImpl })
+    expect(res.hits.length).toBe(1)
+    expect(res.hits[0].score).toBeGreaterThan(1)
+  })
+
+  it("单库失败不影响其它库", async () => {
+    const byColl = {
+      mtf_wiki_v1: [{ id: "p1", payload: { path: "a.md", text: "激素", wiki_id: "mtf-wiki", url: "u", title: "A" } }],
+    }
+    const { fetchImpl } = makeQdrantFetch(byColl, ["rle_wiki_v1"])
+    const res = await runFallback("激素", ["rle-wiki", "mtf-wiki"], ENV, { fetchImpl })
+    expect(res.hits.length).toBe(1)
     expect(res.hits[0].source).toBe("mtf-wiki")
   })
 
-  it("query 无可切内容 → 空 hits，不发 SQL，不抛错", async () => {
-    const rows: BigramRow[] = []
-    const db = makeDbMock(rows)
-    const res = await runFallback("   ", db)
-    expect(res.fallback).toBe(true)
-    expect(res.hits).toEqual([])
-    expect(res.notice).toContain("关键词模式")
-  })
-})
-
-describe("runFallback DB undefined 优雅降级", () => {
-  it("db 为 undefined → 空 hits + notice，不抛错", async () => {
-    const res = await runFallback("激素", undefined)
+  it("Qdrant 未配置 → 空 hits + notice，不抛错", async () => {
+    const res = await runFallback("激素", ["mtf-wiki"], {})
     expect(res.fallback).toBe(true)
     expect(res.hits).toEqual([])
     expect(res.notice).toContain("关键词模式")
   })
 
-  it("D1 查询抛错 → 降级为空 hits，不向上抛", async () => {
-    const badDb = {
-      prepare: () => {
-        throw new Error("d1-down")
-      },
-    } as unknown as D1Database
-    const res = await runFallback("激素", badDb)
-    expect(res.fallback).toBe(true)
+  it("空 query / 纯标点 → 空 hits，不发请求", async () => {
+    const { fetchImpl, calls } = makeQdrantFetch({})
+    const res = await runFallback("   ", ["mtf-wiki"], ENV, { fetchImpl })
     expect(res.hits).toEqual([])
-    expect(res.notice).toContain("关键词模式")
+    expect(calls.length).toBe(0)
   })
 })
 
@@ -133,9 +130,13 @@ describe("splitBigrams 切分", () => {
   })
 })
 
-describe("writeBigramRow 写入（mock D1）", () => {
+describe("writeBigramRow 写入（mock D1，模块保留但回退链路已不用）", () => {
   it("返回影响行数", async () => {
-    const db = makeDbMock([])
+    const db = {
+      prepare: () => ({
+        bind: () => ({ run: async () => ({ success: true, meta: { changes: 1 } }) }),
+      }),
+    } as unknown as D1Database
     const n = await writeBigramRow(db, {
       id: "x",
       wiki_id: "mtf-wiki",
@@ -153,7 +154,6 @@ describe("writeBigramRow 写入（mock D1）", () => {
 
 describe("runSearch 触发 fallback（embedding 抛错）", () => {
   it("embedding 抛错 → 整链路落 fallback：fallback:true、notice 含「关键词」", async () => {
-    // makeEnv 不提供 DB → env.DB 为 undefined，回退分支走优雅降级空 hits，仍算 fallback。
     const env = {
       EMBED_POOL_KEYS: "sk-embed-a",
       LLM_POOL_KEYS: "sk-llm-a",
@@ -168,7 +168,6 @@ describe("runSearch 触发 fallback（embedding 抛错）", () => {
     if (!isFallback(res)) return
     expect(res.hits).toEqual([])
     expect(res.notice).toContain("关键词")
-    // 类型断言：SearchResponse 侧也带 fallback 标记 + 原因 warning
     const full = res as unknown as SearchResponse
     expect(full.warnings).toContain("embedding-unavailable")
   })

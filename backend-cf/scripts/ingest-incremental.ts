@@ -104,6 +104,19 @@ function qdrantHeaders(): Record<string, string> {
   return h
 }
 
+/** 幂等创建 payload.text 全文索引（回退分支查它；tokenizer=multilingual 支持中文分词）。 */
+async function ensureTextIndex(collection: string): Promise<void> {
+  const resp = await fetch(`${QDRANT_URL}/collections/${collection}/index?wait=true`, {
+    method: "PUT",
+    headers: qdrantHeaders(),
+    body: JSON.stringify({ field_name: "text", field_schema: { type: "text", tokenizer: "multilingual" } }),
+  })
+  if (!resp.ok && resp.status !== 409) {
+    const t = await resp.text().catch(() => "")
+    throw new Error(`ensure text index ${collection} status=${resp.status} ${t.slice(0, 160)}`)
+  }
+}
+
 interface ExistingPath {
   blobSha?: string
   /** 该 path 已入库的 point id（用于按 id 删除，避免依赖 payload 索引）。 */
@@ -253,6 +266,7 @@ async function runWiki(wikiId: string): Promise<WikiSummary> {
   let upserted = 0
   if (chunks.length > 0) {
     await ensureCollection(QDRANT_URL, QDRANT_API_KEY, collection, EMBEDDING_DIM, fetch)
+    await ensureTextIndex(collection) // 回退分支（Qdrant 全文检索）依赖此索引
     const { provider } = createEmbeddingProvider({ EMBED_POOL_KEYS }, noopDb)
     const batchSize = 32
     for (let i = 0; i < chunks.length; i += batchSize) {

@@ -226,13 +226,13 @@ export async function runSearch(
       vector = await provider.embed(req.query.trim(), { kind: "query" })
       embedMs = nowMs() - t0
     } catch {
-      return toSearchResponse(await runFallback(req.query, env.DB), quota, warnings, "embedding-unavailable")
+      return toSearchResponse(await runFallback(req.query, corpora, env), quota, warnings, "embedding-unavailable")
     }
 
     const qdrantUrl = env.QDRANT_URL
     if (!qdrantUrl) {
       // Qdrant 未配置：视为上游失败 → 回退
-      return toSearchResponse(await runFallback(req.query, env.DB), quota, warnings, "qdrant-unconfigured")
+      return toSearchResponse(await runFallback(req.query, corpora, env), quota, warnings, "qdrant-unconfigured")
     }
 
     // ── 多 collection 并行检索，limit 取 top_k*3 给 rerank 留 candidate。
@@ -286,7 +286,7 @@ export async function runSearch(
 
     // 所有库都失败且无任何命中 → 视为上游全灭，整体降级回退（tasks.md T1.3 上游失败触发）。
     if (merged.length === 0 && corpora.every((c) => warnings.some((w) => w.startsWith(`collection-unavailable:${collectionName(c)}:`)))) {
-      return toSearchResponse(await runFallback(req.query, env.DB), quota, warnings, "all-collections-unavailable")
+      return toSearchResponse(await runFallback(req.query, corpora, env), quota, warnings, "all-collections-unavailable")
     }
 
     // 只缓存纯向量阶段结果（rerank 每次重算，不入缓存）。写失败不影响结果。

@@ -167,13 +167,18 @@ query
 - 查询 embedding 与文档 embedding 必须同模型同指令（instruction prefix），否则精度崩。
 - 全量 ingest 成本：按 token 计费，wiki 体量下是零花钱级；M2 前先拿一个号实测全量 token 数 × 单价再批量买号。
 
-### 5.4 结巴分词回退（超额/降级分支）
+### 5.4 关键词回退（超额/降级分支）
 
 - 触发条件：配额耗尽、embedding/reranker/LLM 上游超时或 5xx、未登录用户。
-- 实现：Workers 里没有 jieba，改用**预计算 bigram/关键词索引存 D1**（ingest 时对标题+正文切 bigram 入索引表，查询时同样切分匹配；
-  精度糙但反正是降级分支）。Qdrant 稀疏索引不用（Qdrant Cloud 免费层省着用）。
-- 特点：零外部调用、零配额消耗、延迟低、精度低；返回体带 `fallback: true`，前端 banner 提示。
-- 与旧 `sparse.ts`（Worker 本地 BM25）的对应：思想继承（Worker 本地算分），实现改成查 D1 预计算索引，避免双端两套分词不一致。
+- 实现（**2026-09-09 修订**）：改用 **Qdrant `payload.text` 全文索引**做关键词回退——查询时按
+  `filter: {must:[{key:"text", match:{text: query}}]}` scroll 命中 chunk，本地按 query token 命中度排序、按 path 去重取 top_k。
+  - 索引创建：ingest 脚本幂等执行 `PUT /collections/{c}/index {"field_name":"text","field_schema":{"type":"text","tokenizer":"multilingual"}}`
+    （`multilingual` 分词对中文可用，已实测「激素」「嗓音」均能命中）。
+  - **为什么放弃原「预计算 bigram 索引存 D1」**：实测现有 1481 个 chunk 会产生 **521,925 行** bigram 索引，
+    而 D1 免费版每天仅允许写 **100,000 行**（官方 pricing 文档），超 5.2 倍——一次全量写入不可能，且每次重嵌都要重写；
+    存储估算也要 149–348 MB（免费单库上限 500 MB）。Qdrant 全文索引零 D1 行、单次请求、与向量检索共用同一个 Qdrant。
+- 特点：零 embedding、零配额消耗、延迟低、精度低于向量；返回体带 `fallback: true`，前端 banner 提示。
+- `src/bigram.ts` 保留（`splitBigrams` 仍用于本地打分 token 化），但**不再作为回退检索数据源**。
 
 ---
 
@@ -273,17 +278,22 @@ wikis:
 ### 7.3 增量更新流程（crawler/indexer）
 
 ```
-daily Cron Trigger（UTC 01:00）
- ├─ 拉取：GitHub API tarball（Workers 里不做 git clone）→ 解包 → 对比 D1 中上次成功 commit SHA
- ├─ diff：新增/修改/删除文件列表 → 每个 wiki 发一条 Queue 消息（单 wiki 失败互不影响）
- ├─ Queue consumer（小步快跑，避开 Workers 单次执行时长墙）：
+GitHub Actions（每日 UTC 02:00 + 手动触发，见 .github/workflows/ingest.yml）
+ ├─ 拉取：GitHub trees API 一次拿到全部 .md 路径 → git blob sha（内容指纹，细到文件级）
+ ├─ diff：从 Qdrant 读出每个 path 的 blob_sha（payload.blob_sha）→ 只挑变化文件；消失的文件删点
+ ├─ 逐库处理（Node 环境，无 Workers CPU/内存墙）：
  │   ├─ 解析：frontmatter + markdown → 清洗（去 shortcode/HTML 注释/多余空行，继承旧 indexer 逻辑，TS 重写）
- │   ├─ 分块：按标题层级 + 字符窗口 + overlap；每 chunk 记录 {wiki_id, path, title, section, url, commit_sha, chunk_index, updated_at}
+ │   ├─ 分块：按标题层级 + 字符窗口 + overlap；每 chunk 记录 {wiki_id, path, title, section, url, commit_sha, chunk_index, updated_at, blob_sha}
  │   ├─ embedding（硅基流动中国站，批量，走 §8.5 embed_pool）→ Qdrant Cloud upsert（point id 幂等）
- │   ├─ bigram 索写入 D1（回退分支用）；删除：文件删除 → 删 points + 删索引行
- │   └─ 写 D1 `ingest_runs`（commit SHA/新增/更新/删除数/耗时/状态/消耗 key），失败告警
+ │   └─ 删除：文件删除/内容变更 → 按 point id 删旧点后再写新点
  └─ 全量重嵌（换模型时）：建 `{wiki}_v2` collection + 别名切换，旧版保留到验证通过
 ```
+
+> **为什么不用 Worker Cron + Queues（2026-09-09 修订）**：实测 Cloudflare 免费版 CPU 10ms / 内存 128MB / 单次 50 子请求，
+> Worker 内「下载 tarball + gunzip + 全量 embed」必然 `exceededMemory` / `exceededCpu`（`ingest_runs` 从未落过成功记录，
+> 所以自动更新一直没生效）。迁到 GitHub Actions（免费、无这些限制）后：首次全量 1481 chunk 约 2 分钟；
+> 二次运行 `upserted=0`（真增量生效）。Worker 侧 `wrangler.jsonc` 已移除 crons；
+> `/api/v1/admin/ingest/trigger` 保留但仅在升级 Workers Paid 后才有意义。
 
 ### 7.4 要点
 
@@ -292,7 +302,7 @@ daily Cron Trigger（UTC 01:00）
 3. **失败重试与告警**：单 wiki 失败不影响其他 wiki（Queue 天然隔离）；失败发通知（邮件/群机器人）；保留上次成功 SHA，下次接着 diff。
 4. **回滚**：collection 命名带版本（`_v1`），重嵌/换模型时建 `_v2` + 别名切换，旧版保留到验证通过。
 5. **解析复用**：旧 `script/indexer.py` 的 frontmatter 解析、body 清洗、`_index.md` 目录元数据逻辑搬过来，**用 TypeScript 重写**为可测试模块 + 单测（vitest，跑在 Workers 外）。
-6. **定时载体**：Cron Triggers + Queues（不要系统 cron / Celery / Airflow；Workers 单次执行有 wall-time 墙，大 wiki 拆多条 Queue 消息）。
+6. **定时载体**：**GitHub Actions**（免费、无 Workers CPU/内存/子请求墙；2026-09-09 修订，原 Cron Triggers + Queues 方案见 §7.3 说明）。
 
 ### 7.5 元数据与知识树
 
@@ -359,10 +369,11 @@ daily Cron Trigger（UTC 01:00）
 ### 9.1 技术选型（已锁定 2026-09-07）
 
 - **API 服务**：Cloudflare Workers + TypeScript + Hono（**复活旧 `backend-cf/`**，在其 `index/qdrant/cache/rate-limit` 基础上重写模块划分；Python `backend/` 废弃）。
-- **DB**：D1（SQLite：账号、绑定、配额、key 用量、`ingest_runs`、chat sessions、bigram 回退索引）+ KV（短期搜索缓存、限流计数、配额扣减原子操作）。
+- **DB**：D1（SQLite：账号、绑定、配额、key 用量、`ingest_runs`、chat sessions）+ KV（短期搜索缓存、限流计数、配额扣减原子操作）。
+  （`bigram_index` 表仍在 schema 中，但回退检索已改用 Qdrant 全文索引，见 §5.4。）
 - **向量库**：Qdrant（不变），per-wiki collection，用 **Qdrant Cloud 免费层**（两小 wiki 够装；装不下才考虑 Vectorize，不主动迁）。
 - **模型调用**：Workers 服务端代调硅基流动中国站（embedding/rerank/LLM），全部走 §8.5 Key Pool。
-- **任务调度**：Cron Triggers（每日 UTC 01:00）+ Queues（per-wiki 消息 + 大 wiki 分片，避开单次执行时长墙）。
+- **任务调度**：**GitHub Actions**（每日 UTC 02:00，`backend-cf/scripts/ingest-incremental.ts`）；Worker 侧不再注册 Cron。
 - **部署**：`wrangler deploy` 一条命令；前端放 Cloudflare Pages（Nuxt，`nitro.preset` 已是 `cloudflare_module`，顺手）。
 - **前置实测（M0 第一件事）**：Workers → `api.siliconflow.cn` 连通性 + P50 延迟。不通则全 CF 方案塌，届时回退国内云（届时重估）。
 

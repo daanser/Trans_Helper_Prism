@@ -64,11 +64,13 @@
   reranker 硬超时 1.5s，超时/5xx/池全灭自动降级回向量序 + `warnings: ["rerank-fallback"]`。
 - ✅ 相同查询 5 分钟内第二次命中缓存（`timings.cached=true`）；mock 上游全挂后搜索仍可用且带 warning。
 
-### T1.3 结巴分词回退分支（D1 bigram 版）
-- `src/fallback.ts`：Workers 里无 jieba，ingest 时预计算 bigram/关键词索引存 D1（标题+正文），查询时同样切分匹配；
+### T1.3 关键词回退分支（Qdrant 全文索引版）
+- `src/fallback.ts`：**2026-09-09 修订**——改用 Qdrant `payload.text` 全文索引（`tokenizer: multilingual`）检索命中 chunk，
+  本地按 query token 命中度排序、按 path 去重取 top_k；
   触发：配额耗尽 / embedding-rerank-上游失败 / 未登录（M1 先实现"上游失败"触发，配额/登录触发点在 M3 接上）。
+- 原「D1 bigram 索引」方案放弃：实测 1481 chunk 产生 521,925 行，超 D1 免费版 10 万行/天写入额度 5.2 倍（见 plan.md §5.4）。
 - 返回 `fallback:true` + banner 文案约定。
-- ✅ 断网（mock embedding 抛错）时自动回退且 0 外部调用；前端出现回退 banner。
+- ✅ 断网（mock embedding 抛错）时自动回退且 0 embedding 调用；前端出现回退 banner；四个 collection 均已建 text 索引（实测「激素」「嗓音」命中）。
 
 ### T1.4 压测 + 定 reranker 默认开关（决策终点）
 - 真实 wiki query 集（≥50 条，含短词/长句/错别字）测：recall@10、nDCG@10（开/关 rerank 对照），
@@ -88,12 +90,14 @@
   `corpora` 多选真正生效（多 collection 并行检索 + 合并）。
 - ✅ 四个库 M0 已有；M2 起新增第 5 个 wiki 只需改配置 + 跑导入，零代码改动；`corpora` 单选/多选结果正确合并去重。
 
-### T2.2 Cron + Queue 每日增量更新
-- Cron Trigger（UTC 01:00）：GitHub API tarball 拉取（Workers 里不 git clone）→ 对比 D1 上次成功 commit SHA
-  → 新增/修改/删除列表 → per-wiki 发 Queue 消息（大 wiki 再分片，避开单次执行时长墙）。
-- Queue consumer：解析分块 → 批量 embed（走 embed_pool，限流退避）→ Qdrant upsert → 删废 chunk + 删 D1 索引行
-  → 写 D1 `ingest_runs`（commit SHA/新增/更新/删除数/耗时/状态/消耗 key）；单 wiki 失败互不影响，失败告警（日志 + 预留通知）。
-- ✅ 连续跑两天：第二天无变更时 0 upsert；改一篇文章只更新对应 chunks；删一篇文章对应 points 消失；`ingest_runs` 可查。
+### T2.2 每日增量更新（GitHub Actions 版）
+- **2026-09-09 修订**：原「Cron + Queue」方案在 Cloudflare 免费版跑不动（CPU 10ms / 内存 128MB / 50 子请求，
+  实测 `exceededMemory` / `exceededCpu`），迁到 **GitHub Actions**（`.github/workflows/ingest.yml`，每日 UTC 02:00 + 手动触发）。
+- 流程（`backend-cf/scripts/ingest-incremental.ts`，Node 无 CPU/内存墙）：
+  GitHub trees API 取全部 .md 的 git blob sha → 与 Qdrant `payload.blob_sha` 比对 → 只对变化文件解析分块
+  → 批量 embed（走 embed_pool，限流退避）→ 先按 point id 删旧点再 Qdrant upsert → 消失文件删点。
+- ✅ 实测：首次全量 1481 chunk 约 2 分钟；二次运行 `upserted=0`（真增量）；dry-run 的 chunk 数与库内点数逐库吻合（79/76/490/836）。
+- 待办：`ingest_runs` 记账已不在本链路（D1 写入需另配 CF API token）；如需失败告警可加 Actions 通知。
 
 ### T2.3 parser/chunker 单测补齐
 - 给 T0.3 的 TS parser 加单测：frontmatter（含 list）、shortcode、HTML 注释、多余空行、`_index.md` 目录元映射、
