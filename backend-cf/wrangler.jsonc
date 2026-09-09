@@ -41,6 +41,9 @@
   // 这里不再注册 crons，避免每晚产生无效失败；Worker 只负责搜索/树/corpora 等在线服务。
   "vars": {
     "ALLOWED_ORIGINS": "https://search.chengxi.moe,https://transhelper-prism.pages.dev",
+    // 登录相关（非敏感项写进配置，避免被每次部署覆盖；敏感项 X_CLIENT_ID/X_CLIENT_SECRET/JWT_SECRET 放 Worker Secrets）
+    "OAUTH_REDIRECT_URI": "https://transhelper-prism-backend.transprism.workers.dev/api/v1/auth/oauth/x/callback",
+    "FRONTEND_BASE_URL": "https://search.chengxi.moe",
     "EMBEDDING_ENDPOINT": "https://api.siliconflow.cn/v1/embeddings",
     "EMBEDDING_MODEL": "BAAI/bge-m3",
     "EMBEDDING_DIM": "1024",
