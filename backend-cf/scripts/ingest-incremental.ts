@@ -106,9 +106,11 @@ function qdrantHeaders(): Record<string, string> {
 
 interface ExistingPath {
   blobSha?: string
+  /** 该 path 已入库的 point id（用于按 id 删除，避免依赖 payload 索引）。 */
+  ids: Array<string | number>
 }
 
-/** scroll 整个 collection，返回 path → { blobSha }（blob_sha 为本次新增字段，旧数据可能没有）。 */
+/** scroll 整个 collection，返回 path → { blobSha, ids }（blob_sha 为新增字段，旧数据可能没有）。 */
 async function readExisting(collection: string): Promise<Map<string, ExistingPath>> {
   const out = new Map<string, ExistingPath>()
   let offset: unknown = undefined
@@ -123,13 +125,18 @@ async function readExisting(collection: string): Promise<Map<string, ExistingPat
     if (resp.status === 404) return out // 库还不存在 → 全量
     if (!resp.ok) throw new Error(`scroll ${collection} status=${resp.status}`)
     const j = (await resp.json()) as {
-      result?: { points?: Array<{ payload?: Record<string, unknown> }>; next_page_offset?: unknown }
+      result?: {
+        points?: Array<{ id?: string | number; payload?: Record<string, unknown> }>
+        next_page_offset?: unknown
+      }
     }
     for (const p of j.result?.points ?? []) {
       const path = typeof p.payload?.path === "string" ? (p.payload.path as string) : ""
-      if (!path) continue
+      if (!path || p.id === undefined || p.id === null) continue
       const sha = typeof p.payload?.blob_sha === "string" ? (p.payload.blob_sha as string) : undefined
-      out.set(path, { blobSha: sha })
+      const cur = out.get(path)
+      if (cur) cur.ids.push(p.id)
+      else out.set(path, { blobSha: sha, ids: [p.id] })
     }
     const next = j.result?.next_page_offset
     if (next === null || next === undefined) break
@@ -138,17 +145,20 @@ async function readExisting(collection: string): Promise<Map<string, ExistingPat
   return out
 }
 
-/** 按 path 批量删除点（用于变更文件先清旧 chunk + 删除消失文件）。 */
-async function deleteByPaths(collection: string, paths: string[]): Promise<void> {
-  if (paths.length === 0) return
-  const resp = await fetch(`${QDRANT_URL}/collections/${collection}/points/delete?wait=true`, {
-    method: "POST",
-    headers: qdrantHeaders(),
-    body: JSON.stringify({ filter: { must: [{ key: "path", match: { any: paths } }] } }),
-  })
-  if (!resp.ok) {
-    const t = await resp.text().catch(() => "")
-    throw new Error(`delete ${collection} status=${resp.status} ${t.slice(0, 160)}`)
+/** 按 point id 批量删除（Qdrant 单次上限内分批）。 */
+async function deleteByIds(collection: string, ids: Array<string | number>): Promise<void> {
+  if (ids.length === 0) return
+  for (let i = 0; i < ids.length; i += 1000) {
+    const batch = ids.slice(i, i + 1000)
+    const resp = await fetch(`${QDRANT_URL}/collections/${collection}/points/delete?wait=true`, {
+      method: "POST",
+      headers: qdrantHeaders(),
+      body: JSON.stringify({ points: batch }),
+    })
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "")
+      throw new Error(`delete ${collection} status=${resp.status} ${t.slice(0, 160)}`)
+    }
   }
 }
 
@@ -230,9 +240,15 @@ async function runWiki(wikiId: string): Promise<WikiSummary> {
     return { wiki_id: wiki.id, files_total: md.length, changed: targets.length, removed: removed.length, chunks: chunks.length, points_upserted: 0, seconds: (Date.now() - started) / 1000 }
   }
 
-  // 先清受影响 path 的旧点（变更文件可能 chunk 数变少；消失文件整条移除），再写新点。
-  const affected = [...new Set([...targets.map((e) => e.path), ...removed])]
-  await deleteByPaths(collection, affected)
+  // 先按 id 删掉受影响 path 的旧点（变更文件可能 chunk 数变少；消失文件整条移除），再写新点。
+  // 用 id 删除而非 payload filter：后者要求先给 path 字段建索引（Qdrant 会返回 400）。
+  const affectedPaths = new Set([...targets.map((e) => e.path), ...removed])
+  const affectedIds: Array<string | number> = []
+  for (const p of affectedPaths) {
+    const ex = existing.get(p)
+    if (ex) affectedIds.push(...ex.ids)
+  }
+  await deleteByIds(collection, affectedIds)
 
   let upserted = 0
   if (chunks.length > 0) {
