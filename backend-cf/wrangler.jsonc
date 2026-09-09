@@ -36,9 +36,9 @@
       }
     ]
   },
-  "triggers": {
-    "crons": ["1 0 * * *"]
-  },
+  // 摄取（Cron/Queue）已迁到 GitHub Actions（.github/workflows/ingest.yml）：
+  // Cloudflare 免费版 CPU 10ms / 内存 128MB / 50 子请求，Worker 内跑全量 ingest 必然超限。
+  // 这里不再注册 crons，避免每晚产生无效失败；Worker 只负责搜索/树/corpora 等在线服务。
   "vars": {
     "ALLOWED_ORIGINS": "https://search.chengxi.moe,https://transhelper-prism.pages.dev",
     "EMBEDDING_ENDPOINT": "https://api.siliconflow.cn/v1/embeddings",

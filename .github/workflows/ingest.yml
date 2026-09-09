@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# TransHelper Prism — 增量摄取（GitHub Actions）
+#
+# 为什么放这里而不是 Worker Cron：
+#   Cloudflare 免费版 CPU 10ms / 内存 128MB / 单次 50 子请求，Worker 内下载 tarball + gunzip
+#   + 全量 embed 必然 exceededMemory / exceededCpu（已实测）。GitHub Actions 无这些限制且免费。
+#
+# 需要在仓库 Settings → Secrets and variables → Actions 配置：
+#   QDRANT_URL        Qdrant Cloud 地址（https://xxx.cloud.qdrant.io）
+#   QDRANT_API_KEY    Qdrant API key
+#   EMBED_POOL_KEYS   硅基流动 embedding key（可逗号分隔多个）
+#   （GITHUB_TOKEN 由 Actions 自动提供，用于 GitHub API 提高限额）
+
+name: ingest
+
+on:
+  schedule:
+    # 每天 UTC 02:00（北京 10:00）
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      full:
+        description: "强制全量重嵌（忽略 blob_sha 比对，重新 embed 所有文件）"
+        type: boolean
+        default: false
+      wiki:
+        description: "只处理单个 wiki（mtf-wiki / ftm-wiki / rle-wiki / miomtfwiki），留空=全部"
+        type: string
+        default: ""
+
+# 同一时间只跑一个，避免并发写 Qdrant
+concurrency:
+  group: ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: backend-cf
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: backend-cf/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 增量摄取
+        env:
+          QDRANT_URL: ${{ secrets.QDRANT_URL }}
+          QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
+          EMBED_POOL_KEYS: ${{ secrets.EMBED_POOL_KEYS }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.full }}" = "true" ]; then ARGS="$ARGS --full"; fi
+          if [ -n "${{ inputs.wiki }}" ]; then ARGS="$ARGS --only=${{ inputs.wiki }}"; fi
+          echo "运行：npx tsx scripts/ingest-incremental.ts $ARGS"
+          npx tsx scripts/ingest-incremental.ts $ARGS
