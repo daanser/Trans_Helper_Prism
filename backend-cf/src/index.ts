@@ -165,9 +165,11 @@ api.post("/admin/ingest/trigger", async (c) => {
 })
 
 // POST /api/v1/admin/backfill-urls —— 存量数据 url 回填（只改 Qdrant payload，不重新 embed）
-//   query:  wiki_id=<id>  必填（单库一次，避免超出子请求上限）
+//   query:  wiki_id=<id>   必填
+//           offset=<scroll offset>  可选，续跑上一页返回的 next_offset
+//           page_size=<n>           可选，单页点数（默认 100，上限 500）
 //   header: Authorization: Bearer <ADMIN_API_KEY>
-// 用途：把已入库 chunk 的 payload.url 从 GitHub blob 重写成各 wiki 官网 URL（幂等，可重复调用）。
+// 免费版单次子请求上限 50，故按页处理：返回 { ..., next_offset, done }，done=false 时带 next_offset 续跑。
 api.post("/admin/backfill-urls", async (c) => {
   const key = c.env.ADMIN_API_KEY
   if (!key) return c.json({ error: "admin-key-unconfigured" }, 503)
@@ -177,8 +179,15 @@ api.post("/admin/backfill-urls", async (c) => {
   if (!wikiId) return c.json({ error: "wiki_id-required" }, 422)
   if (!isValidCorpus(wikiId)) return c.json({ error: "invalid-corpus" }, 422)
 
+  const offsetRaw = c.req.query("offset")
+  const pageRaw = c.req.query("page_size")
+  const pageSize = pageRaw ? parseInt(pageRaw, 10) : undefined
+
   try {
-    const result = await backfillWikiUrls(c.env, wikiId)
+    const result = await backfillWikiUrls(c.env, wikiId, {
+      offset: offsetRaw,
+      pageSize: Number.isFinite(pageSize as number) ? pageSize : undefined,
+    })
     return c.json(result)
   } catch (e) {
     const msg = (e as Error)?.message ?? "backfill-failed"

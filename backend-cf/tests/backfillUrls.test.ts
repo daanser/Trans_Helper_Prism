@@ -20,13 +20,15 @@ interface Pt {
   payload?: Record<string, unknown>
 }
 
-/** 构造 fetch mock：scroll 返回给定点；payload 写入被记录；raw 文件按 path 返回。 */
-function makeFetch(points: Pt[], rawFiles: Record<string, string> = {}) {
+/** fetch mock：scroll 返回给定点（可带 next_page_offset）；payload 写入被记录；raw 按 path 返回。 */
+function makeFetch(points: Pt[], rawFiles: Record<string, string> = {}, nextOffset: string | null = null) {
   const setPayloadCalls: Array<{ payload: Record<string, unknown>; points: Array<string | number> }> = []
+  const scrollBodies: Array<Record<string, unknown>> = []
   const fetchImpl = vi.fn(async (url: unknown, init?: RequestInit): Promise<Response> => {
     const u = String(url)
     if (u.endsWith("/points/scroll")) {
-      return new Response(JSON.stringify({ result: { points, next_page_offset: null } }), { status: 200 })
+      scrollBodies.push(JSON.parse(String(init?.body ?? "{}")))
+      return new Response(JSON.stringify({ result: { points, next_page_offset: nextOffset } }), { status: 200 })
     }
     if (u.endsWith("/points/payload")) {
       setPayloadCalls.push(JSON.parse(String(init?.body ?? "{}")))
@@ -40,7 +42,7 @@ function makeFetch(points: Pt[], rawFiles: Record<string, string> = {}) {
     }
     return new Response("unexpected", { status: 500 })
   })
-  return { fetchImpl, setPayloadCalls }
+  return { fetchImpl, setPayloadCalls, scrollBodies }
 }
 
 describe("backfillWikiUrls", () => {
@@ -55,9 +57,24 @@ describe("backfillWikiUrls", () => {
     expect(r.scanned).toBe(2)
     expect(r.updated).toBe(2)
     expect(r.skipped).toBe(0)
+    expect(r.done).toBe(true)
+    expect(r.next_offset).toBeNull()
     expect(setPayloadCalls.length).toBe(1) // 同 url 合并
     expect(setPayloadCalls[0].payload).toEqual({ url: "https://mtf.wiki/zh-cn/docs/medicine/zero-to-hrt" })
     expect(setPayloadCalls[0].points.sort()).toEqual(["p1", "p2"])
+  })
+
+  it("分页：带 offset 请求 scroll，并透出 next_offset（done=false）", async () => {
+    const points: Pt[] = [
+      { id: "p1", payload: { path: "content/zh-cn/docs/medicine/zero-to-hrt.md", url: "https://github.com/project-trans/MtF-wiki/blob/master/content/zh-cn/docs/medicine/zero-to-hrt.md" } },
+    ]
+    const { fetchImpl, scrollBodies } = makeFetch(points, {}, "next-page-token")
+    const r = await backfillWikiUrls(makeEnv(), "mtf-wiki", { fetchImpl, offset: "prev-token", pageSize: 50 })
+
+    expect(r.done).toBe(false)
+    expect(r.next_offset).toBe("next-page-token")
+    expect(scrollBodies[0].offset).toBe("prev-token")
+    expect(scrollBodies[0].limit).toBe(50)
   })
 
   it("幂等：已是官网 url 的点跳过，不发 set payload", async () => {
