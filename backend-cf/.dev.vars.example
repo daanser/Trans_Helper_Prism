@@ -10,7 +10,20 @@ QDRANT_API_KEY=your_qdrant_api_key
 
 # ── 可选覆盖 ────────────────────────────────────────────────
 ADMIN_API_KEY=your_admin_key
-ALLOWED_ORIGINS=http://localhost,http://127.0.0.1
+ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+
+# ── 登录：X (Twitter) OAuth 2.0 + PKCE（T3.1）────────────────
+# X 开发者后台 → User authentication settings → OAuth 2.0
+# ⚠️ OAUTH_REDIRECT_URI 必须与 X 后台登记的 Redirect URI 完全一致（差一个字符就失败）
+X_CLIENT_ID=your_x_oauth2_client_id
+X_CLIENT_SECRET=your_x_oauth2_client_secret
+JWT_SECRET=用 openssl rand -hex 32 生成
+# 线上（Worker）回调；本地联调改成 http://127.0.0.1:8787/api/v1/auth/oauth/x/callback
+OAUTH_REDIRECT_URI=https://transhelper-prism-backend.transprism.workers.dev/api/v1/auth/oauth/x/callback
+# 登录成功后回跳的前端；本地联调改成 http://localhost:3000
+FRONTEND_BASE_URL=https://search.chengxi.moe
+# 管理员 X 数字 id（逗号分隔），留空则所有人都是普通用户
+ADMIN_X_IDS=
 
 # 只用于 scripts/probe-connectivity.ts（本地运行时读环境变量，非 Worker secret）
 PROBE_SILICONFLOW_API_KEY=sk-xxxx

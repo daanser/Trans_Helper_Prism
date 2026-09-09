@@ -168,3 +168,22 @@ CREATE TABLE IF NOT EXISTS ingest_files (
 
 CREATE INDEX IF NOT EXISTS idx_ingest_files_wiki
   ON ingest_files (wiki_id);
+
+-- ─────────────────────────────────────────────
+-- 审计日志（audit_log）：敏感操作留痕（封禁/解封、加额/扣额、改模型配置、key 上架禁用等）。
+-- 只记 actor/target/动作/泛化 detail，绝不记 key 明文或用户隐私字段（T3.3）。
+-- ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS audit_log (
+  id          TEXT PRIMARY KEY,
+  actor_id    TEXT NOT NULL,                  -- 操作者 account_id（系统操作为 'system'）
+  action      TEXT NOT NULL,                  -- ban | unban | grant_quota | revoke_quota | set_model | key_enable | key_disable ...
+  target      TEXT NOT NULL DEFAULT '',       -- 被操作对象（account_id / key_ref / model_id）
+  detail      TEXT NOT NULL DEFAULT '',       -- 泛化说明（脱敏，不含 key/隐私）
+  created_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_created
+  ON audit_log (created_at);
+
+CREATE INDEX IF NOT EXISTS idx_audit_actor
+  ON audit_log (actor_id, created_at);

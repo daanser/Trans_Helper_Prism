@@ -34,6 +34,20 @@ export interface Env {
   // ── 其它 ──
   ADMIN_API_KEY?: string
   ALLOWED_ORIGINS?: string
+
+  // ── 登录（T3.1，X OAuth 2.0 + PKCE）──
+  /** X 开发者后台 OAuth 2.0 Client ID */
+  X_CLIENT_ID?: string
+  /** X 开发者后台 OAuth 2.0 Client Secret */
+  X_CLIENT_SECRET?: string
+  /** 回调地址，必须与 X 后台登记的 Redirect URI 完全一致 */
+  OAUTH_REDIRECT_URI?: string
+  /** 登录成功后回跳的前端基址（如 https://search.chengxi.moe） */
+  FRONTEND_BASE_URL?: string
+  /** 会话 JWT 签名密钥（HS256） */
+  JWT_SECRET?: string
+  /** 管理员 X 数字 id，逗号分隔 */
+  ADMIN_X_IDS?: string
 }
 
 /** 一次搜索的请求体（plan.md §3.3）。M0 只实现 corpora=["mtf-wiki"]。 */

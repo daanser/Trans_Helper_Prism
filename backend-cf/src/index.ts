@@ -11,6 +11,16 @@ import { listWikis, collectionName, isValidCorpus, buildCorporaResponse } from "
 import { fetchAllChunks, buildTree, QdrantScrollError } from "./tree"
 import { ingestWiki, type IngestMessage } from "./ingest/incremental"
 import { backfillWikiUrls } from "./backfillUrls"
+import {
+  startXLogin,
+  exchangeXCode,
+  upsertXAccount,
+  issueSession,
+  sessionFromHeader,
+  loginRedirectUrl,
+  frontendBase,
+  AuthConfigError,
+} from "./auth"
 
 export const app = new Hono<{ Bindings: Env }>()
 
@@ -108,10 +118,70 @@ api.post("/search", async (c) => {
 })
 
 // 其余 v1 路由：M0 统一登记为未实现占位，标注各自预期实现任务
-api.post("/auth/oauth/:provider/callback", (c) => c.json({ error: "not-yet" }, 501)) // TODO(T3.1)
-api.post("/auth/bind/email", (c) => c.json({ error: "not-yet" }, 501)) // TODO(T3.1)
-api.post("/auth/bind/x", (c) => c.json({ error: "not-yet" }, 501)) // TODO(T3.1)
-api.get("/me", (c) => c.json({ error: "not-yet" }, 501)) // TODO(T3.1/T3.2)
+// ── 登录（T3.1）：X OAuth 2.0 + PKCE ──
+// GET /auth/oauth/x/start → 302 到 X 授权页（state/verifier 存 KV）
+api.get("/auth/oauth/x/start", async (c) => {
+  try {
+    const { url } = await startXLogin(c.env, c.req.query("redirect"))
+    return c.redirect(url, 302)
+  } catch (e) {
+    if (e instanceof AuthConfigError) return c.json({ error: (e as Error).message }, 503)
+    return c.json({ error: "oauth-start-failed" }, 502)
+  }
+})
+
+// GET /auth/oauth/x/callback → 换 token、取用户、建号、签 JWT，302 回前端（token 放 fragment）
+api.get("/auth/oauth/x/callback", async (c) => {
+  const code = c.req.query("code")
+  const state = c.req.query("state")
+  const fail = (reason: string) =>
+    c.redirect(`${frontendBase(c.env)}/login#error=${encodeURIComponent(reason)}`, 302)
+
+  if (!code || !state) return fail("missing-code-or-state")
+  if (!c.env.DB) return fail("db-unconfigured")
+
+  try {
+    const { xId, handle, redirectAfter } = await exchangeXCode(c.env, code, state)
+    const acc = await upsertXAccount(c.env.DB, c.env, xId, handle, Date.now())
+    if (acc.status === "banned") return fail("account-banned")
+    const token = await issueSession(c.env, { sub: acc.account_id, handle: acc.handle, role: acc.role })
+    return c.redirect(loginRedirectUrl(c.env, redirectAfter, token), 302)
+  } catch (e) {
+    // 不回显任何密钥/原始响应；只给泛化原因
+    return fail((e as Error)?.message?.slice(0, 60) ?? "oauth-callback-failed")
+  }
+})
+
+api.post("/auth/bind/email", (c) => c.json({ error: "not-yet" }, 501)) // 邮箱绑定已砍（T3.7 取消）
+
+// GET /me → 当前账号 + 配额（需 Authorization: Bearer <JWT>）
+api.get("/me", async (c) => {
+  const session = await sessionFromHeader(c.env, c.req.header("Authorization"))
+  if (!session) return c.json({ error: "unauthorized" }, 401)
+  if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
+
+  const acc = await c.env.DB.prepare("SELECT status, created_at FROM accounts WHERE id = ?")
+    .bind(session.sub)
+    .first<{ status: string; created_at: number }>()
+  if (!acc) return c.json({ error: "account-not-found" }, 404)
+  if (acc.status !== "active") return c.json({ error: "account-" + acc.status }, 403)
+
+  const q = await c.env.DB.prepare("SELECT period_start, used_cost, monthly_limit FROM quotas WHERE account_id = ?")
+    .bind(session.sub)
+    .first<{ period_start: number; used_cost: number; monthly_limit: number }>()
+
+  return c.json({
+    // handle 来自会话 JWT（DB 不存 X 明文，见 auth.ts 隐私注释）
+    user: { account_id: session.sub, handle: session.handle, role: session.role, created_at: acc.created_at },
+    quota: {
+      period_start: q?.period_start ?? null,
+      used_cost: q?.used_cost ?? 0,
+      monthly_limit: q?.monthly_limit ?? 5,
+      remaining: Math.max(0, (q?.monthly_limit ?? 5) - (q?.used_cost ?? 0)),
+    },
+  })
+})
+
 api.post("/search/stream", (c) => c.json({ error: "not-yet" }, 501)) // TODO(T3.4)
 api.post("/chat", (c) => c.json({ error: "not-yet" }, 501)) // TODO(T3.4)
 api.get("/admin/keys", (c) => c.json({ error: "not-yet" }, 501)) // TODO(M3 admin)
