@@ -45,6 +45,10 @@ export interface QuotaState {
   used_pct?: number | null
   remaining_pct?: number | null
   exceeded?: boolean
+  /** 后端标记「降级计量」（如 DB 不可用时放行），仅作提示，不影响展示 */
+  degraded?: boolean
+  /** POST /search 的 quota 会带 fallback 标记（是否走了关键词回退） */
+  fallback?: boolean
 }
 
 /** GET /api/v1/me 的 user 字段 */

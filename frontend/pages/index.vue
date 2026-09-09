@@ -135,7 +135,14 @@
               降级模式
             </span>
             <span class="text-xs leading-relaxed text-amber-800 dark:text-amber-200">
-              因上游向量服务波动，当前已自动切换为基础分词索引模式。
+              <template v-if="loginRequired">
+                未登录时使用关键词回退检索（不消耗额度）。
+                <NuxtLink to="/login" class="font-medium underline underline-offset-2">登录</NuxtLink>
+                后可获得完整的向量检索与 AI 伴读。
+              </template>
+              <template v-else>
+                因上游向量服务波动，当前已自动切换为基础分词索引模式。
+              </template>
             </span>
           </div>
 
@@ -238,6 +245,8 @@ const error = ref("")
 const results = ref<SearchResponse["hits"]>([])
 const responseTimings = ref<SearchTimings | null>(null)
 const fallback = ref(false)
+/** 未登录时后端只给关键词回退（warnings: ["login-required"]）→ 提示登录 */
+const loginRequired = ref(false)
 const quota = ref<SearchResponse["quota"] | null>(null)
 const warnings = ref<string[]>([])
 const highlightedHitId = ref<string | null>(null)
@@ -466,7 +475,7 @@ async function onFollowUp(question: string) {
     const res = await chat(sessionId.value, question)
     const text = (res.text ?? "").trim()
     aiAnswer.value += text || "（未返回内容）"
-    if (res.citations?.length) aiCitations.value = [...aiCitations.value, ...res.citations]
+    if (res.citations?.length) aiCitations.value = Array.from(new Set([...aiCitations.value, ...res.citations]))
     if (res.model) aiModel.value = res.model
     aiStatus.value = "done"
   } catch (err: unknown) {
@@ -507,10 +516,13 @@ async function doSearch(payload: Pick<SearchRequest, "query" | "corpora" | "use_
     fallback.value = !!res.fallback
     quota.value = res.quota
     warnings.value = res.warnings || []
+    loginRequired.value = (res.warnings || []).includes("login-required")
 
     if (res.warnings?.length) {
       for (const w of res.warnings) {
-        if (w.includes("fallback")) {
+        if (w === "login-required") {
+          pushToast("未登录：当前为关键词回退检索，登录后可用完整向量检索", "info")
+        } else if (w.includes("fallback")) {
           pushToast("已自动切换至降级检索模式", "warning")
         }
       }

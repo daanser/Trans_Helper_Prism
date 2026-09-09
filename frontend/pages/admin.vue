@@ -9,11 +9,11 @@
       <div class="flex flex-wrap items-center gap-3">
         <h1 class="text-2xl font-bold tracking-tight text-ink-title sm:text-3xl">管理后台</h1>
         <span class="rounded-md border border-surface-border bg-canvas-subtle px-2 py-0.5 text-[11px] font-medium text-ink-sub">
-          骨架页 · 后端 T3.3 对接中
+          骨架页 · 运维接口需 ADMIN_API_KEY
         </span>
       </div>
       <p class="mt-2 text-sm leading-relaxed text-ink-sub">
-        用量、封禁、加额与 key 池管理。所有接口都会独立探测：未实现（404/501）时本页如实提示，不做任何前端假数据。
+        用量、封禁、加额与 key 池管理。所有接口都会独立探测：未实现（404/501）时本页如实提示，不做任何前端假数据。封禁/加额/审计为服务端 ADMIN_API_KEY 保护的运维接口，浏览器会话无权调用时本页会如实说明。
       </p>
     </header>
 
@@ -142,7 +142,7 @@
         <section class="rounded-2xl border border-surface-border bg-surface p-5 shadow-card sm:p-6">
           <div class="mb-4 border-b border-surface-border pb-3">
             <h2 class="text-sm font-semibold text-ink-title">封禁 / 解封</h2>
-            <p class="mt-0.5 text-xs text-ink-muted">POST /api/v1/admin/ban</p>
+            <p class="mt-0.5 text-xs text-ink-muted">POST /api/v1/admin/accounts/:id/ban</p>
           </div>
           <form class="space-y-3" @submit.prevent="submitBan(true)">
             <label class="block">
@@ -188,7 +188,7 @@
         <section class="rounded-2xl border border-surface-border bg-surface p-5 shadow-card sm:p-6">
           <div class="mb-4 border-b border-surface-border pb-3">
             <h2 class="text-sm font-semibold text-ink-title">配额调整</h2>
-            <p class="mt-0.5 text-xs text-ink-muted">POST /api/v1/admin/quota</p>
+            <p class="mt-0.5 text-xs text-ink-muted">POST /api/v1/admin/accounts/:id/quota</p>
           </div>
           <form class="space-y-3" @submit.prevent="submitQuota">
             <label class="block">
