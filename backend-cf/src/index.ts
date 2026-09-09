@@ -10,6 +10,7 @@ import { runSearch, SearchValidationError } from "./search"
 import { listWikis, collectionName, isValidCorpus, buildCorporaResponse } from "./wiki_registry"
 import { fetchAllChunks, buildTree, QdrantScrollError } from "./tree"
 import { ingestWiki, type IngestMessage } from "./ingest/incremental"
+import { backfillWikiUrls } from "./backfillUrls"
 
 export const app = new Hono<{ Bindings: Env }>()
 
@@ -161,6 +162,29 @@ api.post("/admin/ingest/trigger", async (c) => {
     }
   }
   return c.json({ reset: reset ? resetResults : undefined, sent, failed }, failed.length === 0 ? 200 : 503)
+})
+
+// POST /api/v1/admin/backfill-urls —— 存量数据 url 回填（只改 Qdrant payload，不重新 embed）
+//   query:  wiki_id=<id>  必填（单库一次，避免超出子请求上限）
+//   header: Authorization: Bearer <ADMIN_API_KEY>
+// 用途：把已入库 chunk 的 payload.url 从 GitHub blob 重写成各 wiki 官网 URL（幂等，可重复调用）。
+api.post("/admin/backfill-urls", async (c) => {
+  const key = c.env.ADMIN_API_KEY
+  if (!key) return c.json({ error: "admin-key-unconfigured" }, 503)
+  if ((c.req.header("Authorization") ?? "") !== `Bearer ${key}`) return c.json({ error: "unauthorized" }, 401)
+
+  const wikiId = c.req.query("wiki_id")
+  if (!wikiId) return c.json({ error: "wiki_id-required" }, 422)
+  if (!isValidCorpus(wikiId)) return c.json({ error: "invalid-corpus" }, 422)
+
+  try {
+    const result = await backfillWikiUrls(c.env, wikiId)
+    return c.json(result)
+  } catch (e) {
+    const msg = (e as Error)?.message ?? "backfill-failed"
+    // 不回显 key；只回泛化原因（unknown-wiki / qdrant-unconfigured / qdrant-*）。
+    return c.json({ error: msg.slice(0, 200) }, 502)
+  }
 })
 
 app.route("/api/v1", api)

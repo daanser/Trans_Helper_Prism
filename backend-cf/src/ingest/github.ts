@@ -57,6 +57,16 @@ export async function downloadTarball(repo: string, branch: string, fetchImpl: t
 }
 
 /**
+ * 取单个文件的原始文本（raw.githubusercontent.com，无 API 限流/JSON 包装）。
+ * 用于按需拿 frontmatter（如 FTM 的 slug），避免为拿几个文件而下载整仓 tarball。
+ */
+export async function fetchRawFile(repo: string, branch: string, path: string, fetchImpl: typeof fetch): Promise<string> {
+  const url = `https://raw.githubusercontent.com/${repo}/${branch}/${path}`
+  const resp = await ghFetchWithTimeout(url, fetchImpl, { method: "GET" })
+  return await resp.text()
+}
+
+/**
  * 极简 tar 解包：返回 文件相对路径 -> utf8 文本 的映射（只保留我们关心的文本条目）。
  * 支持 GNU 长文件名（typeflag 'L'/长链接名 'K'）：其 data 块存储真实 name，
  * 下一个条目应用它为 name。若路径超 ustar 100(+155 prefix) 限制（如 MtF 108 字符路径），
