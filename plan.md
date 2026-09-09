@@ -40,7 +40,7 @@
 ### 3.1 用户角色
 
 1. **普通用户（登录）**：搜索、看原文引用、可选 LLM 总结/追问。受配额限制。
-2. **超额/未登录用户（如果允许）**：只能走结巴分词回退（纯关键词 BM25/结巴分片召回，无向量、无 LLM），或直接拒绝服务。二选一，推荐 **"未登录仅结巴回退+强登录引导"**，登录后解锁向量检索。
+2. **超额/未登录用户（如果允许）**：只能走**关键词回退**（Qdrant 全文索引，无向量、无 LLM），或直接拒绝服务。二选一，推荐 **"未登录仅关键词回退 + 强登录引导"**，登录后解锁向量检索。
 3. **管理员**：看全站用量、封禁账号、管理 wiki 源、配 API Key（硅基流动专用账号）、调默认参数。
 
 ### 3.2 核心页面（前端重写后）
@@ -74,20 +74,22 @@ POST /api/v1/search {
 {
   hits: [{ id, title, url, source /* wiki 名 */, path /* 章节路径 */, snippet, score, rerank_score? }],
   timings: { embed_ms, search_ms, rerank_ms, llm_ms, total_ms },
-  quota: { used_h, remaining_h, fallback: false },
+  quota: { window_start, window_hours, limit_tokens, used_tokens, used_pct, remaining_pct, exceeded },
   answer?: { text, citations: [hit_id], model: "Qwen3-8B" }
 }
 ```
 
-### 3.4 配额语义：什么是"5h"
+### 3.4 配额语义：滚动 5 小时窗口
 
-必须先定义清楚，否则无法实现。建议定义为 **"加权计算时长（compute-hours）"** 而非墙钟时间：
+**2026-09-09 修订（用户澄清）**：不是「每月 5h」，而是**滚动 5 小时窗口 + 固定额度**，与 ChatGPT / Gemini 的用量窗口同构。
 
-- 方案 A（推荐）：按**后端实际消耗**折算：`quota_cost = embed_cost + qdrant_cost(≈0) + w_rerank × rerank_ms + w_llm × llm_tokens`，折算成"小时"单位展示。权重可调，保证 LLM 开一次 ≈ 纯搜索 N 倍消耗（例如纯搜索 1 次 = 1 单位，rerank ×3，LLM ×50~200取决于 token）。
-- 方案 B：按各模型服务商计费 token 直接扣"点数"，前端换算显示为"小时"。
-- 无论哪种：**每个账号每月重置 5h**（已决策 2026-09-07：按月重置，不做终身制）。
-- 超额后：自动降级为**结巴分词回退**（本地 jieba 分词 + BM25/关键词检索，不调 embedding/reranker/LLM，不耗配额），并明确提示"配额耗尽，已切换为关键词模式"。
-- 未登录用户：同样走**结巴回退 + 登录引导**（已决策，不直接拒绝服务）。
+- 窗口：每账号记 `window_start`；当 `now - window_start ≥ window_hours`（默认 **5h**）时**自动开新窗口**（`window_start = now`、`used_tokens = 0`）。
+  **不是自然月重置**，从窗口起点算满 5 小时即刷新（滚动窗口）。
+- 额度单位：**加权 token**（`limit_tokens` 来自 env `QUOTA_WINDOW_TOKENS`，默认 300,000/窗口）。
+- 消耗模型（见 §6.2 权重表）：`used_tokens += 权重`；LLM 按上游真实 `tokens_in + tokens_out` 计。
+- **前端只显示百分比**：`used_pct` / `remaining_pct`（0–100，1 位小数）；不显示小时/秒/绝对数。
+- 超额后：自动降级为**关键词回退**（Qdrant 全文索引，不调 embedding/reranker/LLM，不耗额度），并明确提示"额度已用尽，已切换为关键词模式"。
+- 未登录用户：同样走**回退 + 登录引导**（已决策，不直接拒绝服务）。
 
 ---
 
@@ -117,7 +119,7 @@ POST /api/v1/search {
 
 ```
 query
- ├─ 配额检查（超额 → 结巴回退分支，直接返回）
+ ├─ 配额检查（超额 → 关键词回退分支，直接返回）
  ├─ embedding(query) ──→ Qdrant 多 collection 并行检索（dense，可选 hybrid）
  ├─ (可选) RRF 合并（如果上 sparse/BM25 双路；否则单 dense 即可，简化）
  ├─ (可选, use_reranker) rerank(candidates) → 截断 top_k
@@ -187,7 +189,7 @@ query
 ### 6.1 登录与强制绑定
 
 - 登录方式：建议 **OAuth 优先**（X / GitHub / Google 三选一或全上），密码登录可选但增加维护（找回密码、撞库），初期不建议自研密码体系。
-- **强制绑定邮箱或 X 账号**：注册后必须完成至少一项绑定才能用向量检索（否则只能结巴回退）。目的：提高批量刷号成本。
+- **强制绑定邮箱或 X 账号**：注册后必须完成至少一项绑定才能用向量检索（否则只能关键词回退）。目的：提高批量刷号成本。
   - **已决策（2026-09-07）：X 绑定为主、邮箱为辅。但 TransPrism 主打隐私，引流用户多对隐私敏感，因此必须守住隐私底线**：
     - X OAuth 只取最小必要字段（id + handle，不存头像/粉丝/推文等）；登录页明示"我们只会读取你的 X 账号 id 与用户名，用于防刷号，不读取推文/关注/私信，不会发帖"；提供"绑定后解绑 X、改绑邮箱"的逃生通道（解绑后仍需保留一种有效绑定）。
     - 邮箱绑定作为隐私友好替代项全程可用，不强制用户必须用 X；不做实名、不收集手机号。
@@ -196,21 +198,24 @@ query
   - X 绑定：X OAuth，天然一人一号门槛更高。
 - 风控：同一邮箱/X 只允许 N 个账号（建议 1）、注册 IP 限流、异常调用频率熔断、管理员一键封禁。
 
-### 6.2 配额（5h）设计
+### 6.2 配额（滚动 5 小时窗口）设计
 
-- 粒度：按账号，**每月重置 5h**（已决策 2026-09-07）。
-- 消耗模型：见 §3.4 方案 A。需要一张权重表，例如（草案，需压测后调）：
+- 粒度：按账号；**滚动 5 小时窗口**，窗口内累计 `used_tokens`，满 5h 自动开新窗口（见 §3.4，2026-09-09 修订）。
+- 额度：`limit_tokens` 来自 env `QUOTA_WINDOW_TOKENS`（默认 300,000/窗口），**不落库**，便于随时调整。
+- 消耗模型（权重表，初值，M4 可调）：
 
-| 操作 | 消耗（单位：配额秒） |
+| 操作 | 消耗（单位：加权 token） |
 |---|---|
-| 纯向量搜索 1 次 | 1 |
-| + reranker | +2 |
-| LLM 总结（按输出 token，每 1k token = X） | 30–120 |
-| LLM 追问每轮 | 按 token 同上 |
-| 结巴回退 | 0 |
+| 纯向量搜索 1 次（embed + Qdrant） | 200 |
+| + reranker | +100 |
+| LLM 总结 / 追问每轮 | 按上游真实 `tokens_in + tokens_out` |
+| 关键词回退 | 0 |
 
-- 查询接口每次返回 `quota.remaining`，前端实时显示；剩余额 < 10% 时提示。
-- 管理员可手动加/扣额度（运营活动、误杀恢复）。
+- 查询接口每次返回 `quota`：`{ window_start, window_hours, limit_tokens, used_tokens, used_pct, remaining_pct, exceeded }`；
+  前端**只显示百分比**，`used_pct ≥ 90` 时提示。
+- 存储：复用 D1 `quotas` 表——`period_start` 存 `window_start`、`used_cost` 存 `used_tokens`（零 DDL）；
+  扣减走 D1 原子 `UPDATE`（KV 无原子自增，不用 KV 记账）。
+- 管理员可手动加/重置当前窗口的额度（运营活动、误杀恢复）。
 
 ### 6.3 Auth 技术选型（Workers 版）
 
@@ -337,10 +342,10 @@ GitHub Actions（每日 UTC 02:00 + 手动触发，见 .github/workflows/ingest.
 ### 8.3 LLM 功能范围
 
 1. **总结（summary）**：基于本次 hits（top_k 全文或截断）做带引用总结，system prompt 强制"只基于给定资料回答，不编造；每条关键结论标注 [来源 n]"。
-2. **追问（chat）**：`session_id` 续多轮，上下文 = 限定窗口（最近 N 轮 + 初始 hits），超长截断；**每轮都扣配额**，前端明确提示。
+2. **追问（chat）**：`session_id` 续多轮，上下文 = 限定窗口（最近 N 轮 + 初始 hits），超长截断；**每轮都扣额度**，前端明确提示。
 3. **查询扩展（可选）**：旧项目的 query expansion 可以保留为内部选项，但默认关闭（省 LLM 配额）；或只在纯搜索零结果时触发一次。
 
-### 8.4 成本控制（重要：LLM 跑 5h 配额很猛）
+### 8.4 成本控制（重要：LLM 消耗额度很猛）
 
 - 默认 `use_llm=false`（已决策 2026-09-07：默认关）；打开时前端二次确认"本次将消耗较多额度"。
 - 流式输出（SSE），首 token 计时；设置 max_tokens 上限（如 800）与请求超时。
@@ -423,7 +428,7 @@ GET  /api/v1/admin/...         # 管理：用量、封禁、ingest runs、模型
 3. 不做全文爬虫（只爬 GitHub wiki 仓库 markdown，不爬渲染后站点）。
 4. 不做多语言（先中文；embedding prompt 与分词都按中文优化）。
 5. 不做 Python 后端；单 Workers 后端（旧 `backend/` 废弃）。
-6. 不承诺终身免费 5h 之外的 SLA；先跑通再谈扩容。
+6. 不承诺免费额度之外的 SLA；先跑通再谈扩容。
 
 ---
 
@@ -434,15 +439,15 @@ GET  /api/v1/admin/...         # 管理：用量、封禁、ingest runs、模型
   **M0 第一件事**：Workers → `api.siliconflow.cn` 连通实测，不通则方案塌（届时重估）。
 - **M1 检索优化（1–2 周）**：硅基流动 rerank 接入 + 批量化 + 超时熔断、可关闭；KV 短期缓存；timings；压测达 §5 性能目标；D1 bigram 回退分支。
 - **M2 数据管线（1 周）**：wiki 注册表 + Cron+Queue 每日增量 + 增量 upsert + 删除处理 + 多 collection（mtf-wiki + miomtfwiki）+ 知识树 + bigram 索引。
-- **M3 账号与 LLM（1–2 周）**：OAuth 登录 + 强制绑定 + 配额（月重置 5h）+ 超额回退 + Qwen3-8B 总结/追问（走 llm_pool）+ 自定义模型 + SSE 流式 + 管理后台（含 keys 管理）。
+- **M3 账号与 LLM（1–2 周）**：X OAuth 登录 + 强制绑定 + 配额（滚动 5 小时窗口 + 加权 token，前端显示百分比）+ 超额回退 + Qwen3.5-4B 总结/追问（走 llm_pool）+ 自定义模型 + SSE 流式 + 管理后台（含 keys 管理）。
 - **M4 灰度与运营（持续）**：小圈子内测、key 补货/轮换演练、权重调参、封禁与加额工具、文档与致谢页。
 
 ---
 
 ## 12. 决策记录（已全部拍板，2026-09-07）
 
-1. 5h 配额：**每月重置**。
-2. 未登录用户：**结巴回退 + 登录引导**（不拒绝服务）。
+1. 配额：**滚动 5 小时窗口 + 加权 token**（窗口满 5h 自动刷新，非自然月）。
+2. 未登录用户：**关键词回退 + 登录引导**（不拒绝服务）。
 3. `use_reranker`：**默认开（T1.4 压测终定，2026-09-08）**。实测 20 条真实 query：首条相关率 75%→85%（+10pp），P50 0.84s→1.39s（仍在 <2s 目标内）；精度优先，超时熔断兜底。数据见 §5.2。
 4. 前端框架：**Nuxt 3 单前端**（Cloudflare Pages 托管）。
 5. 后端：**~~彻底放弃 CF Workers，只留 Python~~ → 反转：全 Cloudflare Workers（复活 backend-cf），Python 版废弃**。理由：省服务器钱；Workers 调硅基流动走 CF 出口，不怕被封 IP。

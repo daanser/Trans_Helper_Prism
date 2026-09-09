@@ -61,6 +61,76 @@
             </svg>
           </a>
 
+          <!-- 站内导航：设置 / 管理（管理仅管理员可见；真实权限由后端 T3.3 兜底） -->
+          <NuxtLink
+            to="/settings"
+            class="hidden rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-xs font-medium text-ink-sub transition-colors hover:border-surface-border-hover hover:text-ink-title sm:inline-flex"
+          >
+            设置
+          </NuxtLink>
+          <NuxtLink
+            v-if="isAdmin"
+            to="/admin"
+            class="hidden rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-xs font-medium text-ink-sub transition-colors hover:border-surface-border-hover hover:text-ink-title sm:inline-flex"
+          >
+            管理
+          </NuxtLink>
+
+          <!-- 账号区：未登录 → 登录入口；已登录 → @handle + 剩余配额 + 退出 -->
+          <div class="flex items-center gap-2">
+            <NuxtLink
+              v-if="!isLoggedIn"
+              to="/login"
+              class="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
+            >
+              <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                <circle cx="12" cy="7" r="4" />
+              </svg>
+              <span>登录</span>
+            </NuxtLink>
+
+            <template v-else>
+              <NuxtLink
+                to="/settings"
+                class="max-w-[7.5rem] truncate rounded-lg border border-surface-border bg-surface px-2.5 py-1.5 text-xs font-medium text-ink-title transition-colors hover:border-surface-border-hover"
+                :title="user ? `@${user.handle}` : '已登录'"
+              >
+                {{ user ? `@${user.handle}` : "已登录" }}
+              </NuxtLink>
+
+              <!-- 配额：只显示百分比（滚动窗口固定额度），低于 10% 用警示色，字段缺失则整块隐藏 -->
+              <div
+                v-if="hasQuotaInfo"
+                class="hidden flex-col items-end gap-1 sm:flex"
+                :title="quotaTitle"
+              >
+                <div class="flex items-center gap-1.5 text-xs tabular-nums" :class="quotaToneClass">
+                  <span
+                    class="h-1.5 w-1.5 shrink-0 rounded-full"
+                    :class="isExceeded || isLowQuota ? 'bg-danger' : 'bg-primary'"
+                  ></span>
+                  <span>{{ quotaLabel }}</span>
+                </div>
+                <div class="h-1 w-24 overflow-hidden rounded-full bg-canvas-subtle">
+                  <div
+                    class="h-full rounded-full transition-all"
+                    :class="isExceeded || isLowQuota ? 'bg-danger' : 'bg-primary'"
+                    :style="{ width: `${remainingPct ?? 0}%` }"
+                  ></div>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                class="rounded-lg border border-surface-border bg-surface px-2.5 py-1.5 text-xs font-medium text-ink-sub transition-colors hover:border-surface-border-hover hover:text-ink-title"
+                @click="onLogout"
+              >
+                退出
+              </button>
+            </template>
+          </div>
+
           <!-- 深浅色主题切换按钮 -->
           <button
             type="button"
@@ -125,7 +195,72 @@
 </template>
 
 <script setup lang="ts">
+import { computed, onMounted } from "vue"
 import { useDarkMode } from "~/composables/useDarkMode"
+import { describeAuthError } from "~/composables/useAuth"
 
 const { isDark, toggle: toggleDark } = useDarkMode()
+const {
+  isLoggedIn,
+  isAdmin,
+  user,
+  hasQuotaInfo,
+  remainingPct,
+  isLowQuota,
+  isExceeded,
+  resetInHours,
+  init,
+  loadMe,
+  consumeHashToken,
+  logout,
+} = useAuth()
+const { pushToast } = useToast()
+const route = useRoute()
+
+/** 顶栏配额文案：只出现百分比，绝不出现小时/秒等绝对数值 */
+const quotaLabel = computed(() => {
+  if (isExceeded.value) {
+    const hours = resetInHours.value
+    return hours ? `额度已用尽 · 约 ${hours} 小时后恢复` : "额度已用尽"
+  }
+  const pct = remainingPct.value
+  return pct === null ? "" : `剩余 ${pct.toFixed(1)}%`
+})
+
+const quotaToneClass = computed(() => {
+  if (isExceeded.value || isLowQuota.value) return "font-medium text-danger"
+  return "text-ink-sub"
+})
+
+const quotaTitle = computed(() => {
+  if (isExceeded.value) {
+    const hours = resetInHours.value
+    return hours
+      ? `本窗口额度已用尽，约 ${hours} 小时后恢复。回退检索不消耗额度。`
+      : "本窗口额度已用尽。回退检索不消耗额度。"
+  }
+  const pct = remainingPct.value
+  if (pct === null) return "尚未读取到配额信息"
+  return `本窗口剩余额度 ${pct.toFixed(1)}%；低于 10% 时提示。回退检索不消耗额度。`
+})
+
+function onLogout() {
+  logout()
+  pushToast("已退出登录", "info")
+  if (route.path === "/settings" || route.path === "/admin") {
+    void navigateTo("/")
+  }
+}
+
+onMounted(() => {
+  // 登录回跳：任意页面都可能带 #token= / #error=（见 useAuth.consumeHashToken）
+  const hashResult = consumeHashToken()
+  if (hashResult?.error) {
+    pushToast(describeAuthError(hashResult.error), "error")
+  }
+  const hasSession = hashResult?.token ? true : init()
+  if (hasSession) {
+    void loadMe()
+  }
+})
 </script>

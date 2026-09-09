@@ -96,7 +96,11 @@
       <!-- 参数开关（精准重排 & AI伴读） -->
       <div class="flex shrink-0 items-center gap-6">
         <ToggleMini v-model="useReranker" label="精准重排" hint="已激活 BAAI/bge-reranker-v2-m3 二次重排序" />
-        <ToggleMini v-model="useLlm" label="AI 伴读" hint="AI 伴读总结接口将于 M3 阶段接入" warn />
+        <ToggleMini
+          :model-value="useLlm"
+          label="AI 伴读"
+          @update:model-value="onLlmToggle"
+        />
       </div>
     </div>
 
@@ -106,20 +110,27 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, ref } from "vue"
+import { nextTick, onMounted, ref } from "vue"
 import { DEFAULT_CORPORA_OPTIONS, type CorpusOption, type SearchRequest } from "~/composables/useApi"
 import { useToast } from "~/composables/useToast"
 import ToggleMini from "./ToggleMini.vue"
 
-const props = defineProps<{ loading: boolean }>()
-const emit = defineEmits<{ (e: "submit", p: Pick<SearchRequest, "query" | "corpora" | "use_reranker" | "use_llm" | "top_k">): void }>()
+/**
+ * `useLlm` 由父组件受控：开关只是「请求开启」，真正的开启要等父组件完成二次确认弹窗，
+ * 避免用户误触后直接产生配额消耗（tasks.md T3.6）。
+ */
+const props = defineProps<{ loading: boolean; useLlm: boolean }>()
+const emit = defineEmits<{
+  (e: "submit", p: Pick<SearchRequest, "query" | "corpora" | "use_reranker" | "use_llm" | "top_k">): void
+  (e: "update:useLlm", v: boolean): void
+}>()
 const { pushToast } = useToast()
+const { prefs, load: loadPrefs } = usePrefs()
 
 const query = ref("")
 const searchInput = ref<HTMLInputElement | null>(null)
 const selectedCorpora = ref<string[]>(["mtf-wiki", "ftm-wiki", "rle-wiki", "miomtfwiki"])
 const useReranker = ref(true)
-const useLlm = ref(false)
 const corporaOptions: CorpusOption[] = DEFAULT_CORPORA_OPTIONS
 
 function toggleCorpus(id: string) {
@@ -134,6 +145,10 @@ function toggleCorpus(id: string) {
   }
 }
 
+function onLlmToggle(next: boolean) {
+  emit("update:useLlm", next)
+}
+
 function clear() {
   query.value = ""
   nextTick(() => searchInput.value?.focus())
@@ -146,10 +161,17 @@ function submit() {
     query: q,
     corpora: [...selectedCorpora.value],
     use_reranker: useReranker.value,
-    use_llm: useLlm.value,
+    use_llm: props.useLlm,
     top_k: 10,
   })
 }
+
+onMounted(() => {
+  // 客户端载入 /settings 保存的默认偏好（预渲染首屏保持默认值，避免 hydration 不一致）
+  const saved = loadPrefs()
+  selectedCorpora.value = [...saved.corpora]
+  useReranker.value = saved.reranker
+})
 
 defineExpose({
   focus: () => searchInput.value?.focus(),

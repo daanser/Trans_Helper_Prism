@@ -168,7 +168,7 @@ const noopDb: KeyPoolDb = { async recordUsage() {} }
 /** fallback 桩包成完整 SearchResponse：timings 归零、quota.fallback=true、追加降级原因 warning。 */
 function toSearchResponse(
   fb: FallbackResponse,
-  quota: { used_h: number; remaining_h: number; fallback: boolean },
+  quota: { used_pct: number; remaining_pct: number; fallback: boolean },
   warnings: string[],
   reason: string,
 ): RunSearchResult {
@@ -204,7 +204,7 @@ export async function runSearch(
   if (req.use_llm) warnings.push("llm-not-yet")
 
   // 配额占位（T3.2 再接真计量）；fallback 标记由下方成功/降级路径覆盖。
-  const quota = { used_h: 0, remaining_h: 0, fallback: false }
+  const quota = { used_pct: 0, remaining_pct: 100, fallback: false }
 
   // ── 纯向量阶段：命中缓存 → 直接用缓存的 hit 列表 + searchMs；未命中 → embed+Qdrant 现算。
   let embedMs = 0

@@ -44,6 +44,13 @@
     // 登录相关（非敏感项写进配置，避免被每次部署覆盖；敏感项 X_CLIENT_ID/X_CLIENT_SECRET/JWT_SECRET 放 Worker Secrets）
     "OAUTH_REDIRECT_URI": "https://transhelper-prism-backend.transprism.workers.dev/api/v1/auth/oauth/x/callback",
     "FRONTEND_BASE_URL": "https://search.chengxi.moe",
+    "QUOTA_WINDOW_TOKENS": "300000",
+    "QUOTA_WINDOW_HOURS": "5",
+    "REQUIRE_LOGIN": "1",
+    "LLM_MODEL": "Qwen/Qwen3.5-4B",
+    "LLM_ENDPOINT": "https://api.siliconflow.cn/v1/chat/completions",
+    "LLM_TIMEOUT_MS": "20000",
+    "LLM_MAX_TOKENS": "800",
     "EMBEDDING_ENDPOINT": "https://api.siliconflow.cn/v1/embeddings",
     "EMBEDDING_MODEL": "BAAI/bge-m3",
     "EMBEDDING_DIM": "1024",

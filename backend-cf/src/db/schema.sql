@@ -187,3 +187,25 @@ CREATE INDEX IF NOT EXISTS idx_audit_created
 
 CREATE INDEX IF NOT EXISTS idx_audit_actor
   ON audit_log (actor_id, created_at);
+
+-- ─────────────────────────────────────────────
+-- 自定义模型（T3.5，plan.md §8.2）：用户自带 OpenAI-compatible 配置。
+-- api_key_enc 为 AES-GCM 密文（v1:base64(iv|cipher)），密钥来自 Workers secret CUSTOM_MODEL_ENC_KEY；
+-- 绝不存明文 key。查询一律带 account_id（越权视为不存在）。
+-- ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS custom_models (
+  id          TEXT PRIMARY KEY,
+  account_id  TEXT NOT NULL,                  -- -> accounts.id
+  name        TEXT NOT NULL DEFAULT '',       -- 用户可见标签
+  base_url    TEXT NOT NULL,                  -- https://…（已过 SSRF 校验）
+  model       TEXT NOT NULL,                  -- 上游模型名
+  api_key_enc TEXT NOT NULL,                  -- 密文，绝不存明文
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_custom_models_account
+  ON custom_models (account_id, updated_at);
+
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_account
+  ON chat_sessions (account_id, updated_at);

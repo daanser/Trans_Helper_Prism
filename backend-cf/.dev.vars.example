@@ -25,6 +25,24 @@ FRONTEND_BASE_URL=https://search.chengxi.moe
 # 管理员 X 数字 id（逗号分隔），留空则所有人都是普通用户
 ADMIN_X_IDS=
 
+
+# ── 配额（T3.2：滚动 5 小时窗口 + 加权 token）──────────────
+# 窗口内额度（加权 token）；纯搜索 200 / +rerank +100 / LLM 按真实 tokens / 回退 0
+QUOTA_WINDOW_TOKENS=300000
+QUOTA_WINDOW_HOURS=5
+# 未登录是否只走关键词回退（"1"=是，plan §2 登录制；"0"=放开完整检索）
+REQUIRE_LOGIN=1
+
+# ── LLM（T3.4 / T3.5）────────────────────────────────────
+LLM_MODEL=Qwen/Qwen3.5-4B
+LLM_ENDPOINT=https://api.siliconflow.cn/v1/chat/completions
+LLM_TIMEOUT_MS=20000
+LLM_MAX_TOKENS=800
+# 自定义模型 api_key 的加密密钥（T3.5 必需）：
+#   32 字节 base64，或任意 ≥16 字符（会经 SHA-256 派生）；缺失则相关接口 503，绝不落明文
+#   生成：openssl rand -base64 32
+CUSTOM_MODEL_ENC_KEY=
+
 # 只用于 scripts/probe-connectivity.ts（本地运行时读环境变量，非 Worker secret）
 PROBE_SILICONFLOW_API_KEY=sk-xxxx
 # 注意：绝不可把真实 key 提交到仓库；.dev.vars 与 .env 均被 .gitignore 排除。

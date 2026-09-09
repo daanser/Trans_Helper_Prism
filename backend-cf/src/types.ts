@@ -48,6 +48,24 @@ export interface Env {
   JWT_SECRET?: string
   /** 管理员 X 数字 id，逗号分隔 */
   ADMIN_X_IDS?: string
+
+  // ── 配额（T3.2：滚动 5 小时窗口 + 加权 token）──
+  /** 窗口额度（加权 token），默认 300000 */
+  QUOTA_WINDOW_TOKENS?: string
+  /** 窗口长度（小时），默认 5 */
+  QUOTA_WINDOW_HOURS?: string
+  /** 未登录是否只走关键词回退（默认 "1"=是；"0"=放开完整检索） */
+  REQUIRE_LOGIN?: string
+
+  // ── LLM（T3.4 / T3.5）──
+  LLM_MODEL?: string
+  LLM_ENDPOINT?: string
+  LLM_TIMEOUT_MS?: string
+  LLM_MAX_TOKENS?: string
+  /** false | true | omit（不吃该参数的模型用 omit） */
+  LLM_ENABLE_THINKING?: string
+  /** 自定义模型 api_key 的 AES-GCM 加密密钥（缺失则相关接口 503，绝不落明文） */
+  CUSTOM_MODEL_ENC_KEY?: string
 }
 
 /** 一次搜索的请求体（plan.md §3.3）。M0 只实现 corpora=["mtf-wiki"]。 */
@@ -86,7 +104,7 @@ export interface SearchResponse {
     /** T1.2：命中短期向量缓存时为 true（跳过 embed+Qdrant；rerank 仍重算）。缺省视作 false。 */
     cached?: boolean
   }
-  quota: { used_h: number; remaining_h: number; fallback: boolean }
+  quota: { used_pct: number; remaining_pct: number; fallback: boolean }
   warnings: string[]
   answer?: { text: string; citations: string[]; model: string }
   /** 降级分支标记（plan §5.4：回退时带 fallback:true，前端展示 banner）。 */

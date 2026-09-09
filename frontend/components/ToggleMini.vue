@@ -21,8 +21,11 @@
       />
     </button>
     <span
-      class="text-xs font-medium transition-colors"
-      :class="modelValue ? 'font-semibold text-slate-900 dark:text-slate-100' : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'"
+      :class="
+        hideLabel
+          ? 'sr-only'
+          : ['text-xs font-medium transition-colors', modelValue ? 'font-semibold text-slate-900 dark:text-slate-100' : 'text-slate-500 hover:text-slate-700 dark:text-slate-400']
+      "
     >
       {{ label }}
     </span>
@@ -37,6 +40,8 @@ const props = defineProps<{
   label: string
   hint?: string
   warn?: boolean
+  /** 仅保留无障碍名称、不显示文字（用于旁边已有说明文案的场景） */
+  hideLabel?: boolean
 }>()
 
 const emit = defineEmits<{
