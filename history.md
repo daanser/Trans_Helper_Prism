@@ -101,6 +101,8 @@
 32. **`key_usage` 加列不能用 `CREATE TABLE IF NOT EXISTS` 补**（SQLite 无 `ADD COLUMN IF NOT EXISTS`）：迁移语句要单独导出，apply-schema 先跑迁移再建表，并把 `duplicate column name` / ALTER 的 `no such table` 视为成功（其它错误仍 failed）。**部署顺序硬要求：先 deploy，再立刻 POST apply-schema**——迁移完成前 `/admin/usage` 会 503（故意报错而不是显示假 0）。
 33. **登录回跳 fragment 要在 Nuxt 启动前消费**：放在 `onMounted` 里可能因水合/路由初始化重写 URL 而读不到 hash；现改为 `nuxt.config.ts` head 内联脚本先落 `localStorage.prism_token` 并清 hash（`useAuth.consumeHashToken` 保留作兜底，错误信息经 `sessionStorage` 传递）。
 
+34. **X 的 `/2/users/me` 必须有 `tweet.read`**：曾按"只取 id+username"把 OAuth scope 收窄成只 `users.read`，结果回调 403（前端 `登录失败（x-users-me-failed status=403）`）。**默认 scope 必须两条**，别删；`X_OAUTH_SCOPES` env 只是个实验口子，改完必须真机走一次登录。
+
 ## 6. 前端现状（2026-09-08 全量重写 UI/UX；2026-09-09 已上线 Pages）
 - **设计语言已彻底换掉**：不再是照搬 `vitepress-theme-project-trans` 的 indigo 色板。现为自定「温润学术检索」风——浅底 `#F8FAFC` / 深底 `#0B1120`，品牌蓝 `#2563EB`（深 `#3B82F6`），token 全走 `assets/css/main.css` 的 CSS 变量（`--bg-canvas/--bg-surface/--text-*/--primary*`），`tailwind.config.ts` 只做语义映射（`canvas/surface/primary/ink`）。
 - **用户明确否决过的方向（别再走回头路）**：① 高饱和四色彩虹 wiki 徽章（粉/天蓝/紫/翠绿）——太 AI 味；② 纯黑 `bg-slate-900` 实色选中块——太凝重死寂；③ 全大写英文终端风标签（`ARCHIVE RETRIEVAL //`、`SEARCH`、`PERF //`）——读不懂。现方案：四库**统一中性**选中态（淡蓝底 `bg-blue-50/80` + 勾选 `✓`，无彩色区分），中文标签，`max-w-7xl` 宽屏。

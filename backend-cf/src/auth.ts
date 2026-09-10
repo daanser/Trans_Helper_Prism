@@ -48,12 +48,12 @@ const STATE_TTL = 600
 /** 会话有效期。 */
 const SESSION_TTL = "30d"
 /**
- * X OAuth 2.0 scope。默认只要 `users.read`——代码只调 `/2/users/me` 取 id + username，
- * 不读帖子/关注关系；少要一个权限，授权页文案也更克制。
- * 若某天 X 的 /users/me 因 scope 不足被拒（回调会回 `x-users-me-failed`），
- * 把 env `X_OAUTH_SCOPES` 设回 `"users.read tweet.read"` 即可回滚（无需改代码）。
+ * X OAuth 2.0 scope。**实测（2026-09-09）只给 `users.read` 时 `/2/users/me` 返回 403**，
+ * 即使我们只取 id + username 也必须带 `tweet.read`——所以默认是两条，别删。
+ * （我们把 scope 做成 env 可配只是留个实验/回滚口子；换 scope 后必须真机登录验证。）
+ * 代码本身不读帖子/关注关系，只调 `/2/users/me?user.fields=username`。
  */
-const X_SCOPES_DEFAULT = ["users.read"]
+const X_SCOPES_DEFAULT = ["users.read", "tweet.read"]
 /** 解析 env 里的 scope（逗号或空格分隔）；空/非法回默认。 */
 export function resolveXScopes(env: { X_OAUTH_SCOPES?: string }): string[] {
   const raw = (env.X_OAUTH_SCOPES ?? "").trim()

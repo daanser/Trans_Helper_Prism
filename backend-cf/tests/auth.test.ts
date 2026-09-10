@@ -137,24 +137,21 @@ describe("startXLogin", () => {
     await expect(startXLogin(makeEnv({ X_CLIENT_ID: undefined }), undefined)).rejects.toBeInstanceOf(AuthConfigError)
   })
 
-  it("scope 默认只要 users.read；可用 env 覆盖（回滚用）", async () => {
-    expect(resolveXScopes({})).toEqual(["users.read"])
-    expect(resolveXScopes({ X_OAUTH_SCOPES: "users.read" })).toEqual(["users.read"])
-    expect(resolveXScopes({ X_OAUTH_SCOPES: "users.read tweet.read" })).toEqual(["users.read", "tweet.read"])
+  it("scope 默认两条（实测少了 tweet.read 会被 X 403）；env 可覆盖", async () => {
+    // 回归：曾试图只留 users.read，结果 /2/users/me 403（x-users-me-failed）→ 默认必须含 tweet.read
+    expect(resolveXScopes({})).toEqual(["users.read", "tweet.read"])
     expect(resolveXScopes({ X_OAUTH_SCOPES: "users.read,tweet.read" })).toEqual(["users.read", "tweet.read"])
-    expect(resolveXScopes({ X_OAUTH_SCOPES: "   " })).toEqual(["users.read"])
+    expect(resolveXScopes({ X_OAUTH_SCOPES: "users.read" })).toEqual(["users.read"])
+    expect(resolveXScopes({ X_OAUTH_SCOPES: "   " })).toEqual(["users.read", "tweet.read"])
   })
 
-  it("授权 URL 里带的是解析后的 scope（默认不含 tweet.read）", async () => {
+  it("授权 URL 里带的是解析后的 scope（默认含 tweet.read）", async () => {
     const { kv } = makeKv()
     const env = makeEnv({ SEARCH_CACHE: kv })
     const { url } = await startXLogin(env, undefined)
     const scope = new URL(url).searchParams.get("scope") ?? ""
     expect(scope).toContain("users.read")
-    expect(scope).not.toContain("tweet.read")
-
-    const widened = await startXLogin(makeEnv({ SEARCH_CACHE: kv, X_OAUTH_SCOPES: "users.read tweet.read" }), undefined)
-    expect(new URL(widened.url).searchParams.get("scope")).toContain("tweet.read")
+    expect(scope).toContain("tweet.read")
   })
 
   it("回跳地址做白名单校验：非白名单退回默认 /login", async () => {
