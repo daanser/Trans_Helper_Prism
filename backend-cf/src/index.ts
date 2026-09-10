@@ -854,6 +854,19 @@ api.get("/admin/whoami", async (c) => {
     // 后端实际会用于限流的取值（复现 clientIpFromHeaders 的信任链）
     resolved_ip: resolved.ip ?? null,
     resolved_by: resolved.by,
+    // CF 的网络元数据：用于「按 IP 分档限流」判断家宽 / 机房 / 境外（见 TODO.md P0）
+    // 注意：这些字段是 CF 在边缘根据连接判定的，**不可伪造**；我们只用它们做分档，不落库。
+    cf: (() => {
+      const meta = (c.req.raw as unknown as { cf?: Record<string, unknown> }).cf ?? {}
+      return {
+        country: meta.country ?? null,
+        asn: meta.asn ?? null,
+        asOrganization: meta.asOrganization ?? null,
+        colo: meta.colo ?? null,
+        city: meta.city ?? null,
+        region: meta.region ?? null,
+      }
+    })(),
   })
 })
 
