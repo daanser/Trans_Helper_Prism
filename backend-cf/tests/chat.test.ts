@@ -7,6 +7,7 @@
 //   4) 调用错误信息绝不回显 key。
 // 全部 mock，不触真实上游；断言里只有占位串，不含任何真实 key。
 import { describe, it, expect } from "vitest"
+import { deleteCustomModel } from "../src/custommodel"
 import {
   CHAT_MAX_HISTORY_MESSAGES,
   CHAT_MAX_MESSAGE_CHARS,
@@ -580,5 +581,54 @@ describe("custommodel：callCustomModel 与落库", () => {
 
     const loaded = await loadCustomModel(db, env, "acc-1", first.model.id)
     if (loaded.ok) expect(loaded.config.api_key).toBe("keep-me-1234")
+  })
+})
+
+// ── T3.5 补充：自定义模型删除（越权/不存在 → not-found；缺 D1 → db-unavailable）──
+describe("deleteCustomModel", () => {
+  function makeDeleteDb(changes: number, throwErr = false) {
+    const calls: Array<{ sql: string; args: unknown[] }> = []
+    const stmt = (sql: string) => {
+      const rec = { sql, args: [] as unknown[] }
+      const self = {
+        bind(...a: unknown[]) {
+          rec.args = a
+          calls.push(rec)
+          return self
+        },
+        first: async () => null,
+        all: async () => ({ results: [] }),
+        run: async () => {
+          if (throwErr) throw new Error("d1-error")
+          return { success: true, meta: { changes } }
+        },
+      }
+      return self
+    }
+    return { db: { prepare: stmt } as never, calls }
+  }
+
+  it("删除成功返回 deleted=1，且 SQL 带 account_id（越权隔离）", async () => {
+    const { db, calls } = makeDeleteDb(1)
+    const res = await deleteCustomModel(db, "acc-1", "m-1")
+    expect(res).toEqual({ ok: true, deleted: 1 })
+    expect(calls[0].sql).toContain("DELETE FROM custom_models")
+    expect(calls[0].sql).toContain("account_id")
+    expect(calls[0].args).toEqual(["m-1", "acc-1"])
+  })
+
+  it("不存在 / 不属于本人（changes=0）→ not-found", async () => {
+    const { db } = makeDeleteDb(0)
+    const res = await deleteCustomModel(db, "acc-1", "other")
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.code).toBe("not-found")
+  })
+
+  it("缺 D1 → db-unavailable；D1 抛错 → db-unavailable（不向上抛）", async () => {
+    expect((await deleteCustomModel(null, "acc-1", "m-1")).ok).toBe(false)
+    const { db } = makeDeleteDb(1, true)
+    const res = await deleteCustomModel(db, "acc-1", "m-1")
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.code).toBe("db-unavailable")
   })
 })

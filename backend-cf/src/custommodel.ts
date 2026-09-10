@@ -649,3 +649,32 @@ export async function loadCustomModel(
     },
   }
 }
+
+/** 删除结果。 */
+export type DeleteCustomModelResult =
+  | { ok: true; deleted: number }
+  | { ok: false; code: "db-unavailable" | "not-found"; reason: string }
+
+/**
+ * 删除属于该 account 的自定义模型（越权/不存在 → not-found，绝不泄漏他人是否存在）。
+ * 注意：api_key 是密文落库，删除即不可恢复；调用方无需先解密。
+ */
+export async function deleteCustomModel(
+  db: CustomModelDb | null | undefined,
+  accountId: string,
+  id: string,
+): Promise<DeleteCustomModelResult> {
+  if (!db) return { ok: false, code: "db-unavailable", reason: "db-unavailable" }
+  if (!accountId || !id) return { ok: false, code: "not-found", reason: "id-required" }
+  try {
+    const res = await db
+      .prepare("DELETE FROM custom_models WHERE id = ? AND account_id = ?")
+      .bind(id, accountId)
+      .run()
+    const changes = (res as { meta?: { changes?: number } } | null)?.meta?.changes ?? 0
+    if (!changes) return { ok: false, code: "not-found", reason: "not-found" }
+    return { ok: true, deleted: changes }
+  } catch {
+    return { ok: false, code: "db-unavailable", reason: "db-delete-failed" }
+  }
+}

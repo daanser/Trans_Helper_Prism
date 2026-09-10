@@ -51,7 +51,13 @@ import {
   type LlmUsage,
 } from "./llm"
 import { appendRound, createSession, historyToMessages, isMaxRounds, loadContext } from "./chat"
-import { callCustomModel, listCustomModels, loadCustomModel, saveCustomModel } from "./custommodel"
+import {
+  callCustomModel,
+  deleteCustomModel,
+  listCustomModels,
+  loadCustomModel,
+  saveCustomModel,
+} from "./custommodel"
 import type { KeyPool, KeyPoolDb, UsageRecord } from "./keypool"
 import {
   buildPoolInfos,
@@ -589,6 +595,17 @@ api.post("/settings/models", async (c) => {
     return c.json({ error: saved.code, reason: saved.reason }, status)
   }
   return c.json({ model: saved.model })
+})
+
+// DELETE /settings/models/:id —— 删除本人自定义模型（越权/不存在 → 404）
+api.delete("/settings/models/:id", async (c) => {
+  const session = await sessionFromHeader(c.env, c.req.header("Authorization"))
+  if (!session) return c.json({ error: "unauthorized" }, 401)
+  const deleted = await deleteCustomModel(c.env.DB, session.sub, c.req.param("id"))
+  if (!deleted.ok) {
+    return c.json({ error: deleted.code, reason: deleted.reason }, deleted.code === "db-unavailable" ? 503 : 404)
+  }
+  return c.json({ ok: true, deleted: deleted.deleted })
 })
 
 /**
