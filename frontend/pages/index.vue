@@ -603,6 +603,10 @@ function aiFailureText(err: unknown): string {
   if (code === "llm-unavailable" || code === "llm-upstream" || code === "llm-not-configured") {
     return "AI 总结暂不可用（上游模型不可用）。主检索结果不受影响。"
   }
+  // 502/503/504（含反代透传的 upstream-unreachable）：上游抖动，给友好文案而不是甩原始错误
+  if (status === 502 || status === 503 || status === 504 || code === "upstream-unreachable") {
+    return "服务暂时不可用，请稍后重试。主检索结果不受影响。"
+  }
   if (code) return `AI 总结暂不可用：${code}。主检索结果不受影响。`
   return `AI 总结暂不可用：${(err as Error)?.message || "服务异常"}。主检索结果不受影响。`
 }
@@ -694,7 +698,11 @@ async function doSearch(payload: Pick<SearchRequest, "query" | "corpora" | "use_
       // 额度耗尽（quota-exceeded）不走这里 —— 它由后端的回退分支返回，属于另一套语义。
       applyRateLimit(err)
     } else {
-      error.value = err?.message || "网络请求异常，请稍后重试"
+      // 上游抖动（含反代透传的 upstream-unreachable）→ 友好文案，不甩原始错误
+      const status = (err as { status?: number })?.status
+      const code = (err as { code?: string })?.code ?? ""
+      const transient = status === 502 || status === 503 || status === 504 || code === "upstream-unreachable"
+      error.value = transient ? "服务暂时不可用，请稍后重试" : err?.message || "网络请求异常，请稍后重试"
       results.value = []
       pushToast(error.value, "error")
     }
