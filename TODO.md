@@ -53,8 +53,13 @@ X OAuth 的回调地址是 `https://transhelper-prism-backend.transprism.workers
 1. **R1**（你，5 分钟）：CF 边缘限流规则 —— zone `chengxi.moe` → Security → WAF → Rate limiting rules
    → `/api/v1/search` + 按 IP + 10 秒窗口 / 20 次 → Block 10 秒。**这层在边缘拦，连 Worker 成本都省。**
 2. **R2**（你 + 我）：`PROXY_SHARED_SECRET` 在 **Pages env** 与 **Worker Secret** 两处设成同一个值（代码已就绪）。
-3. **R3–R5**（我/subagent）：D1 计数 + 分档（CN 家宽 30 / 其余 10 / 登录 60 次每分钟）+ 熔断 + 观测。
-4. **R6（本条是你单独点名的 TODO）**：**5h 额度重置时间的展示与锚定方式**
+3. **R3–R5**（我/subagent）：D1 计数 + 分档（CN 家宽 30 / CN 其它 15 / **CN 机房 6** / 境外 10 / 登录 60 次每分钟；
+   **LLM 端点 = 该档限额 ÷ 5 向上取整**）+ 熔断 + 观测。
+4. **R6.5（可选优化）**：把 **`search.chengxi.moe` 子域名单独 NS 委派**到 Worker 所在账号（不必迁 `chengxi.moe` 主体），
+   然后加 `api.search.chengxi.moe` 作为 Worker 自定义域、**删掉 Pages Function 反代** ——
+   这样 Worker 直接看到真实客户端 IP/ASN，限流天然准确、少一跳。方案与坑见 `plan-ratelimit.md` §8.1。
+   （若 `transhelper.org` 已在同账号，直接加 `api.transhelper.org` 更省事，无需委派。）
+5. **R6（本条是你单独点名的 TODO）**：**5h 额度重置时间的展示与锚定方式**
    - 现状：窗口起点 = 每个用户**自己首次请求的时刻**（天然错峰，不存在全局统一重置挤爆）；
      但**会漂移**（过期后从"下次请求时刻"重算）→ 重置时刻不可预测，无法展示"还有多久重置"。
    - 计划：改为**按注册时间的网格锚定**（`window_start = 注册时间 + k×5h`），重置时刻固定可预测且仍错峰；

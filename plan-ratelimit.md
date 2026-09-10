@@ -71,8 +71,8 @@ x-prism-colo:      SIN                       # 可选
 | `logged_in` | 有效 JWT 会话 | **60** | 另有 5h 加权 token 配额精确计量（真正的成本闸门）|
 | `cn_residential` | `country=CN` 且 ASN ∈ 家宽/移动白名单 | **30** | 目标主力用户：CN 家宽/移动网络通常较干净 |
 | `cn_other` | `country=CN` 且 ASN 既不在白名单也不在 IDC 名单 | **15** | 保守中间档 |
-| `cn_idc` | `country=CN` 且 ASN ∈ 云/IDC 名单 | **10** | 阿里云/腾讯云/华为云/UCloud/百度云… |
-| `overseas` | `country≠CN` | **10**（可调 5）| 逼境外用户登录（登录后 60/min）|
+| `cn_idc` | `country=CN` 且 ASN ∈ 云/IDC 名单 | **6** | 阿里云/腾讯云/华为云/UCloud/百度云…。**刻意低于境外**：正常人不会用机房 IP 连站，且机房 IP 是攻击主力（曾被打过）|
+| `overseas` | `country≠CN` | **10**（可调 5）| 逼境外用户登录（登录后 60/min）。略高于 CN 机房，因为境外的正常读者（含海外华人）比机房攻击者多 |
 | `unknown` | 取不到 country 或 ASN | **5** | 最保守；故障时宁可少放行 |
 
 **env 变量**（全部可调，缺省用上表）：
@@ -80,10 +80,29 @@ x-prism-colo:      SIN                       # 可选
 RATE_LIMIT_LOGGED_IN_PER_MIN=60
 RATE_LIMIT_CN_RESIDENTIAL_PER_MIN=30
 RATE_LIMIT_CN_OTHER_PER_MIN=15
-RATE_LIMIT_CN_IDC_PER_MIN=10
+RATE_LIMIT_CN_IDC_PER_MIN=6
 RATE_LIMIT_OVERSEAS_PER_MIN=10
 RATE_LIMIT_UNKNOWN_PER_MIN=5
+# LLM 端点限额 = ceil(对应搜索限额 / 该除数)——默认 5，可改 4
+RATE_LIMIT_LLM_DIVISOR=5
 ```
+
+### 4.0 LLM 端点单独收紧（同一个分档，除以除数后向上取整）
+LLM（`/search/stream`、`/chat`）单次成本远高于纯检索，所以**复用同一套分档，只把限额除以 `RATE_LIMIT_LLM_DIVISOR`（默认 5）并向上取整**：
+
+| tier | 搜索（次/分钟）| LLM（次/分钟）= `ceil(搜索/5)` |
+|---|---|---|
+| `logged_in` | 60 | **12** |
+| `cn_residential` | 30 | **6** |
+| `cn_other` | 15 | **3** |
+| `cn_idc` | 6 | **2** |
+| `overseas` | 10 | **2** |
+| `unknown` | 5 | **1** |
+
+- 下限保护：任何档位的 LLM 限额**至少 1**（不能因为取整变 0）。
+- 现状说明：LLM 端点目前**要求登录**（未登录 401），所以该限额实际作用在 `logged_in` 档（60 → 12/min），
+  且还有 5h 加权 token 配额做精确计量；公式保留是为了将来若放开匿名 AI 可直接生效。
+- 搜索与 LLM **分别计数**（两个桶），互不占用对方的额度。
 
 ### 4.1 CN 家宽/移动 ASN 白名单（初始值，需按数据校准）
 已知主要骨干，**先作为初始清单**：
@@ -180,9 +199,43 @@ CREATE INDEX IF NOT EXISTS idx_rate_counters_window ON rate_counters (window_sta
   浏览器若直连它，墙内用户搜索/登录全废 —— 这正是本次 P0 要解决的事。所以保留 `/api/*` 反代 = 保留墙内可用性。
 - 反代的**副作用**（真实 IP/元数据丢失、KV 限流失效）已由 §3 的信任链 + §5 的 D1 计数解决。
 
-**可选后续优化（非必须）**：若将来把 `chengxi.moe` 迁到与 Worker 同一个 CF 账号，可改用
-**Worker 自定义域**（如 `api.chengxi.moe`）直接承载 API —— 这样 Worker 直接看到真实 IP 与 `request.cf`，
-反代层可以删除，信任链也不再需要。当前 `chengxi.moe` 在另一个 CF 账号，跨账号无法直接加 Worker 路由（history 坑 17）。
+### 8.1 可选升级：把 `search.chengxi.moe` **子域名**单独委派过来（不必迁整个 `chengxi.moe`）
+
+**可以做到**。做法是「子域名 NS 委派」（child zone delegation），`chengxi.moe` 主体与其它记录**不受影响**：
+
+```
+① 在 chengxi.moe 所在账号：给子域加一条 NS 委派
+   search.chengxi.moe.  NS  <CF 给新 zone 分配的两个 ns>（如 kai.ns.cloudflare.com / pat.ns.cloudflare.com）
+② 在 Worker 所在账号（transprism）：把 search.chengxi.moe 作为**新 zone** 添加
+   → CF 校验委派生效后，该子域就成了本账号下的独立 zone
+③ 在这个新 zone 里：
+   · search.chengxi.moe  → 重新关联到 Pages 项目（custom domain）
+   · api.search.chengxi.moe → 添加为 **Worker 自定义域**（Custom Domain）
+④ 把前端 `NUXT_PUBLIC_API_BASE` 改成 https://api.search.chengxi.moe/api，
+   并**删掉 Pages Function 反代**（frontend/functions/ 整个目录可移除）
+```
+
+**收益（为什么值得做）**
+- Worker 直接承载 API → **看到真实客户端 IP 与真实 `request.cf`（country/asn）**，
+  不再需要 `PROXY_SHARED_SECRET` 信任链、不再有"子请求元数据是 Cloudflare 自己"的问题；
+- 少一跳（Pages Function），延迟更低、故障面更小；
+- IP 分档限流变得**天然准确**，边缘限流规则也能直接按 country/ASN 分流。
+
+**代价与坑（务必先读）**
+1. **委派后 `search.*` 下的所有记录都由新 zone 管**：原来在 `chengxi.moe` 里为 `search` 建的 CNAME/其它记录要
+   在新 zone 里重建（含 Pages 自定义域关联），漏了就是那段解析失效。
+2. **迁移期间有短暂断服**（NS 生效 + 证书签发，通常几分钟到几十分钟）。
+3. 新 zone 会占用一个 zone 配额（免费版可加多个 zone，但**子域名 zone 需要能通过 CF 的 NS 校验**——
+   在父域加 NS 记录这一步必须在 `chengxi.moe` 账号操作，你要有那个账号的访问权）。
+4. Pages 自定义域当前是跨账号关联（history 坑 17 的 1014/1016）：委派后应**先在新 zone 重新添加**，
+   确认 200 后再删旧关联，避免中间态解析悬空。
+5. `api.search.chengxi.moe` 与 `search.chengxi.moe` 都自动走 CF 证书，无需自备。
+
+**更省事的替代（如果它成立）**：若 `transhelper.org`（或任何你**已经在 transprism 账号里**的域名）
+可用，直接加一条 Worker 自定义域 `api.transhelper.org` 即可 —— **不用任何委派**，同样能达到"Worker 直接见真实 IP"的效果。
+优先级建议：**同账号域名 > 子域委派 > 保持现状（反代 + 信任链）**。
+
+> 现状（反代 + `PROXY_SHARED_SECRET` 信任链 + D1 计数）本身是**可用**的，上面属于优化项，不是阻塞项。
 
 ---
 
@@ -233,7 +286,8 @@ window_start = registration_time + floor((now - registration_time) / window_ms) 
 
 ## 11. 验收标准
 
-1. **分档生效**：CN 家宽 IP 第 31 次/分钟 → 429；境外/机房 IP 第 11 次 → 429；登录用户第 61 次 → 429（且配额照常扣减）。
+1. **分档生效**：CN 家宽 IP 第 31 次/分钟 → 429；境外第 11 次 → 429；**CN 机房第 7 次** → 429；登录用户第 61 次 → 429（且配额照常扣减）。
+2. **LLM 收紧生效**：登录用户第 13 次 LLM 请求/分钟 → 429（`ceil(60/5)=12`）；搜索计数与 LLM 计数互不影响。
 2. **不存 IP**：`rate_counters` 表内无任何明文 IP（抽查 + 单测断言）；审计日志与错误日志不含 IP。
 3. **失效防护**：未配 `PROXY_SHARED_SECRET` 时行为与今天一致；伪造 `x-prism-*` / `X-Forwarded-For` 一律不采信（已有单测）。
 4. **熔断**：全局软熔断触发后匿名只拿到关键词回退（上游 embedding 调用量为 0）；硬熔断后匿名 429、登录用户仍可用。
@@ -254,4 +308,4 @@ window_start = registration_time + floor((now - registration_time) / window_ms) 
 
 ---
 
-_最后更新：2026-09-09_
+_最后更新：2026-09-09（CN 机房档 10→6；新增 LLM 除数规则与子域名委派方案）_
