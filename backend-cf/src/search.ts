@@ -9,7 +9,7 @@ import { createEmbeddingProvider, defaultFetch } from "./embeddings"
 import { createRerankProvider } from "./rerank"
 import { runFallback, FallbackResponse } from "./fallback"
 import { kvCache, buildCacheKey, cacheGetVectorStage, cachePutVectorStage, type CacheStore } from "./searchcache"
-import type { KeyPoolDb } from "./keypool"
+import type { KeyPoolDb, PoolName } from "./keypool"
 
 /** M0 四个库的 corpora 白名单（tasks.md T0.4）。 */
 export const VALID_CORPORA = ["mtf-wiki", "ftm-wiki", "rle-wiki", "miomtfwiki"] as const
@@ -31,6 +31,11 @@ export interface RunSearchOpts {
   nowMs?: () => number
   /** 结果缓存（KVNamespace 或测试内存实现）。注入后优先于 env.SEARCH_CACHE。 */
   cache?: CacheStore
+  /**
+   * T3.3 运行时效：admin 下架的 key ref（按池，见 keyadmin.ts 的 `readDeniedPools`）。
+   * 只透传给 KeyPool，**不改动检索语义**；缺省/空 = 无禁用（fail-open）。
+   */
+  denied?: Partial<Record<PoolName, Iterable<string>>>
 }
 
 export type RunSearchResult = SearchResponse | FallbackResponse
@@ -221,7 +226,7 @@ export async function runSearch(
     // ── embedding(query)，走 embed_pool；失败 → fallback ──
     let vector: number[]
     try {
-      const { provider } = createEmbeddingProvider(env, opts.db ?? noopDb, fetchImpl)
+      const { provider } = createEmbeddingProvider(env, opts.db ?? noopDb, fetchImpl, { denied: opts.denied })
       const t0 = nowMs()
       vector = await provider.embed(req.query.trim(), { kind: "query" })
       embedMs = nowMs() - t0
@@ -305,7 +310,7 @@ export async function runSearch(
       const docs = candidates.map(rerankDocText)
       let rerankScores: number[]
       try {
-        const { provider } = createRerankProvider(env, opts.db ?? noopDb, fetchImpl)
+        const { provider } = createRerankProvider(env, opts.db ?? noopDb, fetchImpl, { denied: opts.denied })
         const t2 = nowMs()
         rerankScores = await provider.rerank(req.query.trim(), docs, {
           timeoutMs: parseTimeoutMs(env.RERANK_TIMEOUT_MS), // T1.3 超时配置项

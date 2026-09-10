@@ -4,6 +4,7 @@
 // /api/v1/corpora（T2.1）、/api/v1/tree/:wiki_id（T2.4）、Queue consumer + Cron（T2.2 增量管线）。
 // 其余路由登记为占位/未实现（返回 501 not-yet），待 M3 填充。
 import { Hono } from "hono"
+import type { Context } from "hono"
 import { cors } from "hono/cors"
 import { Env, SearchRequest, SearchResponse } from "./types"
 import { runSearch, validate, SearchValidationError } from "./search"
@@ -51,7 +52,20 @@ import {
 } from "./llm"
 import { appendRound, createSession, historyToMessages, isMaxRounds, loadContext } from "./chat"
 import { callCustomModel, listCustomModels, loadCustomModel, saveCustomModel } from "./custommodel"
-import type { KeyPoolDb, UsageRecord } from "./keypool"
+import type { KeyPool, KeyPoolDb, UsageRecord } from "./keypool"
+import {
+  buildPoolInfos,
+  fetchProviderKeyRows,
+  isPoolName,
+  isSafeKeyRef,
+  kvDenyStore,
+  poolRefsFromEnv,
+  readDeniedPools,
+  setKeyDenied,
+  upsertProviderKey,
+  type DeniedPools,
+} from "./keyadmin"
+import { buildAdminUsage } from "./adminstats"
 
 /** Key Pool 记账适配：把用量写进 D1 key_usage（失败不影响业务）。 */
 function makeKeyUsageDb(env: Env): KeyPoolDb {
@@ -94,7 +108,28 @@ function getChatProvider(env: Env) {
     chatProvider = createChatProvider(env, makeKeyUsageDb(env))
     chatProviderFp = fp
   }
-  return chatProvider.provider
+  return chatProvider
+}
+
+/**
+ * T3.3 运行时效：读 KV 的「admin 下架 key」集合（fail-open）。
+ * 读 KV / 解析 / 任何异常 → 空集合（视为无禁用），**绝不影响检索与 LLM**。
+ */
+async function loadDeniedKeys(env: Env): Promise<DeniedPools> {
+  try {
+    return await readDeniedPools(kvDenyStore(env.SEARCH_CACHE), env)
+  } catch {
+    return { embed: [], llm: [], rerank: [] }
+  }
+}
+
+/** 把禁用集合热更新到 chat 单例的池上（每次请求刷一次，KV 变更即时生效）。 */
+function applyDeniedToPool(pool: KeyPool, denied: DeniedPools, poolName: "llm" | "rerank"): void {
+  try {
+    pool.setDenied(poolName, denied[poolName])
+  } catch {
+    // 任何异常 → 不放禁用（fail-open）
+  }
 }
 
 /** SearchHit → LLM 输入（截断由 llm.ts 内部负责）。 */
@@ -267,9 +302,9 @@ api.post("/search", async (c) => {
     if (!charge.ok) console.warn("[quota] db-unavailable → fail-open")
   }
 
-  // ④ 检索
+  // ④ 检索（T3.3：先取 admin 下架集合，fail-open 传给工厂）
   try {
-    const result = await runSearch(req, c.env)
+    const result = await runSearch(req, c.env, { denied: await loadDeniedKeys(c.env) })
     if (!session) return c.json(result)
     const view = await getQuota(c.env.DB, session.sub, nowMs, c.env)
     const fb = Boolean((result as SearchResponse).fallback)
@@ -363,8 +398,10 @@ api.post("/search/stream", async (c) => {
   }
 
   let result: SearchResponse
+  // T3.3 运行时效：禁用集合只影响 KeyPool 选 key，不改检索语义（fail-open）
+  const denied = await loadDeniedKeys(c.env)
   try {
-    result = (await runSearch({ ...req, use_llm: false }, c.env)) as SearchResponse
+    result = (await runSearch({ ...req, use_llm: false }, c.env, { denied })) as SearchResponse
   } catch (err) {
     if (err instanceof SearchValidationError) return c.json({ error: err.code }, 422)
     throw err
@@ -403,7 +440,9 @@ api.post("/search/stream", async (c) => {
         )
         if (ctx) controller.enqueue(sse("session", { session_id: ctx.id, max_rounds: 10 }))
 
-        const llm = getChatProvider(c.env).streamSummary(llmHits, question)
+        const chat = getChatProvider(c.env)
+        applyDeniedToPool(chat.pool, denied, "llm")
+        const llm = chat.provider.streamSummary(llmHits, question)
         controller.enqueue(sse("citations", { citations: llm.citations, model: llm.model }))
         let text = ""
         for await (const delta of llm) {
@@ -494,7 +533,9 @@ api.post("/chat", async (c) => {
       })
     }
 
-    const out = await getChatProvider(c.env).summarize(ctx.initialHits, question, { history })
+    const chat = getChatProvider(c.env)
+    applyDeniedToPool(chat.pool, await loadDeniedKeys(c.env), "llm")
+    const out = await chat.provider.summarize(ctx.initialHits, question, { history })
     await appendRound(c.env.DB, sessionId, "assistant", out.text, Date.now())
     await chargeQuota(
       c.env.DB,
@@ -550,27 +591,136 @@ api.post("/settings/models", async (c) => {
   return c.json({ model: saved.model })
 })
 
-api.get("/admin/keys", (c) => c.json({ error: "not-yet" }, 501)) // TODO(M3 admin keys)
-api.post("/admin/keys", (c) => c.json({ error: "not-yet" }, 501)) // TODO(M3 admin keys)
-
-/** admin 路由统一鉴权（ADMIN_API_KEY）。 */
-function adminGuard(c: { env: Env; req: { header: (n: string) => string | undefined } }): Response | null {
+/**
+ * admin 路由统一鉴权（T3.3 + T3.6 扩展）：**二选一，任一通过即放行**
+ *   ① `Authorization: Bearer <ADMIN_API_KEY>` —— 运维通道（curl / CI），行为与旧版完全一致；
+ *   ② `Authorization: Bearer <JWT>` 且会话 `role === "admin"` —— 前端管理页通道
+ *      （用 `sessionFromHeader()`，与 /me 同一套校验）。
+ * 未通过 → 401 `{error:"unauthorized"}`（**不再**因为没有 ADMIN_API_KEY 就 503：
+ * 只配了 JWT 的部署也必须能用管理页）。ADMIN_API_KEY 未配置 + JWT 非 admin → 同样 401。
+ * 注意：这里不查账号封禁状态（JWT 已签名的 admin 视为可信；封禁的是「使用检索」而非「被审计」）。
+ * 返回 `actorId`：审计用，`?actor=` 优先（旧运维习惯），其次 JWT 的 account_id，最后 "admin"。
+ */
+async function adminAuthorize(
+  c: Context<{ Bindings: Env }>,
+): Promise<{ denied: Response | null; actorId: string }> {
+  const header = c.req.header("Authorization") ?? ""
+  const actorParam = c.req.query("actor") ?? ""
   const key = c.env.ADMIN_API_KEY
-  if (!key) return Response.json({ error: "admin-key-unconfigured" }, { status: 503 })
-  if ((c.req.header("Authorization") ?? "") !== `Bearer ${key}`) {
-    return Response.json({ error: "unauthorized" }, { status: 401 })
+  if (key && header === `Bearer ${key}`) {
+    return { denied: null, actorId: actorParam || "admin" }
   }
-  return null
+  try {
+    const session = await sessionFromHeader(c.env, header)
+    if (session?.role === "admin") {
+      return { denied: null, actorId: actorParam || session.sub }
+    }
+  } catch {
+    // JWT 校验异常一律视为未通过（不 500、不回显任何细节）
+  }
+  return { denied: Response.json({ error: "unauthorized" }, { status: 401 }), actorId: "" }
 }
+
+// ── GET /admin/usage —— 只读用量总览（T3.3 / T3.6 /admin 页）──
+//   数据：accounts + quotas（period_start=window_start、used_cost=used_tokens）+ provider_keys 脱敏投影。
+//   额度/窗口长度来自 limitTokens(env)/windowHours(env)（见 src/quota.ts），不读 DB 的 monthly_limit。
+//   绝不返回任何 secret：keys[] 只有 key_ref / 计数 / 成本（见 keyadmin.ts）。
+api.get("/admin/usage", async (c) => {
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
+  if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
+  try {
+    return c.json(await buildAdminUsage(c.env.DB, c.env, Date.now()))
+  } catch {
+    // 不把 SQL 细节回显给客户端；日志只留泛化信息。
+    console.warn("[admin] usage aggregation failed")
+    return c.json({ error: "db-unavailable" }, 503)
+  }
+})
+
+// ── GET /admin/keys —— 只读 key 池健康（T3.3「keys 上架禁用 + 每 key 用量」）──
+//   keys[]：provider_keys 行（**只有 key_ref**，绝无 secret）；pools[]：env 池的 ref 清单（parsePoolKeys 推导）。
+//   D1 缺失 → 仍 200：pools 来自 env secrets，不依赖 D1（keys:[] / db_rows:0），运维仍能看到池配置。
+api.get("/admin/keys", async (c) => {
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
+  const pools = buildPoolInfos(c.env)
+  if (!c.env.DB) return c.json({ keys: [], pools, db_rows: 0 })
+  try {
+    const keys = await fetchProviderKeyRows(c.env.DB)
+    return c.json({ keys, pools, db_rows: keys.length })
+  } catch {
+    console.warn("[admin] provider_keys read failed")
+    return c.json({ error: "db-unavailable" }, 503)
+  }
+})
+
+// ── POST /admin/keys —— 上架/禁用一把 key（T3.3）──
+//   ① provider_keys upsert（enabled）；② 写审计（action=key_enable|key_disable，target 只放 key_ref）；
+//   ③ 运行时效：KV `keydeny:<pool>` 记录禁用集合，KeyPool 取用时剔除（KV 故障 = fail-open，不阻断）。
+//   请求体 `{ key_ref: "llm-key-0", pool: "llm", enabled: false }`（enabled 缺省 = true 上架）。
+api.post("/admin/keys", async (c) => {
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
+
+  let body: { key_ref?: unknown; pool?: unknown; enabled?: unknown } = {}
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: "invalid-body" }, 422)
+  }
+  const keyRef = typeof body.key_ref === "string" ? body.key_ref.trim() : ""
+  const poolRaw = typeof body.pool === "string" ? body.pool.trim() : ""
+  // 形状校验：只接受 `<pool>-key-<n>`，真 key（sk-…）无法进来（见 keyadmin.isSafeKeyRef）
+  if (!isSafeKeyRef(keyRef)) return c.json({ error: "invalid-key-ref" }, 422)
+  if (!isPoolName(poolRaw)) return c.json({ error: "invalid-pool" }, 422)
+  const pool = poolRaw
+  const enabled = body.enabled !== false
+
+  if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
+  const nowMs = Date.now()
+  try {
+    await upsertProviderKey(c.env.DB, { pool, keyRef, enabled, nowMs })
+  } catch {
+    console.warn("[admin] provider_keys upsert failed")
+    return c.json({ error: "db-unavailable" }, 503)
+  }
+
+  // 审计（旁路；失败不阻断 —— writeAudit 自身也不抛错）。target 只放 key_ref，绝不放真 key。
+  const auditWritten = await writeAudit(c.env.DB, {
+    actorId: auth.actorId,
+    action: enabled ? "key_enable" : "key_disable",
+    target: keyRef,
+    detail: `pool=${pool}`,
+    nowMs,
+  })
+
+  // 运行时效（fail-open）：KV 缺失/读写失败 → runtime_applied:false，请求仍 200。
+  const runtime = await setKeyDenied(kvDenyStore(c.env.SEARCH_CACHE), pool, keyRef, enabled)
+  const configured = poolRefsFromEnv(c.env, pool).includes(keyRef)
+  return c.json({
+    ok: true,
+    key_ref: keyRef,
+    pool,
+    enabled,
+    /** 该 ref 是否真在 env 池里配置（false = 预登记/疑似笔误；不阻断，避免先禁后配的死锁） */
+    configured,
+    /** KV 里的禁用集合（写入后的真值；KV 不可用时为空数组） */
+    disabled_refs: runtime.refs,
+    /** 运行时效是否生效（KV 不可用/写失败 → false，此时只有 DB 记了禁用） */
+    runtime_applied: runtime.ok,
+    audit_written: auditWritten,
+  })
+})
 
 // POST /admin/accounts/:id/ban —— 封禁/解封（?unban=1 解封）
 api.post("/admin/accounts/:id/ban", async (c) => {
-  const denied = adminGuard(c)
-  if (denied) return denied
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
   if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
 
   const target = c.req.param("id")
-  const actorId = c.req.query("actor") ?? "admin"
+  const actorId = auth.actorId
   const reason = c.req.query("reason") ?? "admin-ban"
   const banned = c.req.query("unban") !== "1"
   await c.env.DB.prepare("UPDATE accounts SET status = ? WHERE id = ?")
@@ -588,12 +738,12 @@ api.post("/admin/accounts/:id/ban", async (c) => {
 
 // POST /admin/accounts/:id/quota —— 加额/扣额/重置当前窗口
 api.post("/admin/accounts/:id/quota", async (c) => {
-  const denied = adminGuard(c)
-  if (denied) return denied
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
   if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
 
   const target = c.req.param("id")
-  const actorId = c.req.query("actor") ?? "admin"
+  const actorId = auth.actorId
   const nowMs = Date.now()
   let body: { delta_tokens?: number; reset?: boolean } = {}
   try {
@@ -624,10 +774,11 @@ api.post("/admin/accounts/:id/quota", async (c) => {
 
 // POST /admin/db/apply-schema —— 幂等应用 D1 schema
 // 用途：受限环境（wrangler d1 execute 不可用）下，用 Worker 的 D1 binding 完成建表/迁移。
-// 安全性：只执行 src/db/schemaStatements.ts 中固定的 IF NOT EXISTS 语句，不接受任意 SQL；需 ADMIN_API_KEY。
+// 安全性：只执行 src/db/schemaStatements.ts 中固定的 IF NOT EXISTS 语句，不接受任意 SQL；
+//         鉴权同其它 admin 路由（ADMIN_API_KEY 或 JWT role=admin）。
 api.post("/admin/db/apply-schema", async (c) => {
-  const denied = adminGuard(c)
-  if (denied) return denied
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
   if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
 
   const applied: string[] = []
@@ -641,7 +792,7 @@ api.post("/admin/db/apply-schema", async (c) => {
     }
   }
   await writeAudit(c.env.DB, {
-    actorId: "admin",
+    actorId: auth.actorId,
     action: "apply_schema",
     detail: `applied=${applied.length} failed=${failed.length}`,
     nowMs: Date.now(),
@@ -654,8 +805,8 @@ api.post("/admin/db/apply-schema", async (c) => {
 
 // GET /admin/audit —— 审计日志
 api.get("/admin/audit", async (c) => {
-  const denied = adminGuard(c)
-  if (denied) return denied
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
   const rows = await listAudit(c.env.DB, {
     limit: Number(c.req.query("limit") ?? 50),
     offset: Number(c.req.query("offset") ?? 0),

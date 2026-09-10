@@ -6,7 +6,7 @@
 //   - 批量推理：一次 HTTP 塞多对 (query, document)，禁止逐条循环（Workers→国内往返贵，§5.2 第 2 条）；
 //   - rerankTopK 做成配置项（删旧魔法数字，§5.2 第 3 条）；
 //   - 401/403/429/余额不足/超时自动换 key 重试一次（复用 withKeyRetry）；池全灭/超时抛错给上层降级为向量序。
-import { KeyPool, withKeyRetry, PoolKey, type KeyPoolDb } from "./keypool"
+import { KeyPool, withKeyRetry, PoolKey, type KeyPoolDb, type KeyPoolOptions } from "./keypool"
 import { defaultFetch } from "./embeddings"
 
 /** 批量 rerank 的配置（批量大小/超时，均可配）。 */
@@ -144,8 +144,13 @@ export function createRerankProvider(
   },
   db: KeyPoolDb,
   fetchImpl: typeof fetch = defaultFetch,
+  /**
+   * T3.3 运行时效：admin 下架的 ref（`{ rerank: ["rerank-key-0"] }`）。
+   * 可选、缺省 = 无禁用（fail-open）——读不到禁用集绝不能影响检索。
+   */
+  options: KeyPoolOptions = {},
 ): { pool: KeyPool; provider: RerankProvider } {
-  const pool = new KeyPool(env, db)
+  const pool = new KeyPool(env, db, options)
   const provider = new SiliconFlowReranker(
     {
       model: env.RERANK_MODEL ?? "BAAI/bge-reranker-v2-m3",

@@ -3,7 +3,7 @@
 // 供应商锁定：硅基流动中国站 bge 系列。抽象为接口以保留切换能力（§8.5 逃生通道）。
 // 所有 key 走 KeyPool（embed_pool）；401/403/429/超时自动换 key 重试一次；失败抛错给上层降级。
 
-import { KeyPool, PoolKey, withKeyRetry, KeyPoolDb, shouldRetryStatus } from "./keypool"
+import { KeyPool, PoolKey, withKeyRetry, KeyPoolDb, KeyPoolOptions, shouldRetryStatus } from "./keypool"
 
 /** 调用方向：query（检索）或 document（入库）。二者共用同一 instruction prefix（§5.3）。 */
 export interface EmbedOpts {
@@ -259,8 +259,13 @@ export function createEmbeddingProvider(
   env: { EMBED_POOL_KEYS?: string; LLM_POOL_KEYS?: string; RERANK_POOL_KEYS?: string; EMBEDDING_ENDPOINT?: string; EMBEDDING_MODEL?: string; EMBEDDING_DIM?: string; EMBED_TIMEOUT_MS?: string },
   db: KeyPoolDb,
   fetchImpl: typeof fetch = defaultFetch,
+  /**
+   * T3.3 运行时效：admin 下架的 ref（`{ embed: ["embed-key-1"] }`）。
+   * 可选、缺省 = 无禁用（fail-open）——读不到禁用集绝不能影响检索。
+   */
+  options: KeyPoolOptions = {},
 ): { pool: KeyPool; provider: EmbeddingProvider } {
-  const pool = new KeyPool(env, db)
+  const pool = new KeyPool(env, db, options)
   const provider = new SiliconFlowEmbedding(
     {
       model: env.EMBEDDING_MODEL ?? "BAAI/bge-m3",

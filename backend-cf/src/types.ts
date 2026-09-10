@@ -7,6 +7,8 @@ export interface Env {
   // ── Key Pool secrets（逗号分隔的一组 key，只存 secret）──
   EMBED_POOL_KEYS?: string
   LLM_POOL_KEYS?: string
+  /** rerank 独立池（可选；缺省并入 LLM_POOL_KEYS，见 plan §2）。只影响 ref 命名与 key 禁用映射。 */
+  RERANK_POOL_KEYS?: string
 
   // ── D1 / KV / Queue 绑定 ──
   DB: D1Database

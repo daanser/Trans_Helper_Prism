@@ -66,13 +66,35 @@ export function parsePoolKeys(raw: string | undefined, pool: PoolName): PoolKey[
     }))
 }
 
+/** KeyPool 构造可选项（全部可省：省了就是旧行为）。 */
+export interface KeyPoolOptions {
+  /**
+   * admin 下架的 key ref（按池，形如 `{ embed: ["embed-key-1"], llm: ["llm-key-0"] }`）。
+   * 缺省/空集合 = 无禁用（**fail-open**）：管理面读不到禁用集时检索/LLM 必须照常工作。
+   */
+  denied?: Partial<Record<PoolName, Iterable<string>>>
+}
+
 export class KeyPool {
   private readonly pools: Record<PoolName, PoolKey[]>
   private readonly db: KeyPoolDb
   /** 运行时警报：可用 key < 2 时置 true（§8.5 告警线），生产可接通知。 */
   private alertReady: Record<PoolName, boolean> = { embed: true, llm: true, rerank: true }
+  /**
+   * admin 下架的 ref（T3.3 运行时效）。默认全空 = 无禁用；
+   * `setDenied()` 可在运行中热更新（禁用的 key 立刻不再被 pickKey 选中）。
+   */
+  private readonly denied: Record<PoolName, Set<string>> = {
+    embed: new Set<string>(),
+    llm: new Set<string>(),
+    rerank: new Set<string>(),
+  }
 
-  constructor(env: { EMBED_POOL_KEYS?: string; LLM_POOL_KEYS?: string; RERANK_POOL_KEYS?: string }, db: KeyPoolDb) {
+  constructor(
+    env: { EMBED_POOL_KEYS?: string; LLM_POOL_KEYS?: string; RERANK_POOL_KEYS?: string },
+    db: KeyPoolDb,
+    options: KeyPoolOptions = {},
+  ) {
     // embed/llm 必填；rerank 默认并入 llm（§2 决策：rerank 与 LLM 共用一批号）。
     const rerankRaw = env.RERANK_POOL_KEYS ?? env.LLM_POOL_KEYS
     this.pools = {
@@ -81,13 +103,51 @@ export class KeyPool {
       rerank: parsePoolKeys(rerankRaw, "rerank"),
     }
     this.db = db
+    this.applyDenied(options.denied)
     this.checkAlertLevels()
   }
 
-  /** 每个池可用 key 数。 */
+  /**
+   * 热更新某池的禁用集合（admin 上架/禁用后调用，见 keyadmin.ts 的 KV 读取）。
+   * **fail-open**：传 null/undefined/不可迭代对象 → 清空该池禁用（视为无禁用）；绝不抛错。
+   */
+  setDenied(pool: PoolName, refs: Iterable<string> | null | undefined): void {
+    const next = new Set<string>()
+    if (refs) {
+      try {
+        for (const ref of refs) {
+          if (typeof ref === "string" && ref !== "") next.add(ref)
+        }
+      } catch {
+        // 迭代过程异常 → 视为无禁用（fail-open），保留空集合
+      }
+    }
+    this.denied[pool] = next
+    this.checkAlertLevels()
+  }
+
+  /** 批量设置（index.ts 一次注入三个池）。 */
+  applyDenied(map: Partial<Record<PoolName, Iterable<string>>> | null | undefined): void {
+    for (const pool of ["embed", "llm", "rerank"] as PoolName[]) {
+      this.setDenied(pool, map?.[pool])
+    }
+  }
+
+  /** 该池当前被禁用的 ref（排序数组；供 admin 展示/单测断言）。 */
+  deniedRefs(pool: PoolName): string[] {
+    return [...this.denied[pool]].sort()
+  }
+
+  /** 该 ref 是否被 admin 下架。 */
+  isDenied(pool: PoolName, ref: string): boolean {
+    return this.denied[pool].has(ref)
+  }
+
+  /** 每个池可用 key 数（已剔除 evicted / 冷却中 / admin 禁用）。 */
   private usableKeys(pool: PoolName): PoolKey[] {
     const now = Date.now()
-    return this.pools[pool].filter((k) => !k.evicted && now >= k.cooldownUntil)
+    const denied = this.denied[pool]
+    return this.pools[pool].filter((k) => !k.evicted && now >= k.cooldownUntil && !denied.has(k.ref))
   }
 
   /** 选一个 key：优先最少在用（in-flight），其次轮询最旧 idle。 */
