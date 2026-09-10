@@ -42,7 +42,10 @@
   "vars": {
     "ALLOWED_ORIGINS": "https://search.chengxi.moe,https://transhelper-prism.pages.dev",
     // 登录相关（非敏感项写进配置，避免被每次部署覆盖；敏感项 X_CLIENT_ID/X_CLIENT_SECRET/JWT_SECRET 放 Worker Secrets）
-    "OAUTH_REDIRECT_URI": "https://transhelper-prism-backend.transprism.workers.dev/api/v1/auth/oauth/x/callback",
+    // P0 域名改造：登录回调改走前端自有域（经 Pages Function 反代到本 Worker），
+    // 因为 workers.dev 在墙内不可达、而回调是浏览器顶层跳转 → 墙内会登不上。
+    // 回滚：把这行改回 https://transhelper-prism-backend.transprism.workers.dev/api/v1/auth/oauth/x/callback
+    "OAUTH_REDIRECT_URI": "https://search.chengxi.moe/api/v1/auth/oauth/x/callback",
     "FRONTEND_BASE_URL": "https://search.chengxi.moe",
     // X OAuth scope：实测只给 users.read 会让 /2/users/me 403，必须带 tweet.read（别删）
     "X_OAUTH_SCOPES": "users.read tweet.read",
