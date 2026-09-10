@@ -60,7 +60,19 @@ X OAuth 的回调地址是 `https://transhelper-prism-backend.transprism.workers
    - **搜索档实测**：对齐窗口边界连打 13 次 → 前 10 次 200，**第 11 次 429** `{tier:"overseas",scope:"tier-limit"}`；
    - **LLM 档实测**：连打 14 次 `/chat` → 前 12 次放行，**第 13 次 429** `{tier:"logged_in"}`（= `ceil(60/5)`）；
    - `rate_counters` 表已建（apply-schema）；桶 key 为 HMAC 摘要、**表内无 IP 明文**；KV 限流已降级为 120/min 粗兜底。
-   - **待办（R5）**：`/admin/usage` 增加"今日匿名请求/各档命中/熔断次数"观测；前端被 429 时的友好提示。
+4. **R4 突发与熔断 → ✅ 已完成并线上验证（2026-09-09）**
+   - **修掉一个真 bug**：`rateGate` 原顺序是「封禁 → 分档 → 突发 → 全局」，分档被拒就提前返回，
+     导致被拒请求永远进不到突发层；而突发阈值 20 次/10 秒（=120/分钟）高于所有档位（最高登录 60/分钟），
+     **突发层等于死代码**（线上 40 并发实测 `burst` 恒为 0）。已改为「① 封禁 → ② 突发 → ③ 分档 → ④ 全局」。
+   - 线上验证：25 并发（对齐分钟边界）→ `10×200 + 10×tier-limit + 4×burst + 1×blocked`，
+     随后请求 `scope=blocked`、`retry_after≈54`、`X-RateLimit-Remaining: 0`。
+   - ⚠️ 产品影响：现在 10 秒内打满 20 次会被**硬封 60 秒**（以前只是反复 429）。阈值 `BURST_PER_10S` 是 env，可按观感调。
+5. **R5 观测 + 429 前端体验 → ✅ 已完成并线上验证（2026-09-09）**
+   - 新增 `GET /api/v1/admin/ratelimit`（admin）：`tiers[] / scopes{search,llm,burst,global} / blocked_buckets / global{count,soft,hard,state} / limits`，
+     **两条 SELECT、零写入**（单测断言"任何 run() 被调用即失败"）；`/admin` 页「用量」区已接入「分档限流观测」子块。
+   - 搜索页 429：**不清空已有结果**、显示「请求过于频繁（当前档位：境外访客，10 次/分钟），请在 N 秒后重试」、
+     按钮倒计时禁用、对 `overseas/unknown/cn_idc` 给出温和的登录引导；`quota-exceeded` 语义与 429 严格区分。
+   - 实现注记：为区分 search/llm 桶，llm 行在 `rate_counters.tier` 列写 `llm:<档位>` 前缀（桶 key 不含该字符串，**计数器不重置、无 DDL**）。
 4. **R6.5（可选优化）**：把 **`search.chengxi.moe` 子域名单独 NS 委派**到 Worker 所在账号（不必迁 `chengxi.moe` 主体），
    然后加 `api.search.chengxi.moe` 作为 Worker 自定义域、**删掉 Pages Function 反代** ——
    这样 Worker 直接看到真实客户端 IP/ASN，限流天然准确、少一跳。方案与坑见 `plan-ratelimit.md` §8.1。
