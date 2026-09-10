@@ -18,6 +18,17 @@
 // IP 不落 KV 明文：`ipKey()` 用 FNV-1a 32 位散列（限流场景不需要可逆，碰撞只是共桶）。
 // 账号 id 本身是 randomUUID，非 PII，直接入 key。
 // KVNamespace 类型由 tsconfig 的 `types: ["@cloudflare/workers-types"]` 全局注入（与 auth.ts 一致）。
+//
+// ── ⚠️ 已知局限：修好客户端 IP ≠ 限流就准了（线上实测，别误判）──
+// 经 Cloudflare Pages Function 反代（`frontend/functions/api/[[path]].ts`）访问时，
+// **IP 限流实际上完全不生效**：线上实测「13 秒内连打 12 次搜索」全部 200、零 429，
+// 而按 RATE_LIMIT_IP_PER_MIN 早就该被拒。
+// 原因**不是** IP 取错（那是本文件 clientIpFromHeaders 的老问题，已修，见下），
+// 而是 CF 内部子请求会**跨 colo**：本模块的计数落在 KV，而 KV 是**最终一致**的，
+// 各 colo 各写各的桶 → 同一 IP 在 N 个 colo 各拿到一份额度，计数永远不收敛。
+// 结论：KV 上的 IP 限流只能当「同一 colo 内的尽力而为闸门」，
+// 真正的边缘限流要靠 CF 的 Rate Limiting 规则（待办，不在本模块职责内）。
+// **不要**为了这个现象去改算法或换存储（换 D1 也绕不开跨 colo 请求分布）。
 
 /** 限流存储的最小契约（KVNamespace 与测试内存 mock 都能满足）。 */
 export interface RateLimitStore {
@@ -164,7 +175,7 @@ export async function checkRateLimit(
 
 /** 限流主体：未登录只有 ip；登录后有 accountId（ip 作兜底）。 */
 export interface RateLimitSubject {
-  /** 客户端 IP（CF-Connecting-IP） */
+  /** 客户端 IP（应来自 `clientIpFromHeaders(headers, env)` 的信任链，不要直接读 cf-connecting-ip） */
   ip?: string
   /** 登录账号 id（有则为主维度） */
   accountId?: string
@@ -235,13 +246,121 @@ export async function checkSubjectRateLimit(
   }
 }
 
-/** 从请求头取客户端 IP（CF-Connecting-IP 优先，其次 X-Forwarded-For 首个）。缺失 → undefined。 */
-export function clientIpFromHeaders(headers: Headers): string | undefined {
-  const direct = headers.get("CF-Connecting-IP")
-  if (direct?.trim()) return direct.trim()
-  const fwd = headers.get("X-Forwarded-For")
-  const first = fwd?.split(",")[0]?.trim()
-  return first || undefined
+// ─────────────────────────────────────────────────────────────────────────────
+// 客户端 IP 的信任链（线上踩坑换来的，改动前务必读完）
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ── 问题 ──
+// 墙内用户走 `search.chengxi.moe/api/*`（Pages Function 反代）访问本 Worker，
+// 这是「Worker → Worker 的子请求」。CF 在子请求上会**重新注入** `cf-connecting-ip` / `x-real-ip`，
+// 值是 CF 内部地址（线上实测恒为 `2a06:98c0:3600::103`，且与真实客户端无关）——
+// **而且这个头在 Pages Function 里删不掉**（实测 `headers.delete("cf-connecting-ip")` 之后后端照样收到）。
+// 于是「优先读 cf-connecting-ip」的老逻辑会把**所有反代用户归进同一个限流桶**。
+//
+// ── 所以信任锚点改成「我们代理亲自签发的凭据」──
+// 不能删头，就只能**信任一个只有我们代理知道的头**：
+//   · `x-prism-proxy`     = 共享密钥（Pages Function 写入，值来自 Pages env / Worker secret）
+//   · `x-prism-client-ip` = 真实客户端 IP（Pages Function 从**入站请求**的 cf-connecting-ip 摘下来的）
+// 直连 `workers.dev` 的伪造者不知道密钥，写不出匹配的 `x-prism-proxy`，因此伪造无效。
+//
+// ── 判定顺序（严格按此顺序，不要重排）──
+//   1) `env.PROXY_SHARED_SECRET` 非空 **且** `x-prism-proxy` 与之**完全相等**（恒时比较）
+//      → 采信 `x-prism-client-ip`；该头缺失/为空则回落到 `x-forwarded-for` 首段（同为代理写入）。
+//   2) 否则沿用**今天的老逻辑**：`cf-connecting-ip` → 其次 `x-forwarded-for` 首段。
+//      `env` 缺失或密钥未配置时，行为与改造前**逐字节一致**（优雅降级，不抛错）。
+//
+// ── 为什么第 1 条不能无条件信任 XFF ──
+// `workers.dev` 是公网可达的：直连者可以自带 `X-Forwarded-For: <随机 IP>` 轮换绕过限流。
+// 只有当请求带着**我们代理的密钥**时，XFF 才是我们代理自己写的、可信的。
+//
+// ── 为什么用恒时比较 ──
+// 普通 `===` 逐字节比较会在首个不同字节处提前返回，泄漏「前缀猜对了多少」的时序侧信道。
+// 这里长度不同直接 false（长度本身不是秘密），等长则全量异或累加后一次判零。
+
+/** 代理凭据头名（必须与 `frontend/functions/api/[[path]].ts` 中的写入端**逐字符一致**）。 */
+export const PROXY_SECRET_HEADER = "x-prism-proxy"
+
+/** 代理转发的真实客户端 IP 头名（同上，两端必须一致）。 */
+export const PROXY_CLIENT_IP_HEADER = "x-prism-client-ip"
+
+/** `clientIpFromHeaders` 用得到的 env 子集（避免与 types.ts 的 Env 循环依赖）。 */
+export interface ClientIpEnv {
+  /**
+   * 与 Pages Function 共享的代理密钥。**Pages env 与 Worker secret 两处必须设成同一个值**；
+   * 不设（或只有一边设）→ 退化为直连逻辑（第 1 条整条跳过），且经反代时 IP 会取到 CF 内部地址。
+   */
+  PROXY_SHARED_SECRET?: string
+}
+
+/** `resolved_by` 的取值：IP 是通过哪条路径采信到的。 */
+export type ClientIpSource = "proxy-trusted" | "cf-connecting-ip" | "x-forwarded-for" | "none"
+
+/** IP 判定结果（`resolved_by` 供 /admin/whoami 排障用）。 */
+export interface ClientIpResolution {
+  /** 采信到的客户端 IP；无法判定时为 undefined */
+  ip?: string
+  /** 判定依据 */
+  by: ClientIpSource
+}
+
+/**
+ * 恒时字符串比较（等价于「`a === b` 但不因首个不同字节提前返回」）。
+ * 长度不同 → 直接 false（长度不是秘密，且能避免越界比较）。
+ */
+export function timingSafeEqualString(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
+/** `x-forwarded-for` 的首段（最靠近客户端的那个地址）；空串/缺失 → undefined。 */
+function firstForwardedFor(headers: Headers): string | undefined {
+  return headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || undefined
+}
+
+/** 非空（trim 后）才返回值，否则 undefined——避免把空头当成有效 IP。 */
+function nonEmpty(value: string | null | undefined): string | undefined {
+  return value?.trim() || undefined
+}
+
+/**
+ * 判定客户端 IP 及其依据（信任链见本段顶部注释）。
+ * @param headers 请求头
+ * @param env     运行时 env；缺失/未配密钥 → 退化为老逻辑（不抛错）
+ */
+export function resolveClientIp(headers: Headers, env?: ClientIpEnv): ClientIpResolution {
+  // ① 代理凭据：只有「配了密钥」且「头值与密钥完全相等」才成立（恒时比较）。
+  const secret = typeof env?.PROXY_SHARED_SECRET === "string" ? env.PROXY_SHARED_SECRET : ""
+  if (secret.length > 0) {
+    const proof = headers.get(PROXY_SECRET_HEADER)
+    if (proof !== null && timingSafeEqualString(proof, secret)) {
+      // 采信代理写的真实 IP；该头缺失则回落代理写的 XFF 首段。
+      // resolved_by 一律记 "proxy-trusted"（信任路径是同一条）：
+      // 到底用的是哪个头，看 whoami 里原样回显的 x-prism-client-ip 是否为 null 即可区分。
+      const claimed = nonEmpty(headers.get(PROXY_CLIENT_IP_HEADER)) ?? firstForwardedFor(headers)
+      if (claimed) return { ip: claimed, by: "proxy-trusted" }
+    }
+  }
+
+  // ② 老逻辑（向后兼容）：cf-connecting-ip 优先，其次 XFF 首段。
+  // 注意：在「代理未配密钥」时这里拿到的 cf-connecting-ip 是 CF 的内部地址——这不是本函数能修的，
+  // 只能在两端配上 PROXY_SHARED_SECRET（见上方说明）。
+  const direct = nonEmpty(headers.get("CF-Connecting-IP"))
+  if (direct) return { ip: direct, by: "cf-connecting-ip" }
+  const fwd = firstForwardedFor(headers)
+  if (fwd) return { ip: fwd, by: "x-forwarded-for" }
+  return { by: "none" }
+}
+
+/**
+ * 从请求头取客户端 IP（CF-Connecting-IP 优先，其次 X-Forwarded-For 首个）。缺失 → undefined。
+ *
+ * ⚠️ 反代场景请务必把 `env` 传进来：只在两端配了同一个 `PROXY_SHARED_SECRET` 时，
+ * 本函数才会采信代理签发的真实 IP，否则会拿到 CF 给子请求注入的内部地址（见上方信任链注释）。
+ */
+export function clientIpFromHeaders(headers: Headers, env?: ClientIpEnv): string | undefined {
+  return resolveClientIp(headers, env).ip
 }
 
 /** 构造 429 响应头（Retry-After 秒 + 泛化提示），供路由直接拼响应。 */

@@ -35,8 +35,12 @@ import {
   checkSubjectRateLimit,
   clientIpFromHeaders,
   kvRateLimitStore,
+  PROXY_CLIENT_IP_HEADER,
+  PROXY_SECRET_HEADER,
   type RateLimitPolicy,
   rateLimitHeaders,
+  resolveClientIp,
+  timingSafeEqualString,
 } from "./ratelimit"
 import { listAudit, writeAudit } from "./audit"
 import { SCHEMA_MIGRATIONS, SCHEMA_STATEMENTS, isToleratedSchemaError } from "./db/schemaStatements"
@@ -291,7 +295,7 @@ api.post("/search", async (c) => {
 
   // ① 限流：未登录按 IP，登录按账号（KV 缺失 fail-open）
   const session = await sessionFromHeader(c.env, c.req.header("Authorization"))
-  const ip = clientIpFromHeaders(c.req.raw.headers)
+  const ip = clientIpFromHeaders(c.req.raw.headers, c.env)
   const rl = await checkSubjectRateLimit(
     c.env.SEARCH_CACHE ? kvRateLimitStore(c.env.SEARCH_CACHE) : undefined,
     { ip, accountId: session?.sub },
@@ -813,28 +817,43 @@ api.post("/admin/accounts/:id/quota", async (c) => {
 
 // GET /admin/whoami —— 诊断：看 Worker 到底收到了哪些「来源相关」请求头
 // 用途：经 Pages Function 反代后，判断客户端 IP 是否还能被正确识别（限流依赖它，见 TODO.md P0 / R2）。
-// 安全：需 admin 鉴权；只回白名单头，绝不回 Authorization / Cookie / 任何密钥。
+// 安全：需 admin 鉴权；只回白名单头，绝不回 Authorization / Cookie / **任何密钥**。
+//       `x-prism-proxy` 是共享密钥，因此**只回布尔**（是否存在 / 是否匹配），永不回值。
 api.get("/admin/whoami", async (c) => {
   const auth = await adminAuthorize(c)
   if (auth.denied) return auth.denied
 
   const h = c.req.raw.headers
   const pick = (name: string): string | null => h.get(name)
+  // 代理凭据：只判「有没有」和「配没配上、对不对」，绝不回显值（回显等于把密钥发到浏览器）。
+  const secret = typeof c.env.PROXY_SHARED_SECRET === "string" ? c.env.PROXY_SHARED_SECRET : ""
+  const proxyHeader = pick(PROXY_SECRET_HEADER)
+  const proxyPresent = proxyHeader !== null && proxyHeader.trim().length > 0
+  const proxyTrusted = secret.length > 0 && proxyHeader !== null && timingSafeEqualString(proxyHeader, secret)
+  // 后端实际会用于限流的取值（与 /search 走**同一个**函数，保证诊断结论与线上行为一致）
+  const resolved = resolveClientIp(h, c.env)
   return c.json({
     ok: true,
     // 只看这些「谁在调用我」相关的头
     "cf-connecting-ip": pick("cf-connecting-ip"),
     "x-forwarded-for": pick("x-forwarded-for"),
     "x-real-ip": pick("x-real-ip"),
-    "x-prism-client-ip": pick("x-prism-client-ip"),
+    "x-prism-client-ip": pick(PROXY_CLIENT_IP_HEADER),
     "cf-ray": pick("cf-ray"),
     "cf-ipcountry": pick("cf-ipcountry"),
     "user-agent-length": (pick("user-agent") ?? "").length,
     origin: pick("origin"),
     host: pick("host"),
-    // 后端实际会用于限流的取值（复现 clientIpFromHeaders 的逻辑）
-    resolved_ip: clientIpFromHeaders(h) ?? null,
-    resolved_by: pick("cf-connecting-ip") ? "cf-connecting-ip" : pick("x-forwarded-for") ? "x-forwarded-for" : "none",
+    // 代理信任链的诊断位（全是布尔，不泄漏密钥）：
+    /** 请求上是否带了 `x-prism-proxy` 头（无论值对不对）——false = 头根本没到 */
+    "x-prism-proxy-present": proxyPresent,
+    /** 该头是否与 `PROXY_SHARED_SECRET` 完全匹配（= 已采信代理声明的 IP）——false 而 present=true = 两边密钥不一致 */
+    "x-prism-proxy-trusted": proxyTrusted,
+    /** 本 Worker 是否配了 `PROXY_SHARED_SECRET`——false = 未配置，退化为直连逻辑（ip 可能取到 CF 内部地址） */
+    "proxy-secret-configured": secret.length > 0,
+    // 后端实际会用于限流的取值（复现 clientIpFromHeaders 的信任链）
+    resolved_ip: resolved.ip ?? null,
+    resolved_by: resolved.by,
   })
 })
 

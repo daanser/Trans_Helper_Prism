@@ -187,3 +187,82 @@ describe("POST /api/v1/admin/ingest/trigger", () => {
     expect(resp.status).toBe(422)
   })
 })
+
+// ── /api/v1/admin/whoami（诊断：反代后的客户端 IP 信任链）──
+describe("GET /api/v1/admin/whoami", () => {
+  const SECRET = "proxy-secret-xyz"
+  /** 线上实测：经 Pages 反代后 CF 给子请求注入的内部地址。 */
+  const INTERNAL = "2a06:98c0:3600::103"
+
+  function whoamiEnv(secret?: string): Env {
+    return {
+      DB: undefined as never,
+      SEARCH_CACHE: undefined as never,
+      INGEST_QUEUE: undefined as never,
+      ADMIN_API_KEY: "admin-secret",
+      PROXY_SHARED_SECRET: secret,
+    } as unknown as Env
+  }
+
+  async function call(env: Env, headers: Record<string, string>) {
+    const resp = await app.request(
+      "/api/v1/admin/whoami",
+      { headers: { Authorization: "Bearer admin-secret", ...headers } },
+      env,
+    )
+    expect(resp.status).toBe(200)
+    return (await resp.json()) as Record<string, unknown>
+  }
+
+  it("未配置密钥 → 退化直连逻辑，且**绝不回显**任何密钥", async () => {
+    const body = await call(whoamiEnv(), {
+      "cf-connecting-ip": INTERNAL,
+      "x-prism-client-ip": "1.2.3.4",
+      "x-prism-proxy": SECRET,
+    })
+    expect(body["proxy-secret-configured"]).toBe(false)
+    expect(body["x-prism-proxy-present"]).toBe(true) // 头到了
+    expect(body["x-prism-proxy-trusted"]).toBe(false) // 但没配密钥 → 不采信
+    expect(body.resolved_ip).toBe(INTERNAL)
+    expect(body.resolved_by).toBe("cf-connecting-ip")
+    // 安全：整个响应体里不能出现密钥值
+    expect(JSON.stringify(body)).not.toContain(SECRET)
+  })
+
+  it("密钥匹配 → resolved_by=proxy-trusted，采信 x-prism-client-ip", async () => {
+    const body = await call(whoamiEnv(SECRET), {
+      "cf-connecting-ip": INTERNAL,
+      "x-forwarded-for": "203.0.113.7",
+      "x-prism-client-ip": "203.0.113.7",
+      "x-prism-proxy": SECRET,
+    })
+    expect(body["proxy-secret-configured"]).toBe(true)
+    expect(body["x-prism-proxy-present"]).toBe(true)
+    expect(body["x-prism-proxy-trusted"]).toBe(true)
+    expect(body["x-prism-client-ip"]).toBe("203.0.113.7")
+    expect(body.resolved_ip).toBe("203.0.113.7")
+    expect(body.resolved_by).toBe("proxy-trusted")
+    expect(JSON.stringify(body)).not.toContain(SECRET)
+  })
+
+  it("密钥不匹配（两边配了不同的值）→ present=true 但 trusted=false，退回 cf-connecting-ip", async () => {
+    const body = await call(whoamiEnv(SECRET), {
+      "cf-connecting-ip": INTERNAL,
+      "x-prism-client-ip": "1.2.3.4",
+      "x-prism-proxy": "another-secret",
+    })
+    expect(body["x-prism-proxy-present"]).toBe(true)
+    expect(body["x-prism-proxy-trusted"]).toBe(false)
+    expect(body.resolved_ip).toBe(INTERNAL)
+    expect(body.resolved_by).toBe("cf-connecting-ip")
+  })
+
+  it("无任何来源头 → resolved_by=none；仍需 admin 鉴权", async () => {
+    const body = await call(whoamiEnv(SECRET), {})
+    expect(body.resolved_ip).toBe(null)
+    expect(body.resolved_by).toBe("none")
+
+    const denied = await app.request("/api/v1/admin/whoami", {}, whoamiEnv(SECRET))
+    expect(denied.status).toBe(401)
+  })
+})

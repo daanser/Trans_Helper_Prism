@@ -37,6 +37,17 @@ export interface Env {
   ADMIN_API_KEY?: string
   ALLOWED_ORIGINS?: string
 
+  // ── 反向代理信任链（P0：Pages Function 反代后拿不到真实客户端 IP）──
+  /**
+   * 与 Pages Function 共享的代理密钥，用于 `x-prism-proxy` 头（见 ratelimit.ts 的信任链注释）。
+   * **必须在两处设成同一个值**：Pages 项目的 `PROXY_SHARED_SECRET`（env/vars）
+   * 与 Worker 的 `PROXY_SHARED_SECRET`（secret），值不一致 = 凭据校验失败 = 退回老逻辑。
+   * 不设（或只有一边设）：退化为直连逻辑（cf-connecting-ip → x-forwarded-for），
+   * 此时经 Pages 反代的请求会把 CF 内部地址（如 `2a06:98c0:3600::103`）当客户端 IP。
+   * 该值只用于「是否来自我们的代理」的判定，**绝不回显**（whoami 只回布尔）。
+   */
+  PROXY_SHARED_SECRET?: string
+
   // ── 登录（T3.1，X OAuth 2.0 + PKCE）──
   /** X 开发者后台 OAuth 2.0 Client ID */
   X_CLIENT_ID?: string

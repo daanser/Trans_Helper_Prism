@@ -11,6 +11,10 @@ import {
   ipKey,
   accountKey,
   kvRateLimitStore,
+  PROXY_CLIENT_IP_HEADER,
+  PROXY_SECRET_HEADER,
+  resolveClientIp,
+  timingSafeEqualString,
   windowIndexFor,
   windowedKey,
   rateLimitHeaders,
@@ -296,5 +300,184 @@ describe("HTTP 辅助", () => {
       "Retry-After": "0",
       "X-RateLimit-Degraded": "1",
     })
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 客户端 IP 信任链（Pages Function 反代场景，线上 P0 修复）
+// ─────────────────────────────────────────────────────────────────────────────
+// 背景：经 Pages Function 反代时，CF 会给子请求**重新注入**内部地址当 cf-connecting-ip
+// （实测 `2a06:98c0:3600::103`，且在 Pages 里删不掉），因此信任锚点是代理签发的
+// `x-prism-proxy`（共享密钥）+ `x-prism-client-ip`（真实 IP），而不是任何 CF 头。
+describe("clientIpFromHeaders 信任链（x-prism-proxy 共享密钥）", () => {
+  /** 线上实测的那个 CF 内部地址（反代后 cf-connecting-ip 的真实值）。 */
+  const INTERNAL = "2a06:98c0:3600::103"
+  const SECRET = "test-proxy-secret-0123456789"
+
+  it("未配置 PROXY_SHARED_SECRET → 带 x-prism-client-ip 也**绝不采信**（防伪造回归）", () => {
+    const headers = new Headers({
+      "cf-connecting-ip": INTERNAL,
+      "x-prism-client-ip": "1.2.3.4",
+      "x-prism-proxy": SECRET, // 连"猜中密钥"都不该被理睬
+    })
+    // env 缺失 / 空密钥：都应退化为老逻辑
+    for (const env of [undefined, {}, { PROXY_SHARED_SECRET: "" }]) {
+      expect(clientIpFromHeaders(headers, env)).toBe(INTERNAL)
+      expect(resolveClientIp(headers, env)).toEqual({ ip: INTERNAL, by: "cf-connecting-ip" })
+    }
+  })
+
+  it("密钥匹配 → 采信 x-prism-client-ip（而不是 CF 内部地址）", () => {
+    const headers = new Headers({
+      "cf-connecting-ip": INTERNAL,
+      "x-forwarded-for": "203.0.113.7",
+      "x-prism-proxy": SECRET,
+      "x-prism-client-ip": "203.0.113.7",
+    })
+    expect(clientIpFromHeaders(headers, { PROXY_SHARED_SECRET: SECRET })).toBe("203.0.113.7")
+    expect(resolveClientIp(headers, { PROXY_SHARED_SECRET: SECRET })).toEqual({
+      ip: "203.0.113.7",
+      by: "proxy-trusted",
+    })
+  })
+
+  it("密钥匹配但 x-prism-client-ip 缺失 → 回落 X-Forwarded-For 首段", () => {
+    const headers = new Headers({
+      "cf-connecting-ip": INTERNAL,
+      "x-forwarded-for": "203.0.113.9, 10.0.0.1",
+      "x-prism-proxy": SECRET,
+    })
+    expect(clientIpFromHeaders(headers, { PROXY_SHARED_SECRET: SECRET })).toBe("203.0.113.9")
+    expect(resolveClientIp(headers, { PROXY_SHARED_SECRET: SECRET })).toEqual({
+      ip: "203.0.113.9",
+      by: "proxy-trusted",
+    })
+  })
+
+  it("x-prism-client-ip 为空/纯空白 → 视作缺失（回落 XFF，不采信空值）", () => {
+    for (const empty of ["", "   "]) {
+      const headers = new Headers({
+        "cf-connecting-ip": INTERNAL,
+        "x-forwarded-for": "203.0.113.9",
+        "x-prism-proxy": SECRET,
+        "x-prism-client-ip": empty,
+      })
+      expect(clientIpFromHeaders(headers, { PROXY_SHARED_SECRET: SECRET })).toBe("203.0.113.9")
+    }
+  })
+
+  it("密钥不匹配（错值 / 空值 / 只有头没配密钥）→ 一律不采信", () => {
+    const ipHeaders = { "cf-connecting-ip": INTERNAL, "x-prism-client-ip": "1.2.3.4" }
+    const cases: Array<[string, string | undefined]> = [
+      [SECRET.slice(0, -1) + "X", SECRET], // 等长错值
+      ["wrong", SECRET], // 长度不同
+      ["", SECRET], // 空值头
+      ["   ", SECRET], // 纯空白头（Headers 会 trim 成空串 → 仍不等）
+      [SECRET, `${SECRET} `], // 配置值多了个尾空格（Headers 会 trim 头值，所以这是真的不相等）
+      [SECRET, SECRET + "-extra"], // 值对但配置的是另一个（更长）密钥
+      [SECRET, ""], // 有头没配密钥
+      [SECRET, undefined], // 有头、env 里根本没这个字段
+    ]
+    for (const [headerValue, secret] of cases) {
+      const headers = new Headers({ ...ipHeaders, "x-prism-proxy": headerValue })
+      const env = secret === undefined ? {} : { PROXY_SHARED_SECRET: secret }
+      expect(resolveClientIp(headers, env)).toEqual({ ip: INTERNAL, by: "cf-connecting-ip" })
+    }
+  })
+
+  it("直连场景（无 x-prism-*）→ 与今天完全一致：cf-connecting-ip 优先", () => {
+    const headers = new Headers({ "cf-connecting-ip": "203.0.113.7" })
+    // 配了密钥也一样（没带凭据头 = 不是我们的代理）
+    for (const env of [undefined, {}, { PROXY_SHARED_SECRET: SECRET }]) {
+      expect(resolveClientIp(headers, env)).toEqual({ ip: "203.0.113.7", by: "cf-connecting-ip" })
+    }
+  })
+
+  it("伪造场景：自带 X-Forwarded-For: 1.2.3.4 且无代理凭据 → 仍以 cf-connecting-ip 为准", () => {
+    const headers = new Headers({
+      "cf-connecting-ip": "203.0.113.7",
+      "x-forwarded-for": "1.2.3.4",
+    })
+    for (const env of [undefined, { PROXY_SHARED_SECRET: SECRET }]) {
+      expect(resolveClientIp(headers, env)).toEqual({ ip: "203.0.113.7", by: "cf-connecting-ip" })
+    }
+  })
+
+  it("伪造场景：自带 XFF + 伪造的 x-prism-proxy → 密钥不对，仍以 cf-connecting-ip 为准", () => {
+    const headers = new Headers({
+      "cf-connecting-ip": "203.0.113.7",
+      "x-forwarded-for": "1.2.3.4",
+      "x-prism-client-ip": "1.2.3.4",
+      "x-prism-proxy": "guess",
+    })
+    expect(resolveClientIp(headers, { PROXY_SHARED_SECRET: SECRET })).toEqual({
+      ip: "203.0.113.7",
+      by: "cf-connecting-ip",
+    })
+  })
+
+  it("代理已验签但两个声明头都缺失 → 回落老逻辑（不返回空，避免限流直接失效）", () => {
+    const headers = new Headers({ "cf-connecting-ip": INTERNAL, "x-prism-proxy": SECRET })
+    expect(resolveClientIp(headers, { PROXY_SHARED_SECRET: SECRET })).toEqual({
+      ip: INTERNAL,
+      by: "cf-connecting-ip",
+    })
+  })
+
+  it("老逻辑的 XFF 分支与 none 分支保持原样", () => {
+    expect(clientIpFromHeaders(new Headers({ "x-forwarded-for": "203.0.113.9, 10.0.0.1" }))).toBe("203.0.113.9")
+    expect(resolveClientIp(new Headers())).toEqual({ by: "none" })
+    expect(clientIpFromHeaders(new Headers())).toBeUndefined()
+  })
+
+  it("头名常量与 Pages Function 的写入端对齐（防两端改名漂移）", () => {
+    expect(PROXY_SECRET_HEADER).toBe("x-prism-proxy")
+    expect(PROXY_CLIENT_IP_HEADER).toBe("x-prism-client-ip")
+    // Headers 大小写不敏感：大小写写法不同也必须能取到
+    expect(
+      clientIpFromHeaders(new Headers({ "X-Prism-Proxy": SECRET, "X-Prism-Client-IP": "203.0.113.7" }), {
+        PROXY_SHARED_SECRET: SECRET,
+      }),
+    ).toBe("203.0.113.7")
+  })
+
+  it("采信到的 IP 会进入限流桶（代理路径下不同用户不同桶）", async () => {
+    const nowRef = { now: T0 }
+    const { store, map } = makeStore(nowRef)
+    const env = { PROXY_SHARED_SECRET: SECRET }
+    const make = (ip: string): Headers =>
+      new Headers({ "cf-connecting-ip": INTERNAL, "x-prism-proxy": SECRET, "x-prism-client-ip": ip })
+    const a = clientIpFromHeaders(make("203.0.113.7"), env)!
+    const b = clientIpFromHeaders(make("203.0.113.8"), env)!
+    await checkSubjectRateLimit(store, { ip: a }, { account: { limit: 5, windowSec: 60 }, ip: { limit: 1, windowSec: 60 } }, nowRef.now)
+    // 另一个 IP 不该被前一个用户刷掉（老逻辑下两者都会被归到 CF 内部地址这一个桶）
+    const other = await checkSubjectRateLimit(store, { ip: b }, { account: { limit: 5, windowSec: 60 }, ip: { limit: 1, windowSec: 60 } }, nowRef.now)
+    expect(other.allowed).toBe(true)
+    expect([...map.keys()].filter((k) => k.startsWith("rl:ip:")).length).toBe(2)
+    expect([...map.keys()].some((k) => k.includes(fnv1aHex(INTERNAL)))).toBe(false)
+  })
+})
+
+describe("timingSafeEqualString（恒时比较边界）", () => {
+  it("相等 → true；等长不同值 / 前缀相同但末位不同 → false", () => {
+    expect(timingSafeEqualString("secret-aaaa", "secret-aaaa")).toBe(true)
+    expect(timingSafeEqualString("secret-aaaa", "secret-aaab")).toBe(false) // 末位不同
+    expect(timingSafeEqualString("abcdef", "abcdeg")).toBe(false)
+    expect(timingSafeEqualString("", "")).toBe(true)
+  })
+
+  it("长度不同 → 直接 false（不抛越界错）", () => {
+    expect(timingSafeEqualString("abc", "abcd")).toBe(false)
+    expect(timingSafeEqualString("abcd", "abc")).toBe(false)
+    expect(timingSafeEqualString("", "a")).toBe(false)
+    expect(timingSafeEqualString("a", "")).toBe(false)
+  })
+
+  it("非 ASCII / 超长密钥也稳定判等", () => {
+    expect(timingSafeEqualString("密钥🔑", "密钥🔑")).toBe(true)
+    expect(timingSafeEqualString("密钥🔑", "密钥🔒")).toBe(false)
+    const long = "x".repeat(4096)
+    expect(timingSafeEqualString(long, long)).toBe(true)
+    expect(timingSafeEqualString(long, `${"x".repeat(4095)}y`)).toBe(false)
   })
 })

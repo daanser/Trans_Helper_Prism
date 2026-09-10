@@ -24,9 +24,9 @@
 //    不读成文本、不改写、不加缓冲类头，且**不能**用 30s 超时把它掐断（history §5 坑 22）。
 // 5. 相对 `Location` 必须补成绝对地址再回，否则浏览器会按「当前域」解析（history §5 坑 30）。
 // 6. 这里**不加任何 CORS 头**：同源之后浏览器不再需要跨域；上游 Worker 自己的 CORS 中间件照旧处理。
-// 7. **`cf-connecting-ip` 必须删掉、并用真实客户端 IP 覆盖式写 `x-forwarded-for`**：
-//    子请求里的 `cf-connecting-ip` 是 CF 内部地址，后端限流优先读它 → 会把所有用户归进同一个桶。
-//    详见 `forwardedRequestHeaders` 的注释；改动前先读那段。
+// 7. **客户端 IP 的处理**：删 `cf-connecting-ip` **没用**（CF 会在子请求上重新注入内部地址，
+//    实测删了后端照样收到 `2a06:98c0:3600::103`），真正的信任链靠 `x-prism-proxy` 共享密钥
+//    + `x-prism-client-ip`。详见 `forwardedRequestHeaders` 的注释；改动前先读那段。
 //
 // ── 编译方式 ──
 // 本文件由 Pages 的 Functions 构建（esbuild）单独编译，**不参与** `nuxt generate`
@@ -51,6 +51,18 @@ interface Env {
    * 这里只允许放「上游 base URL」，绝不放 key / secret（那份信息只活在 Worker Secrets 里）。
    */
   API_ORIGIN?: string
+  /**
+   * 与后端 Worker 共享的代理密钥，用于向后端签发的 `x-prism-proxy` 头（后端信任链见
+   * `backend-cf/src/ratelimit.ts` 的「客户端 IP 的信任链」注释）。
+   *
+   * **必须在两处设成同一个值**：本 Pages 项目的 `PROXY_SHARED_SECRET`（env/vars）
+   * 与 Worker 的 `PROXY_SHARED_SECRET`（secret）。值不一致 → 后端校验不过 → 退回直连逻辑
+   * （经反代时会把 CF 内部地址当客户端 IP）。
+   *
+   * 这是本文件**唯一**允许的敏感值，且只用于「给上游签个到」：不落日志、不回响应体。
+   * 未配置 → 不签发该头，后端自动退化为老逻辑（前端仍可用，只是经反代拿不到真实 IP）。
+   */
+  PROXY_SHARED_SECRET?: string
 }
 
 /** Pages Function 的调用上下文（与 `EventContext` 同形；字段取真实平台类型里那几个必有的）。 */
@@ -152,35 +164,59 @@ function isStreamRequest(request: Request, pathname: string): boolean {
 }
 
 /**
+ * 是否带上了「后端会优先采信」的代理凭据头名（大小写不敏感，Headers 已归一）。
+ * 仅用于本文件内部的**先删后写**：必须在写入前把它们从客户端那一份里清掉。
+ */
+const PROXY_CREDENTIAL_HEADERS: readonly string[] = ["x-prism-proxy", "x-prism-client-ip"]
+
+/**
  * 透传请求头：整份复制 + 剔除上面那张表（保留 `authorization` / `content-type` / `accept`）。
  *
- * ── 客户端 IP 的处理（线上踩过，务必别改回去）──
- * Pages Function → Worker 是「Worker 到 Worker 的子请求」，CF 会给子请求塞一个**内部地址**
- * 作为 `cf-connecting-ip`（实测 `2a06:98c0:3600::103`），而后端限流优先读的就是它 ——
- * 结果所有匿名用户被归到同一个桶（`RATE_LIMIT_IP_PER_MIN` 变成全站共享额度）。
+ * ── 客户端 IP 的处理（线上实测过，务必别改回去）──
+ * Pages Function → Worker 是「Worker 到 Worker 的子请求」。CF 会给子请求塞一个**内部地址**
+ * 当 `cf-connecting-ip`（实测恒为 `2a06:98c0:3600::103`），且**在 Pages 里删不掉**：
+ * `headers.delete("cf-connecting-ip")` 之后后端照样收到那个内部地址（CF 在转发时重新注入）。
+ * 而老后端优先读的就是它 → 所有反代用户被归进同一个限流桶。
  *
- * 所以这里必须：
- *   1. **删掉** `cf-connecting-ip` / `x-real-ip`，让后端回落到 `x-forwarded-for`；
- *   2. **覆盖式**写入 `x-forwarded-for` = 本请求的真实客户端 IP
- *      （`request.headers.get("cf-connecting-ip")` 是 CF 边缘写在**入站请求**上的，浏览器伪造不了，
- *       因此不能"仅当不存在时才写"——那会让客户端自带 XFF 生效，等于给限流开了后门）；
- *   3. 客户端自带的 `x-forwarded-for` 也会被第 2 步覆盖。
+ * → 结论：**删头是死路**，信任必须建在「只有我们代理知道的凭据」上。所以这里：
+ *   1. **先删后写**：把客户端可能自带的 `x-prism-proxy` / `x-prism-client-ip` 全部删掉，
+ *      再写入我们自己签发的值（不删就等于让任何人自带凭据、伪造任意 IP 绕过限流）；
+ *   2. 写 `x-prism-client-ip` = **入站请求**上的真实客户端 IP
+ *      （`request.headers.get("cf-connecting-ip")`，CF 边缘写的，浏览器伪造不了；
+ *       取不到则退 `x-real-ip`；都没有就不写）；
+ *   3. 当 env 配了 `PROXY_SHARED_SECRET` 时写 `x-prism-proxy` = 该密钥 —— 这是后端采信第 2 步的**唯一凭据**。
+ *      未配置则不写该头，后端自动退化为老逻辑（直连行为不变）；
+ *   4. 仍按老行为**覆盖式**写 `x-forwarded-for` = 同一个真实客户端 IP
+ *      （作为后端信任链里 `x-prism-client-ip` 缺失时的后备；客户端自带的 XFF 会被覆盖掉）。
  *
- * 直连 `workers.dev` 的场景不受影响：CF 仍会写真实 `cf-connecting-ip`，后端优先用它，
- * 所以「伪造 XFF 绕过限流」在两条路径上都不成立。
+ * `cf-connecting-ip` / `x-real-ip` 的删除**保留但仅为表意**（删了不生效，CF 会重新注入）：
+ * 后端不再优先读它们，所以删不删都不影响；留着是为了「万一将来 CF 行为变了」时语义仍正确。
+ *
+ * 直连 `workers.dev` 的场景不受影响：那边 CF 写的 `cf-connecting-ip` 本来就是真的，后端仍优先用它；
+ * 而伪造者不知道 `PROXY_SHARED_SECRET`，写不出能通过校验的 `x-prism-proxy`，
+ * 所以「自带 XFF / 自带 x-prism-client-ip 绕过限流」在两条路径上都不成立。
  */
-function forwardedRequestHeaders(request: Request): Headers {
+function forwardedRequestHeaders(request: Request, env?: Env): Headers {
   const headers = new Headers(request.headers)
   for (const name of DROPPED_REQUEST_HEADERS) headers.delete(name)
 
   // 入站请求上的真实客户端 IP（CF 边缘写入，浏览器无法伪造）
-  const clientIp = request.headers.get("cf-connecting-ip")
+  const clientIp = request.headers.get("cf-connecting-ip")?.trim() || request.headers.get("x-real-ip")?.trim() || ""
 
-  // 先清掉"谁在调用我"这类头，再按上面的规则重建
+  // 先清掉"谁在调用我 / 我是谁"这类头，再按上面的规则重建（顺序不能反：先删后写才防伪造）
   headers.delete("cf-connecting-ip")
   headers.delete("x-real-ip")
   headers.delete("x-forwarded-for")
-  if (clientIp) headers.set("x-forwarded-for", clientIp)
+  for (const name of PROXY_CREDENTIAL_HEADERS) headers.delete(name)
+
+  if (clientIp) {
+    headers.set("x-forwarded-for", clientIp)
+    headers.set("x-prism-client-ip", clientIp)
+  }
+
+  // 代理凭据：只有配了密钥才签发（没配 → 后端跳过信任链第 1 条，行为与今天一致）
+  const secret = typeof env?.PROXY_SHARED_SECRET === "string" ? env.PROXY_SHARED_SECRET : ""
+  if (secret) headers.set("x-prism-proxy", secret)
 
   return headers
 }
@@ -280,7 +316,7 @@ export const onRequest: PagesFunction<Env> = async ({ request, env }) => {
   try {
     upstreamResponse = await fetch(upstream, {
       method: request.method,
-      headers: forwardedRequestHeaders(request),
+      headers: forwardedRequestHeaders(request, env),
       body: requestBody(request),
       // 3xx 不跟随：手动把 status + Location 回给浏览器，由浏览器自己跳（OAuth 授权页 / 回调回前端）。
       // Pages/Workers 的 manual 会返回真实的 3xx（不是浏览器那种 opaque-redirect），Location 可读。
