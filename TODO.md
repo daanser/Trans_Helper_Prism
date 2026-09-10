@@ -73,10 +73,13 @@ X OAuth 的回调地址是 `https://transhelper-prism-backend.transprism.workers
    - 搜索页 429：**不清空已有结果**、显示「请求过于频繁（当前档位：境外访客，10 次/分钟），请在 N 秒后重试」、
      按钮倒计时禁用、对 `overseas/unknown/cn_idc` 给出温和的登录引导；`quota-exceeded` 语义与 429 严格区分。
    - 实现注记：为区分 search/llm 桶，llm 行在 `rate_counters.tier` 列写 `llm:<档位>` 前缀（桶 key 不含该字符串，**计数器不重置、无 DDL**）。
-4. **R6.5（可选优化）**：把 **`search.chengxi.moe` 子域名单独 NS 委派**到 Worker 所在账号（不必迁 `chengxi.moe` 主体），
-   然后加 `api.search.chengxi.moe` 作为 Worker 自定义域、**删掉 Pages Function 反代** ——
-   这样 Worker 直接看到真实客户端 IP/ASN，限流天然准确、少一跳。方案与坑见 `plan-ratelimit.md` §8.1。
-   （若 `transhelper.org` 已在同账号，直接加 `api.transhelper.org` 更省事，无需委派。）
+4. ~~**R6.5 子域名委派**~~ → ❌ **已取消（2026-09-09）**：CF 的「添加站点」硬性拒绝子域名
+   （`Please ensure you are providing the root domain and not any subdomains`），两个父域也都不在 transprism 账号；
+   且委派要解决的「Worker 看真实 IP」已由 R2 信任链实现（实测 `resolved_by=proxy-trusted`）。
+   反代开销实测可忽略（4.63s vs 4.62s）。详见 `plan-ratelimit.md` §8.1。
+5. **第二前端域名 `search.transhelper.org`**（进行中）：走 **Pages 自定义域**（与 `search.chengxi.moe` 同样的跨账号方式），
+   **不需要委派**。前端 `apiBase` 实测已是 `/api`（同源），所以第二个域名自动复用同一套 Pages Function 反代，零代码改动。
+   做完需把该 origin 加进 `ALLOWED_ORIGINS`（否则从第二个域名发起的登录回跳会被拒）。
 5. **R6（本条是你单独点名的 TODO）**：**5h 额度重置时间的展示与锚定方式**
    - 现状：窗口起点 = 每个用户**自己首次请求的时刻**（天然错峰，不存在全局统一重置挤爆）；
      但**会漂移**（过期后从"下次请求时刻"重算）→ 重置时刻不可预测，无法展示"还有多久重置"。

@@ -199,6 +199,23 @@ CREATE INDEX IF NOT EXISTS idx_rate_counters_window ON rate_counters (window_sta
   浏览器若直连它，墙内用户搜索/登录全废 —— 这正是本次 P0 要解决的事。所以保留 `/api/*` 反代 = 保留墙内可用性。
 - 反代的**副作用**（真实 IP/元数据丢失、KV 限流失效）已由 §3 的信任链 + §5 的 D1 计数解决。
 
+### 8.1 ~~可选升级：委派 `api.*` / `search.*` 子域名~~ → ❌ **已取消（2026-09-09）**
+
+> **取消原因（两条，任一条都足够）**
+> 1. **CF 的「添加站点」硬性拒绝子域名**：实操时输入 `api.chengxi.moe` 直接被拦——
+>    「Please ensure you are providing the root domain and not any subdomains」。
+>    委派的前提（在目标账号新建子域 zone）在当前 CF UI 下走不通；而两个父域也都**不在** transprism 账号下（无同账号捷径）。
+> 2. **委派要解决的问题已经解决**：它唯一的功能性收益是「Worker 看到真实客户端 IP」，
+>    而 R2 的信任链（`x-prism-proxy` + `x-prism-client-ip`）**已经做到**——线上实测 `resolved_ip=真实 IP`、`resolved_by=proxy-trusted`、
+>    真实 `country/asn`，分档限流正是靠它跑通。
+>    且委派后前端与 API 会变成**跨域**（CORS + 预检回来了），净收益更小。
+> 反代额外开销实测可忽略：同一路径经反代 4.63s vs 直连 4.62s。
+>
+> **若将来要重新考虑**：把任一父域（`chengxi.moe` / `transhelper.org`）整体迁入 transprism 账号，或保持现状使用 `*.pages.dev` 之外的第三方 DNS。
+
+<details>
+<summary>（原方案留档，勿再执行）</summary>
+
 ### 8.1 可选升级：把 `search.chengxi.moe` **子域名**单独委派过来（不必迁整个 `chengxi.moe`）
 
 **可以做到**。做法是「子域名 NS 委派」（child zone delegation），`chengxi.moe` 主体与其它记录**不受影响**：
@@ -237,7 +254,9 @@ CREATE INDEX IF NOT EXISTS idx_rate_counters_window ON rate_counters (window_sta
 
 > 现状（反代 + `PROXY_SHARED_SECRET` 信任链 + D1 计数）本身是**可用**的，上面属于优化项，不是阻塞项。
 
-### 8.2 子域名 NS 委派 · 操作手册（2026-09-09 实测现状）
+</details>
+
+### 8.2 子域名 NS 委派 · 操作手册（❌ 已取消，见 §8.1；以下仅作历史留档）
 
 **当前真实 DNS 状态**（用 DoH 查的，绕开本机 fake-IP）：
 
@@ -476,4 +495,4 @@ window_start = registration_time + floor((now - registration_time) / window_ms) 
 
 ---
 
-_最后更新：2026-09-09（限流实施进度：R2✅ R3✅ R5🔄 R1⏸；子域委派操作手册 §8.2 + 零基础逐步操作 §8.2.1）_
+_最后更新：2026-09-09（限流 R2✅ R3✅ R4✅ R5✅ R1⏸；子域委派 ❌ 因 CF 限制取消；新增第二前端域名 `search.transhelper.org`）_
