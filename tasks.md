@@ -129,14 +129,25 @@
 - ✅ 超额后自动回退且不扣额度；并发 20 下扣减无超卖（单测+压测）；窗口到期自动刷新（读取时判断，无需 Cron）。
 
 ### T3.3 限流 + 封禁 + 审计
-- IP/账号双维度限流（KV 计数，未登录按 IP+指纹）；异常频率熔断；管理员一键封禁/解封；敏感操作审计日志（封禁/加额/改模型配置/上架 key）。
-- ✅ 刷接口触发 429；封禁账号立即只能回退（或 403，按定）；审计表可查谁何时封了谁。
+- IP/账号双维度限流（KV 固定窗口；`RATE_LIMIT_IP_PER_MIN` 默认 10、`RATE_LIMIT_ACCOUNT_PER_MIN` 默认 60，env 可调）；
+  管理员一键封禁/解封；敏感操作审计日志（封禁/加额/重置额度/上下架 key/应用 schema）。
+- 管理端点：`GET /admin/usage`（真实聚合）、`GET|POST /admin/keys`（池健康 + 上架/禁用，**只出 `key_ref`，绝不出密钥**）、
+  `GET /admin/audit`、`POST /admin/accounts/:id/ban`、`POST /admin/accounts/:id/quota`。
+  鉴权：`Bearer <ADMIN_API_KEY>` **或** `Bearer <JWT>` 且 `role=admin`。
+- key 禁用**运行时效**：写 KV 禁用集 `keydeny:<pool>`，KeyPool `usableKeys()` 过滤；**全链路 fail-open**
+  （KV 缺失/读写异常/脏值 → 空禁用集，绝不因此让检索失败）。
+- ✅ 已线上验证（2026-09-09）：匿名连打 25 次 → 20 放行/5 拦截（后收紧为 15 次 → 10/5），返回 429 + `Retry-After`；
+  封禁/加额/审计实测留痕；`key_ref=llm-key-9` 下架→`disabled_refs` 生效→重新上架；非法 ref（`sk-…`）被 422 拒绝。
+- 遗留：KV 无原子自增 → 计数可能偏低，只挡异常频率、不能当计费依据；`key_usage` 无 `account_id`，故 `/admin/usage` 的
+  每账号 `requests`/`llm_tokens_*` 暂为 null。
 
-### T3.4 LLM 总结/追问（Qwen3-8B，走 llm_pool）
+### T3.4 LLM 总结/追问（Qwen3.5-4B，走 llm_pool）
 - Workers 代理（前端永不碰 key）；system prompt 强制"只基于给定 hits、逐条标引用 `[来源n]`、不编造"；
   hits 截断（每条≤600字、共≤6条）；`max_tokens 800`、超时+换 key 重试、池全灭降级纯搜索 + `"AI总结暂不可用"`；
   `session_id` 多轮（最近 N 轮 + 初始 hits，超长截断，最多 10 轮）；`POST /api/v1/search/stream` SSE 流式。
-- ✅ 有引用且引用 id 全部可点击回跳 hits；掐掉 LLM 上游后搜索不受影响；每轮追问都扣额度且前端可见。
+- SSE 事件：`hits` → `session` → `citations` → `delta`×N → `done`（异常时 `error`）；响应头必须 `no-cache, no-transform`。
+- ✅ 已线上验证（2026-09-09）：真实流式输出 182 个 delta，引用 3 条带官网 URL，`done.usage` 结算 tokens（上游未返回 usage 时按字符估算并标 `estimated:true`）；
+  每轮追问按真实 tokens 扣额度；掐掉 LLM 上游时搜索不受影响，仅 `AI总结暂不可用`。
 
 ### T3.5 自定义模型
 - `/settings` 配 `base_url+api_key+model`（OpenAI-compatible），加密落库（WebCrypto AES-GCM，密钥放 secrets），仅本人请求可用；
@@ -146,13 +157,21 @@
 ### T3.6 前端：登录/配额/LLM/管理
 - `/login`（X OAuth）、剩余**百分比**常驻显示+低于 10% 警示、开 LLM 二次确认弹窗、追问面板（桌面右/移动下）、
   `/settings`（默认 corpora/reranker/LLM 偏好+自定义模型）、`/admin`（用量/封禁/加额/ingest runs/模型白名单/**keys 上架禁用+每 key 用量**，路由鉴权）。
-- ✅ 未登录态全站可用回退模式；剩余百分比实时；LLM 二次确认可取消；非管理员打 `/admin` 被拦。
+- ✅ 已上线（2026-09-09）：`/login/`（登录回跳读 `#token=` 并清 hash）、`/settings/`、`/admin/` 三个页面 200；
+  顶栏 `@handle + 剩余 xx% + 进度条`、低于 10% 警示、`exceeded` 显示「约 x 小时后恢复」；AI 二次确认可取消；SSE 流式 + `[来源n]` 回跳；
+  非管理员进 `/admin` 被拦。**注意**：`role` 在登录时写入 JWT，设了 `ADMIN_X_IDS` 后需**重新登录**才拿到 admin 会话。
+- 说明：匿名默认**可**用完整向量检索（`REQUIRE_LOGIN=0`，仅靠限流挡滥用）；要改回「匿名仅关键词回退」把该 var 设 1。
 
 ### T3.7 邮件绑定（已取消）
 - **2026-09-09 决策：取消**——邮件服务商（Resend / SES）需域名验证且产生费用，绑定改为**仅 X**。
   隐私面同时变小：只存 `sha256(x_id)`，不存邮箱。
 
 **M3 出关标准**：登录→绑定→配额→搜索→LLM追问→超额回退→封禁，全链路可演示；隐私 checklist 全勾；key 挂一个自动换，演示不断。
+
+> **✅ M3 已完成（2026-09-09）**：T3.1–T3.6 全部上线并在线上实测；T3.7（邮件绑定）按决策取消。
+> 后端 351 测试全绿、`tsc --noEmit` 0 错。D1 schema（含 `audit_log`/`custom_models`）已应用到线上。
+> 未做/待办：`/admin/usage` 的每账号请求数需给 `key_usage` 加 `account_id` 才能有真值；
+> 反滥用第二层（CF 边缘限流规则 / Turnstile）暂缓，**待被刷再加**。
 
 ---
 

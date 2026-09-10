@@ -196,7 +196,9 @@ query
     - 所有绑定标识落库时做哈希/最小化存储，日志与管理后台默认脱敏展示（如 `x:****1234`）。
   - 邮箱绑定：发送验证码（需要邮件服务，如 Resend/SES；有成本，需计入预算）。
   - X 绑定：X OAuth，天然一人一号门槛更高。
-- 风控：同一邮箱/X 只允许 N 个账号（建议 1）、注册 IP 限流、异常调用频率熔断、管理员一键封禁。
+- 风控：绑定仅 X（邮箱绑定已取消）；异常频率限流（**2026-09-09 落地值：匿名按 IP 10 次/分钟、登录按账号 60 次/分钟**，env 可调；KV 无原子自增，只挡异常频率、不作计费依据）；管理员一键封禁/解封 + 审计留痕。
+- 匿名策略（2026-09-09 用户决策）：`REQUIRE_LOGIN=0` —— **匿名也可用完整向量检索**，成本靠限流兜；要改回"匿名仅关键词回退"把该 var 设 `1`。
+- 反滥用第二层（CF 边缘限流规则 / Turnstile）**刻意暂缓**：待真的被刷再加。
 
 ### 6.2 配额（滚动 5 小时窗口）设计
 
@@ -374,7 +376,9 @@ GitHub Actions（每日 UTC 02:00 + 手动触发，见 .github/workflows/ingest.
 ### 9.1 技术选型（已锁定 2026-09-07）
 
 - **API 服务**：Cloudflare Workers + TypeScript + Hono（**复活旧 `backend-cf/`**，在其 `index/qdrant/cache/rate-limit` 基础上重写模块划分；Python `backend/` 废弃）。
-- **DB**：D1（SQLite：账号、绑定、配额、key 用量、`ingest_runs`、chat sessions）+ KV（短期搜索缓存、限流计数、配额扣减原子操作）。
+- **DB**：D1（SQLite：`accounts` 账号、`bindings` 绑定〔只存 `sha256(x_id)`〕、`quotas` 配额窗口、`provider_keys`/`key_usage` key 用量、`ingest_runs`、`chat_sessions`、`custom_models`、`audit_log`）
+  + KV（短期搜索缓存、限流计数、**key 禁用集 `keydeny:<pool>`**、OAuth state）。
+  ⚠️ 配额扣减走 D1 原子 `UPDATE`（KV 无原子自增，不能用于记账）；`quotas.period_start`=窗口起点、`used_cost`=已用加权 token（列名沿用，语义已改）。
   （`bigram_index` 表仍在 schema 中，但回退检索已改用 Qdrant 全文索引，见 §5.4。）
 - **向量库**：Qdrant（不变），per-wiki collection，用 **Qdrant Cloud 免费层**（两小 wiki 够装；装不下才考虑 Vectorize，不主动迁）。
 - **模型调用**：Workers 服务端代调硅基流动中国站（embedding/rerank/LLM），全部走 §8.5 Key Pool。
@@ -405,18 +409,30 @@ backend-cf/
 └── tests/                  # parser/chunker/quota/keypool 换 key/降级单测（vitest）
 ```
 
-### 9.3 API 草案
+### 9.3 API（**2026-09-09 已全部实现并上线**，实际形状以此为准）
 
 ```
-POST /api/v1/auth/oauth/{provider}/callback
-POST /api/v1/auth/bind/email | /bind/x
-GET  /api/v1/me + quota
-POST /api/v1/search            # 非流式（无 LLM 或 summary 一次性）
-POST /api/v1/search/stream     # SSE 流式（use_llm=true 时推荐）
-POST /api/v1/chat              # 追问（session_id）
-GET  /api/v1/corpora           # 可选 wiki 列表 + 每库文档数/更新时间
-GET  /api/v1/tree/{wiki_id}    # 知识树
-GET  /api/v1/admin/...         # 管理：用量、封禁、ingest runs、模型配置、keys（上架/禁用 key、看每 key 用量）
+GET  /api/v1/auth/oauth/x/start      # 302 → X 授权页（PKCE）
+GET  /api/v1/auth/oauth/x/callback   # 302 → 前端 /login/#token=<JWT>
+GET  /api/v1/me                      # 账号 + 配额（quota 为百分比口径）
+POST /api/v1/search                  # 非流式；未登录（REQUIRE_LOGIN=0）也可用，仅限流
+POST /api/v1/search/stream           # SSE：hits/session/citations/delta/done/error
+POST /api/v1/chat                    # 多轮追问（session_id，上限 10 轮）
+GET  /api/v1/corpora                 # wiki 列表 + 每库 chunk 数
+GET  /api/v1/tree/{wiki_id}          # 知识树
+GET  /api/v1/settings/models         # 自带模型列表
+POST /api/v1/settings/models         # 保存自带模型（api_key 加密落库）
+DEL  /api/v1/settings/models/{id}    # 删除自带模型
+GET  /api/v1/admin/usage             # 用量总览（accounts ⟕ quotas 聚合）
+GET  /api/v1/admin/keys              # key 池健康（只出 key_ref）
+POST /api/v1/admin/keys              # 上架/禁用 key（写 KV 禁用集 + 审计）
+GET  /api/v1/admin/audit             # 审计日志
+POST /api/v1/admin/accounts/{id}/ban          # 封禁/解封（?unban=1）
+POST /api/v1/admin/accounts/{id}/quota        # 加额/重置当前窗口
+POST /api/v1/admin/db/apply-schema            # 幂等应用 D1 schema（bootstrap 通道）
+POST /api/v1/admin/ingest/trigger             # 手动摄取（仅 Workers Paid 有意义）
+POST /api/v1/admin/backfill-urls              # 存量 URL 回填（分页）
+# 绑定邮箱：**已取消**（T3.7），绑定仅 X；`/auth/bind/*` 不再提供
 ```
 
 ---

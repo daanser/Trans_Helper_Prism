@@ -23,6 +23,12 @@
 | 知识树 | `GET /api/v1/tree/:wiki_id` 从 chunk 元数据聚合出目录树 |
 | 原文链接 | 每条命中直指**各 wiki 官网**（非 GitHub 源码），规则见下方「原文链接规则」 |
 | 每日增量 | GitHub Actions 按 **git blob sha** 做文件级 diff，只重嵌变化文件 |
+| X 登录 | X OAuth 2.0 + PKCE → 无状态 JWT 会话；**DB 只存 `sha256(x_id)`**，不存 X 明文 |
+| 配额 | **滚动 5 小时窗口 + 加权 token**（同 ChatGPT/Gemini 形态），前端只显示**百分比** |
+| 限流 | IP / 账号双维度（默认 10 与 60 次/分钟，env 可调），超额 429 + `Retry-After` |
+| AI 总结 / 追问 | Qwen3.5-4B，SSE 流式，**只依据检索片段 + 逐条标 `[来源n]`**；多轮会话上限 10 轮 |
+| 自带模型 | 用户自配 OpenAI 兼容端点，api_key **AES-GCM 加密落库**，SSRF 校验 |
+| 管理端 | 用量总览 / key 池健康与上下架（只出 `key_ref`）/ 封禁 / 加额 / 审计日志 |
 
 ## 架构
 
@@ -117,6 +123,14 @@ NUXT_PUBLIC_API_BASE=https://transhelper-prism-backend.transprism.workers.dev/ap
 | `ADMIN_API_KEY` | 运维端点认证（`/admin/*`） | Worker Secret |
 | `ALLOWED_ORIGINS` | CORS 白名单（逗号分隔） | `wrangler.jsonc` vars |
 | `EMBEDDING_MODEL` / `EMBEDDING_DIM` / `RERANK_MODEL` 等 | 模型与端点 | `wrangler.jsonc` vars |
+| `X_CLIENT_ID` / `X_CLIENT_SECRET` | X OAuth 2.0 凭据 | Worker Secret |
+| `JWT_SECRET` | 会话 JWT 签名（HS256） | Worker Secret |
+| `OAUTH_REDIRECT_URI` / `FRONTEND_BASE_URL` | 回调地址 / 前端基址 | `wrangler.jsonc` vars |
+| `CUSTOM_MODEL_ENC_KEY` | 自带模型 api_key 的 AES-GCM 密钥（缺失则相关接口 503） | Worker Secret |
+| `QUOTA_WINDOW_TOKENS` / `QUOTA_WINDOW_HOURS` | 配额窗口额度（默认 300000）/ 窗口长度（默认 5h） | `wrangler.jsonc` vars |
+| `REQUIRE_LOGIN` | `0`=匿名可用完整向量检索（当前）；`1`=匿名仅关键词回退 | `wrangler.jsonc` vars |
+| `RATE_LIMIT_IP_PER_MIN` / `RATE_LIMIT_ACCOUNT_PER_MIN` | 匿名 IP / 登录账号限流（默认 10 / 60） | `wrangler.jsonc` vars |
+| `LLM_MODEL` / `LLM_ENDPOINT` / `LLM_TIMEOUT_MS` / `LLM_MAX_TOKENS` | LLM 总结配置 | `wrangler.jsonc` vars |
 | `NUXT_PUBLIC_API_BASE` | 前端调用的后端基址（**含 `/api`**） | CF Pages 环境变量 |
 
 ## API
@@ -127,7 +141,19 @@ NUXT_PUBLIC_API_BASE=https://transhelper-prism-backend.transprism.workers.dev/ap
 | GET | `/api/v1/corpora` | 四个库的元信息与 chunk 数 |
 | POST | `/api/v1/search` | 检索主接口（见下） |
 | GET | `/api/v1/tree/:wiki_id` | 知识树（`wiki_id` 用连字符，如 `mtf-wiki`） |
-| POST | `/api/v1/admin/ingest/trigger` | 手动触发摄取（`ADMIN_API_KEY` 认证；**仅 Workers Paid 有意义**） |
+| GET | `/api/v1/auth/oauth/x/start` | 302 跳转 X 授权页（PKCE） |
+| GET | `/api/v1/auth/oauth/x/callback` | X 回调：换 token → 建号 → 302 回前端 `#token=<JWT>` |
+| GET | `/api/v1/me` | 当前账号 + 配额（需 `Authorization: Bearer <JWT>`） |
+| POST | `/api/v1/search/stream` | SSE：`hits → session → citations → delta… → done`（需登录） |
+| POST | `/api/v1/chat` | 多轮追问（`{session_id, question}`，上限 10 轮） |
+| GET/POST | `/api/v1/settings/models` | 自带模型列表 / 保存（含 `DELETE .../:id`） |
+| GET | `/api/v1/admin/usage` | 用量总览（真实聚合） |
+| GET/POST | `/api/v1/admin/keys` | key 池健康 / 上架禁用（**只出 `key_ref`，绝不回显密钥**） |
+| GET | `/api/v1/admin/audit` | 审计日志 |
+| POST | `/api/v1/admin/accounts/:id/ban` | 封禁 / 解封（`?unban=1`） |
+| POST | `/api/v1/admin/accounts/:id/quota` | 加额 / 重置当前窗口 |
+| POST | `/api/v1/admin/db/apply-schema` | 幂等应用 D1 schema（wrangler 不可用时的 bootstrap 通道） |
+| POST | `/api/v1/admin/ingest/trigger` | 手动触发摄取（**仅 Workers Paid 有意义**） |
 | POST | `/api/v1/admin/backfill-urls` | 存量 URL 回填，支持 `offset`/`page_size` 分页续跑 |
 
 ```bash
@@ -137,6 +163,10 @@ curl -X POST https://transhelper-prism-backend.transprism.workers.dev/api/v1/sea
 ```
 
 响应含 `hits[]`（每条带 `url` / `title` / `snippet` / `score`）、`timings`、`quota`、`warnings`，降级时带 `fallback:true`。
+`quota` 为 `{used_pct, remaining_pct, fallback}`（**百分比口径**）。
+
+> **鉴权**：`/api/v1/search` 匿名可用（仅限流）；`/me`、`/search/stream`、`/chat`、`/settings/models` 需 JWT；
+> `/admin/*` 接受 `Bearer <ADMIN_API_KEY>` **或** `Bearer <JWT>` 且 `role=admin`（角色在登录时写入 JWT，改 `ADMIN_X_IDS` 后需重新登录）。
 
 ## 数据管线
 
@@ -180,6 +210,12 @@ QDRANT_URL=... QDRANT_API_KEY=... EMBED_POOL_KEYS=... \
 | 后端 | Cloudflare Workers（Git 集成） | 仓库根目录 `/backend-cf`，部署命令 `npx wrangler deploy`；D1/KV/Queue 绑定由 `wrangler.jsonc` 自动生效 |
 | 前端 | Cloudflare Pages（Git 集成） | 根目录 `/frontend`，构建 `npm run generate`，**输出目录 `dist`**，环境变量 `NUXT_PUBLIC_API_BASE=<后端地址>/api` |
 | 摄取 | GitHub Actions | Secrets：`QDRANT_URL`、`QDRANT_API_KEY`、`EMBED_POOL_KEYS`（`GITHUB_TOKEN` 自动注入） |
+
+**D1 schema 应用**（本机 `wrangler` 不可用时）：
+```bash
+curl -X POST https://transhelper-prism-backend.transprism.workers.dev/api/v1/admin/db/apply-schema \
+  -H "Authorization: Bearer <ADMIN_API_KEY>"    # 只执行固定的幂等 CREATE ... IF NOT EXISTS
+```
 
 > 首次部署后需在 Workers → Settings → Variables and Secrets 补齐密钥；Pages 自定义域需先在
 > Pages → Custom domains 添加，再去域名所在账号配 DNS（跨账号 CNAME 裸配会报 1014/1016）。
