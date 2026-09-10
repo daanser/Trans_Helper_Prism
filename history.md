@@ -136,3 +136,33 @@
   5. `ingest_runs` 记账仍未接（GH Actions 无 D1 访问）；`bigram_index` 表保留但不用；`/api/v1/admin/ingest/trigger` 只有 Workers Paid 才有意义。
   6. 产出 0 chunk 的极短文件每次增量都会被复核（无 payload 可存 `blob_sha`），影响可忽略。
   7. 配额窗口重置是「读取时判断」，没有后台任务；若将来要主动清理过期窗口需另加。
+
+## 8. M4（灰度与运营）与技术债清单（2026-09-09 汇总）
+
+> 功能性大块只剩 **M4**；其余是技术债与可选优化。限流相关（R1–R7）见 `plan-ratelimit.md`。
+
+### 8.1 M4：灰度与运营（尚未开始）
+| 事项 | 说明 |
+|---|---|
+| **内测反馈收集与清零** | 找真实用户（跨性别社群）试用，收集条目逐条建账 |
+| **压测复跑** | 跑 20 条真实 query（plan §5.2 有基线表）；重点看新限流手感：`BURST_PER_10S=20` 的 60 秒硬封禁会不会误伤正常用户 |
+| **月账** | 硅基流动（embedding/rerank/LLM）+ Cloudflare 用量与账单，记入运营账 |
+| **运营面板** | `/admin` 的封禁/加额/审计目前是"可看不可点"（需 admin 会话或运维 `ADMIN_API_KEY`）；`/admin/ratelimit` 已有观测 |
+| **域名冗余** | `task-second-domain.md`（等 `transhelper.org` 账号权限）|
+
+### 8.2 技术债（按建议优先级）
+1. **`ingest_runs` 记账未接**：摄取跑在 GitHub Actions、没有 D1 访问权 → 后台看不到摄取历史。接法：给 Actions 配一个最小权限的 CF API Token，或让 Actions 调 `POST /admin/db/apply-schema` 之外的记账端点（需新端点）。
+2. **`bigram_index` 表已废弃**：回退检索早已改用 Qdrant 全文索引，表还占着 D1 空间 → 可直接 `DROP TABLE`（记得同步 `schema.sql`/`schemaStatements.ts`）。
+3. **`KeyPoolDb.listActiveKeys` 从未被消费**：跨 isolate 的 key 剔除不落库；当前真相源是 KV 禁用集（无 TTL，清空即回到全可用）。
+4. **`/admin/usage` 的 `requests` 口径**：现为「上游调用次数」（含换 key 重试），不是「用户请求数」；要后者需另加计数列。
+5. **产出 0 chunk 的极短文件**：每次增量都被复核（无 payload 可存 `blob_sha`），影响可忽略。
+6. **配额窗口无主动清理任务**：靠"读取时判断"，够用；若将来要清理历史行再另加 cron。
+7. **`ASN` 清单是初始值**：需按真实流量校准（`plan-ratelimit.md` §4.1 有方法：APNIC/iptoasn + `asOrganization` 关键词筛选）。
+8. **前端可选**：自定义模型「设为默认」；LLM 回答的轻量 markdown 渲染（用户已否决引 md 库，可自研极简版）；i18n。
+9. **`R7`（混合计数省写放大 / Turnstile 兜匿名 AI）→ 用户判断"用处不大"，暂不做**。触发条件：匿名检索逼近免费额度（10 万行写/天 ≈ 3.3 万次匿名检索/天），或真的被刷。
+
+### 8.3 已知的"不是 bug，但要知道"的现象
+- **经反代的延迟有尖峰**：Worker 自报 `total_ms` 2.7–4.2s（Qdrant 检索 ~2.1s + rerank 0.6–2.1s），正常情况下反代只多 ~0.5s；
+  但实测出现过 13–20s 的尖峰，且 `cf-ray` 显示请求被分到**远端 colo**（如 WAW）——属**链路/节点调度**波动，不是代码问题。
+  若用户在浏览器看到 502，优先确认是 **CF 边缘错误页** 还是我们的 `{"error":"upstream-unreachable"}`（后者 = Pages Function 的 30s 超时）。
+- **响应头 `content-encoding: br` 是 CF 边缘二次压缩**：Pages Function 会删掉上游的 `content-encoding`，边缘再按客户端的 `accept-encoding` 重新压缩并加上该头 —— 正常现象（`curl` 不加 `--compressed` 会看到乱码）。
