@@ -91,7 +91,7 @@ export async function startXLogin(
 /** 回跳地址白名单校验：只允许与 ALLOWED_ORIGINS 同源，否则退回前端基址。 */
 function sanitizeRedirect(env: Env, raw: string | undefined): string {
   const base = frontendBase(env)
-  if (!raw) return `${base}/login`
+  if (!raw) return `${base}/login/` // 带尾斜杠：直击 CF Pages 的 /login/ 静态页，避免多一次 308
   try {
     const u = new URL(raw)
     const allowed = (env.ALLOWED_ORIGINS ?? "")
@@ -105,7 +105,7 @@ function sanitizeRedirect(env: Env, raw: string | undefined): string {
   } catch {
     // 非法 URL：退回默认
   }
-  return `${base}/login`
+  return `${base}/login/`
 }
 
 /** sha256 hex（identifier 落库最小化用）。 */

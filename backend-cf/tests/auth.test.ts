@@ -140,7 +140,7 @@ describe("startXLogin", () => {
     const { kv, store } = makeKv()
     const env = makeEnv({ SEARCH_CACHE: kv })
     const bad = await startXLogin(env, "https://evil.example/steal")
-    expect(JSON.parse(store.get(`oauth:${bad.state}`)!).r).toBe("https://search.example/login")
+    expect(JSON.parse(store.get(`oauth:${bad.state}`)!).r).toBe("https://search.example/login/")
 
     const good = await startXLogin(env, "https://search.example/settings")
     expect(JSON.parse(store.get(`oauth:${good.state}`)!).r).toBe("https://search.example/settings")
