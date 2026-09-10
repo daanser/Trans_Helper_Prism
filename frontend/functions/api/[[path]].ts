@@ -24,6 +24,9 @@
 //    不读成文本、不改写、不加缓冲类头，且**不能**用 30s 超时把它掐断（history §5 坑 22）。
 // 5. 相对 `Location` 必须补成绝对地址再回，否则浏览器会按「当前域」解析（history §5 坑 30）。
 // 6. 这里**不加任何 CORS 头**：同源之后浏览器不再需要跨域；上游 Worker 自己的 CORS 中间件照旧处理。
+// 7. **`cf-connecting-ip` 必须删掉、并用真实客户端 IP 覆盖式写 `x-forwarded-for`**：
+//    子请求里的 `cf-connecting-ip` 是 CF 内部地址，后端限流优先读它 → 会把所有用户归进同一个桶。
+//    详见 `forwardedRequestHeaders` 的注释；改动前先读那段。
 //
 // ── 编译方式 ──
 // 本文件由 Pages 的 Functions 构建（esbuild）单独编译，**不参与** `nuxt generate`
@@ -148,16 +151,37 @@ function isStreamRequest(request: Request, pathname: string): boolean {
   return pathname.endsWith("/stream")
 }
 
-/** 透传请求头：整份复制 + 剔除上面那张表（保留 `authorization` / `content-type` / `accept`）。 */
+/**
+ * 透传请求头：整份复制 + 剔除上面那张表（保留 `authorization` / `content-type` / `accept`）。
+ *
+ * ── 客户端 IP 的处理（线上踩过，务必别改回去）──
+ * Pages Function → Worker 是「Worker 到 Worker 的子请求」，CF 会给子请求塞一个**内部地址**
+ * 作为 `cf-connecting-ip`（实测 `2a06:98c0:3600::103`），而后端限流优先读的就是它 ——
+ * 结果所有匿名用户被归到同一个桶（`RATE_LIMIT_IP_PER_MIN` 变成全站共享额度）。
+ *
+ * 所以这里必须：
+ *   1. **删掉** `cf-connecting-ip` / `x-real-ip`，让后端回落到 `x-forwarded-for`；
+ *   2. **覆盖式**写入 `x-forwarded-for` = 本请求的真实客户端 IP
+ *      （`request.headers.get("cf-connecting-ip")` 是 CF 边缘写在**入站请求**上的，浏览器伪造不了，
+ *       因此不能"仅当不存在时才写"——那会让客户端自带 XFF 生效，等于给限流开了后门）；
+ *   3. 客户端自带的 `x-forwarded-for` 也会被第 2 步覆盖。
+ *
+ * 直连 `workers.dev` 的场景不受影响：CF 仍会写真实 `cf-connecting-ip`，后端优先用它，
+ * 所以「伪造 XFF 绕过限流」在两条路径上都不成立。
+ */
 function forwardedRequestHeaders(request: Request): Headers {
   const headers = new Headers(request.headers)
   for (const name of DROPPED_REQUEST_HEADERS) headers.delete(name)
-  // 兜底补 `x-forwarded-for`（不覆盖已有的）：后端限流优先读 CF-Connecting-IP、其次读它，
-  // 万一子请求侧的 CF-Connecting-IP 被写成出口 IP，这条至少还留着真实客户端 IP 可供后端使用。
-  if (!headers.has("x-forwarded-for")) {
-    const clientIp = request.headers.get("cf-connecting-ip")
-    if (clientIp) headers.set("x-forwarded-for", clientIp)
-  }
+
+  // 入站请求上的真实客户端 IP（CF 边缘写入，浏览器无法伪造）
+  const clientIp = request.headers.get("cf-connecting-ip")
+
+  // 先清掉"谁在调用我"这类头，再按上面的规则重建
+  headers.delete("cf-connecting-ip")
+  headers.delete("x-real-ip")
+  headers.delete("x-forwarded-for")
+  if (clientIp) headers.set("x-forwarded-for", clientIp)
+
   return headers
 }
 
