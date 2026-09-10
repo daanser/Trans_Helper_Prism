@@ -38,6 +38,8 @@ interface FakeRow {
   period_start: number
   used_cost: number
   monthly_limit: number
+  /** 本窗口"扣费成功"的请求数（技术债 #4；旧库没有这一列，见 makeDb 的 noRequestsColumn） */
+  requests: number
   updated_at: number
 }
 
@@ -53,6 +55,8 @@ function makeDb(
   seed: Record<string, Partial<FakeRow>> = {},
   failOn?: string,
   accounts?: Record<string, number | null>,
+  /** true = 模拟"还没跑 apply-schema"的旧库：任何提到 requests 列的语句都报 no such column */
+  noRequestsColumn = false,
 ) {
   const rows = new Map<string, FakeRow>()
   const accs = new Map<string, number>()
@@ -61,6 +65,7 @@ function makeDb(
       period_start: r.period_start ?? NOW,
       used_cost: r.used_cost ?? 0,
       monthly_limit: r.monthly_limit ?? 5,
+      requests: r.requests ?? 0,
       updated_at: r.updated_at ?? NOW,
     })
     accs.set(id, r.period_start ?? NOW)
@@ -74,10 +79,26 @@ function makeDb(
   const calls: Array<{ sql: string; args: unknown[] }> = []
 
   const apply = (sql: string, args: unknown[]): number => {
+    // 旧库模拟：凡出现 `requests` 的语句都报 no such column（chargeQuota 应退化为旧语句）
+    if (noRequestsColumn && /\brequests\b/.test(sql)) throw new Error("SQLITE_ERROR: no such column: requests")
     if (sql.includes("INSERT OR IGNORE INTO quotas")) {
       const [accountId, windowStart, legacyLimit, updatedAt] = args as [string, number, number, number]
       if (rows.has(accountId)) return 0
-      rows.set(accountId, { period_start: windowStart, used_cost: 0, monthly_limit: legacyLimit, updated_at: updatedAt })
+      rows.set(accountId, {
+        period_start: windowStart,
+        used_cost: 0,
+        monthly_limit: legacyLimit,
+        requests: 0,
+        updated_at: updatedAt,
+      })
+      return 1
+    }
+    if (sql.includes("SET requests = 0") && sql.includes("AND period_start < ?")) {
+      // ensureWindow ⓪：窗口切换前清零"本窗口请求数"（条件写：只碰还停在旧窗口的行）
+      const [accountId, threshold] = args as [string, number]
+      const row = rows.get(accountId)
+      if (!row || !(row.period_start < threshold)) return 0
+      row.requests = 0
       return 1
     }
     if (sql.includes("used_cost = 0") && sql.includes("AND period_start < ?")) {
@@ -107,6 +128,8 @@ function makeDb(
       if (!row) return 0
       if (row.used_cost + cost > limit) return 0
       row.used_cost += cost
+      // 与 used_cost 同语句自增（技术债 #4）：只有真正扣成功才 +1
+      if (sql.includes("requests = requests + 1")) row.requests += 1
       row.updated_at = updatedAt
       return 1
     }
@@ -418,7 +441,13 @@ describe("ensureWindow（网格对齐 + 保证行存在）", () => {
     const v = await ensureWindow(db, "acc-1", NOW)
     expect(v).not.toBeNull()
     const gridStart = NOW - HOUR_MS // NOW-6h 的网格起点 = NOW-1h
-    expect(rows.get("acc-1")).toEqual({ period_start: gridStart, used_cost: 0, monthly_limit: 5, updated_at: NOW })
+    expect(rows.get("acc-1")).toEqual({
+      period_start: gridStart,
+      used_cost: 0,
+      monthly_limit: 5,
+      requests: 0,
+      updated_at: NOW,
+    })
     expect(v!.window_start).toBe(gridStart)
     expect(v!.reset_at).toBe(gridStart + WINDOW_MS)
   })
@@ -636,6 +665,86 @@ describe("chargeQuota（原子扣减）", () => {
     const sql = calls.map((c) => c.sql).join("\n")
     expect(sql).toContain("used_cost = used_cost + ?")
     expect(sql).toContain("used_cost + ? <= ?")
+  })
+
+  // ── 技术债 #4：requests（本窗口扣费成功的真实请求数）──
+  it("requests 与 used_cost 在**同一条** UPDATE 里自增（零额外写）", async () => {
+    const { db, calls } = makeDb({ "acc-1": {} })
+    await chargeQuota(db, "acc-1", 200, NOW)
+    const chargeCalls = calls.filter((c) => c.sql.includes("used_cost = used_cost + ?"))
+    expect(chargeCalls).toHaveLength(1)
+    expect(chargeCalls[0].sql).toContain("requests = requests + 1")
+    // 绑定参数顺序不变（cost 绑定两次：累加 + 判额）
+    expect(chargeCalls[0].args).toEqual([200, NOW, "acc-1", 200, DEFAULT_LIMIT_TOKENS])
+  })
+
+  it("每次扣费成功 requests +1；退还/零消耗/getQuota 都不涨", async () => {
+    const { db, rows } = makeDb({ "acc-1": {} })
+    await chargeQuota(db, "acc-1", 200, NOW)
+    await chargeQuota(db, "acc-1", 200, NOW)
+    expect(rows.get("acc-1")!.requests).toBe(2)
+    // cost=0（回退/免费）不写库 → 不涨
+    await chargeQuota(db, "acc-1", 0, NOW)
+    expect(rows.get("acc-1")!.requests).toBe(2)
+    // 只读视图不涨
+    await getQuota(db, "acc-1", NOW)
+    expect(rows.get("acc-1")!.requests).toBe(2)
+    // 管理员加额（grantQuota）不涨
+    await grantQuota(db, "acc-1", 100, NOW)
+    expect(rows.get("acc-1")!.requests).toBe(2)
+  })
+
+  it("超额那一击**不**计入 requests（判额失败 = 整条语句不改任何列）", async () => {
+    const { db, rows } = makeDb({ "acc-1": { used_cost: 300_000 } }) // 已用满
+    const res = await chargeQuota(db, "acc-1", 200, NOW)
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe("quota-exceeded")
+    expect(rows.get("acc-1")!.requests).toBe(0)
+    expect(rows.get("acc-1")!.used_cost).toBe(300_000)
+  })
+
+  it("窗口切换 → requests 与本窗口用量一起清零（⓪ 清零语句在网格推进之前）", async () => {
+    // 上一窗口：用过 500、请求 3 次；现在跨到下一网格窗口
+    const { db, rows, calls } = makeDb({ "acc-1": { used_cost: 500, requests: 3, period_start: NOW - WINDOW_MS } })
+    await chargeQuota(db, "acc-1", 200, NOW)
+    expect(rows.get("acc-1")!.used_cost).toBe(200) // 旧窗口用量已清零，只剩本次
+    expect(rows.get("acc-1")!.requests).toBe(1) // 旧窗口的 3 次已清零，只剩本次
+    const sqls = calls.map((c) => c.sql)
+    const resetIdx = sqls.findIndex((q) => q.includes("SET requests = 0"))
+    const advanceIdx = sqls.findIndex((q) => q.includes("used_cost = 0") && q.includes("AND period_start < ?"))
+    expect(resetIdx).toBeGreaterThanOrEqual(0)
+    expect(advanceIdx).toBeGreaterThan(resetIdx) // 顺序不能反：先把旧窗口清零，再推进窗口
+  })
+
+  it("同窗口内不清零（快路径 0 写；对齐路径只动 period_start）", async () => {
+    const { db, rows, calls } = makeDb({ "acc-1": { used_cost: 300, requests: 2 } })
+    await chargeQuota(db, "acc-1", 200, NOW)
+    expect(rows.get("acc-1")!.requests).toBe(3)
+    expect(calls.some((c) => c.sql.includes("SET requests = 0"))).toBe(false)
+  })
+
+  it("旧库（还没跑 apply-schema，没有 requests 列）→ 退化为旧语句，配额照常扣、不 fail-open", async () => {
+    const { db, rows, calls } = makeDb({ "acc-1": {} }, undefined, undefined, true /* noRequestsColumn */)
+    const res = await chargeQuota(db, "acc-1", 200, NOW)
+    expect(res.ok).toBe(true) // 关键：不能因为缺列就判 db-unavailable（那会让额度形同虚设）
+    expect(res.reason).toBeUndefined()
+    expect(rows.get("acc-1")!.used_cost).toBe(200)
+    expect(rows.get("acc-1")!.requests).toBe(0) // 迁移完成前 requests 恒 0（在 /admin/usage 上可见）
+    // 两条语句都发了：先带 requests（失败），再退化
+    expect(calls.filter((c) => c.sql.includes("used_cost = used_cost + ?")).length).toBe(2)
+    expect(calls.filter((c) => c.sql.includes("requests")).length).toBeGreaterThan(0)
+  })
+
+  it("旧库 + 窗口切换：缺列不影响窗口推进与扣费（清零语句失败被吞）", async () => {
+    const { db, rows } = makeDb(
+      { "acc-1": { used_cost: 500, requests: 3, period_start: NOW - WINDOW_MS } },
+      undefined,
+      undefined,
+      true,
+    )
+    const res = await chargeQuota(db, "acc-1", 200, NOW)
+    expect(res.ok).toBe(true)
+    expect(rows.get("acc-1")!.used_cost).toBe(200)
   })
 
   it("超额 → {ok:false, reason:'quota-exceeded'}（不抛错、不扣）", async () => {

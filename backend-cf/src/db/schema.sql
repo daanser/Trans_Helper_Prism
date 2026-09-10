@@ -1,6 +1,6 @@
 -- SPDX-License-Identifier: GPL-3.0-or-later
 -- TransHelper Prism — D1 schema (v0.1, 骨架版)
--- 依据 plan.md §9.1（DB 用 D1：账号/绑定/配额/key 用量/ingest_runs/chat sessions/bigram 回退索引）。
+-- 依据 plan.md §9.1（DB 用 D1：账号/绑定/配额/key 用量/ingest_runs/chat sessions/rate_counters）。
 -- 说明：本文件会被 wrangler d1 migrations apply 执行（具体迁移流程见 T0.1 验收）。
 -- 所有表均带注释；索引随查询需求逐步补充（M2 起按 ingest/检索 query 形态加）。
 
@@ -36,11 +36,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_type_identifier
 -- 配额（quotas）：每账号每月的 5h 加权配额。
 -- 消耗模型见 plan.md §3.4/§6.2。剩余额 = monthly_limit - used_cost。
 -- ─────────────────────────────────────────────
+-- ⚠️ 历史表补列（SQLite 没有 ADD COLUMN IF NOT EXISTS）：
+--    ALTER TABLE quotas ADD COLUMN requests INTEGER NOT NULL DEFAULT 0;
+--    同 key_usage.account_id：**故意不写在本文件**（会被 schemaStatements 的派生逻辑当成建表语句、
+--    破坏"逐条一致"语义），而由 SCHEMA_MIGRATIONS 单独导出 + apply-schema 容忍 duplicate column name。
 CREATE TABLE IF NOT EXISTS quotas (
   account_id      TEXT PRIMARY KEY,             -- -> accounts.id
-  period_start    INTEGER NOT NULL,             -- 当前计费周期起点（epoch ms，月重置用）
-  used_cost       REAL NOT NULL DEFAULT 0,      -- 已消耗的加权"配额小时"（方案A折算）
-  monthly_limit   REAL NOT NULL DEFAULT 5.0,    -- 默认每月 5h
+  period_start    INTEGER NOT NULL,             -- 当前窗口起点（epoch ms，R6 起为"注册时间网格对齐"）
+  used_cost       REAL NOT NULL DEFAULT 0,      -- 本窗口已消耗的加权 token（列名沿用 legacy）
+  monthly_limit   REAL NOT NULL DEFAULT 5.0,    -- legacy 列：**不再参与判定**（仅补行时写默认值）
+  requests        INTEGER NOT NULL DEFAULT 0,   -- 本窗口**真实用户请求数**（扣费成功才 +1，见 quota.ts）
   updated_at      INTEGER NOT NULL
 );
 
@@ -137,36 +142,15 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
   updated_at    INTEGER NOT NULL
 );
 
--- ─────────────────────────────────────────────
--- 结巴回退索引（bigram_index）：ingest 时预计算 bigram，回退分支用（plan.md §5.4）。
--- 回退链路（T1.3）：embedding/Qdrant 全灭 → runFallback(query, DB) 把 query 切成
--- bigram/ASCII 词 → 按 gram 匹配本表 → 按 path 聚合、命中 gram 数降序取 top → 返回 hits。
--- 表较大，后续按 wiki_id+gram 建索引；此处先建骨架。
--- snippet 列在骨架阶段补齐，供回退分支直接带摘要返回（M1 按需加列符合注释约定）。
--- ─────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS bigram_index (
-  id            TEXT PRIMARY KEY,
-  wiki_id       TEXT NOT NULL,
-  path          TEXT NOT NULL,                  -- 文档路径
-  title         TEXT NOT NULL,
-  section       TEXT,
-  url           TEXT,
-  gram          TEXT NOT NULL,                  -- bigram / 关键词 token
-  snippet       TEXT,                           -- 摘要片段（回退分支直接带出）
-  updated_at    INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_bigram_gram_wiki
-  ON bigram_index (gram, wiki_id);
-
--- 回退检索时按 gram 匹配文档 id 去重聚合，用 id 关联原始 chunk 信息。
-CREATE INDEX IF NOT EXISTS idx_bigram_path_wiki
-  ON bigram_index (path, wiki_id);
+-- 注：这里曾有 `bigram_index`（D1 倒排索引，回退分支用）。**已删除**（2026-09-11 技术债清理）：
+-- 回退检索改用 Qdrant 全文索引后该表只写不读，且 1481 chunk 会产生 521,925 行
+-- （超 D1 免费版 10 万写/天 5.2 倍，history.md §5 坑 14）。
+-- 线上老库由 schemaStatements.ts 的 `DROP TABLE IF EXISTS bigram_index` 迁移删除；新库不再创建。
 
 -- ─────────────────────────────────────────────
 -- 增量文件清单（ingest_files）：真·文件级增量（T2.2 真增量版）。
 -- 每次 ingest 记录 content_dir 下每个入库文件的路径 + 内容 hash，
--- 下次跑时只对 hash 变化的文件重新 embed/upsert，消失的文件删除（Qdrant points + bigram 行）。
+-- 下次跑时只对 hash 变化的文件重新 embed/upsert，消失的文件删除（Qdrant points）。
 -- 无此表时退化全量重嵌（幂等覆盖），不破坏旧行为。
 -- ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS ingest_files (

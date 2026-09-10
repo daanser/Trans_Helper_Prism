@@ -10,7 +10,7 @@
 //   6) runSearch（真实 search.ts）embedding 抛错 → 整链路落 fallback
 import { describe, it, expect, vi, afterEach } from "vitest"
 import { runFallback } from "../src/fallback"
-import { splitBigrams, writeBigramRow } from "../src/bigram"
+import { splitBigrams } from "../src/bigram"
 import { runSearch } from "../src/search"
 import type { FallbackResponse } from "../src/fallback"
 import type { RunSearchResult } from "../src/search"
@@ -130,25 +130,18 @@ describe("splitBigrams 切分", () => {
   })
 })
 
-describe("writeBigramRow 写入（mock D1，模块保留但回退链路已不用）", () => {
-  it("返回影响行数", async () => {
-    const db = {
-      prepare: () => ({
-        bind: () => ({ run: async () => ({ success: true, meta: { changes: 1 } }) }),
-      }),
-    } as unknown as D1Database
-    const n = await writeBigramRow(db, {
-      id: "x",
-      wiki_id: "mtf-wiki",
-      path: "/p",
-      title: "T",
-      section: null,
-      url: "u",
-      gram: "激素",
-      snippet: "s",
-      updatedAt: 123,
-    })
-    expect(n).toBe(1)
+describe("bigram 模块只做分词（不再有任何 D1 写入口）", () => {
+  it("模块只导出 splitBigrams（writeBigramRow / BigramRow 等已随 bigram_index 表一起删除）", async () => {
+    const mod = (await import("../src/bigram")) as Record<string, unknown>
+    expect(Object.keys(mod).sort()).toEqual(["splitBigrams"])
+    expect(mod.writeBigramRow).toBeUndefined()
+  })
+
+  it("splitBigrams 是纯函数：同样输入两次调用结果一致（无状态、无 IO）", () => {
+    const a = splitBigrams("激素治疗 hormone")
+    const b = splitBigrams("激素治疗 hormone")
+    expect(a).toEqual(b)
+    expect(a).toEqual(["激素", "素治", "治疗", "hormone"])
   })
 })
 

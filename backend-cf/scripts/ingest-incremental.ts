@@ -15,7 +15,15 @@
 // 用法：
 //   QDRANT_URL=... QDRANT_API_KEY=... EMBED_POOL_KEYS=... GITHUB_TOKEN=... \
 //     npx tsx scripts/ingest-incremental.ts [--only=mtf-wiki] [--full] [--dry-run]
+//
+// 可选：INGEST_SUMMARY_PATH=/path/summary.json —— 把本次每个 wiki 的结果写成**机器可读**摘要，
+// 供 `.github/workflows/ingest.yml` 的"上报摄取摘要"步骤 POST 到
+// `POST /api/v1/admin/ingest/runs`（Worker 代笔写 D1 `ingest_runs`；本脚本没有 D1 绑定，也不该有）。
+// 摘要形状：{ started_at, finished_at, reports: [{ wiki_id, status, changed, removed, chunks_upserted, error }] }
+// 单个 wiki 失败**不再中断整轮**：记 status=failed + error 后继续跑其余 wiki，最后以退出码 1 结束
+// （既让 Actions 那一步标红，又能把"哪几个 wiki 失败"如实上报）。
 
+import { writeFileSync } from "node:fs"
 import { listWikis, collectionName } from "../src/wiki_registry"
 import { buildSiteUrl } from "../src/wikiUrl"
 import {
@@ -307,12 +315,56 @@ async function runWiki(wikiId: string): Promise<WikiSummary> {
   }
 }
 
+/** 上报给 `/admin/ingest/runs` 的单个 wiki 摘要（形状与 Actions 的上报步骤约定一致）。 */
+interface RunReport {
+  wiki_id: string
+  status: "success" | "failed"
+  changed: number
+  removed: number
+  chunks_upserted: number
+  error: string | null
+}
+
+/**
+ * 写机器可读摘要（仅在 INGEST_SUMMARY_PATH 非空时）。
+ * 写失败**只警告不抛错**：摄取本身已经完成，摘要文件只影响"后台观测"，不该让整轮失败。
+ * 内容不含任何密钥/凭据（只有计数与泛化错误信息，错误信息截断 300 字符）。
+ */
+function writeSummaryFile(startedMs: number, finishedMs: number, reports: RunReport[]): void {
+  const path = (process.env.INGEST_SUMMARY_PATH ?? "").trim()
+  if (!path) return
+  try {
+    writeFileSync(path, JSON.stringify({ started_at: startedMs, finished_at: finishedMs, reports }, null, 2), "utf-8")
+    console.log(`摘要已写入：${path}`)
+  } catch (e) {
+    console.warn(`摘要写入失败（不影响摄取）：${(e as Error)?.message ?? String(e)}`)
+  }
+}
+
 async function main() {
   const wikis = ONLY ? [ONLY] : listWikis().map((w) => w.id)
+  const runStarted = Date.now()
   console.log(`增量摄取：${wikis.join(", ")}${FULL ? "（--full 强制全量重嵌）" : ""}${DRY ? " [dry-run]" : ""}`)
   const summaries: WikiSummary[] = []
+  const reports: RunReport[] = []
   for (const id of wikis) {
-    summaries.push(await runWiki(id))
+    try {
+      const summary = await runWiki(id)
+      summaries.push(summary)
+      reports.push({
+        wiki_id: id,
+        status: "success",
+        changed: summary.changed,
+        removed: summary.removed,
+        chunks_upserted: summary.points_upserted,
+        error: null,
+      })
+    } catch (e) {
+      // 单 wiki 失败不阻断其余 wiki（历史上一个坏文件会让整轮零产出）；失败如实记账并最终退出码 1
+      const msg = (e as Error)?.message ?? String(e)
+      console.error(`wiki=${id} 摄取失败：${msg}`)
+      reports.push({ wiki_id: id, status: "failed", changed: 0, removed: 0, chunks_upserted: 0, error: msg.slice(0, 300) })
+    }
   }
   const totals = summaries.reduce(
     (a, s) => ({ changed: a.changed + s.changed, removed: a.removed + s.removed, upserted: a.upserted + s.points_upserted }),
@@ -321,6 +373,11 @@ async function main() {
   console.log(`\n完成：changed=${totals.changed} removed=${totals.removed} upserted=${totals.upserted}`)
   for (const s of summaries) {
     console.log(`  ${s.wiki_id}: files=${s.files_total} changed=${s.changed} removed=${s.removed} chunks=${s.chunks} upsert=${s.points_upserted} ${s.seconds.toFixed(1)}s${s.skipped ? " (skip)" : ""}`)
+  }
+  writeSummaryFile(runStarted, Date.now(), reports)
+  const failed = reports.filter((r) => r.status === "failed")
+  if (failed.length > 0) {
+    throw new Error(`${failed.length}/${reports.length} 个 wiki 摄取失败：${failed.map((f) => f.wiki_id).join(", ")}`)
   }
 }
 

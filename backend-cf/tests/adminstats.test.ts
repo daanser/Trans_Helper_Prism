@@ -128,7 +128,11 @@ function auditInserts(calls: Array<{ sql: string; args: unknown[] }>) {
   return calls.filter((c) => /INSERT INTO audit_log/i.test(c.sql))
 }
 
-/** 默认 usage 行（acc-1 正常 / acc-2 超额 / acc-3 封禁且无 quotas 行）。 */
+/**
+ * 默认 usage 行（acc-1 正常 / acc-2 超额 / acc-3 封禁且无 quotas 行）。
+ * `requests` 是技术债 #4 新增的 `quotas.requests` 列 = **本窗口内扣费成功的真实请求数**
+ * （与 `key_usage` 行数无关；老口径以 `upstream_calls` 透出）。
+ */
 function usageRows() {
   return [
     {
@@ -137,6 +141,7 @@ function usageRows() {
       created_at: NOW - 60_000,
       period_start: WINDOW_START,
       used_cost: 250,
+      requests: 7,
     },
     {
       account_id: "acc-2",
@@ -144,6 +149,7 @@ function usageRows() {
       created_at: NOW - 50_000,
       period_start: WINDOW_START,
       used_cost: 1500, // 超限 → used_pct 夹到 100
+      requests: 3,
     },
     {
       account_id: "acc-3",
@@ -151,14 +157,15 @@ function usageRows() {
       created_at: NOW - 40_000,
       period_start: null, // 无 quotas 行（LEFT JOIN → NULL）
       used_cost: null,
+      requests: null,
     },
   ]
 }
 
 /**
  * key_usage 窗口粗筛行（account_id / endpoint / tokens_in / tokens_out / created_at）。
- * 期望结果：
- *   acc-1 → requests 4（embeddings + rerank + 2×chat）+ 窗口外/未来行不计
+ * 期望结果（`upstream_calls` = 老口径的 key_usage 行数；`requests` 另见 usageRows 的 quotas.requests）：
+ *   acc-1 → upstream_calls 4（embeddings + rerank + 2×chat）+ 窗口外/未来行不计
  *           llm_tokens_in 100 / out 200（只有 chat 累加：100/200 + 0/0）
  *   acc-2 → requests 1、in 10 / out 20
  *   acc-3 → 全 0（无 quotas 行 → 窗口起点 = now，任何历史行都不在窗口内）
@@ -238,8 +245,10 @@ describe("GET /api/v1/admin/usage", () => {
     expect(acc1.exceeded).toBe(false)
     expect(acc1.status).toBe("active")
     expect(acc1.window_start).toBe(WINDOW_START)
-    // 账号维度用量真值（不再是 null）：见 keyUsageRows() 的口径注释
-    expect(acc1.requests).toBe(4)
+    // requests = quotas.requests（真实请求数，技术债 #4 新口径）；
+    // upstream_calls = key_usage 行数（老口径，含换 key 重试）—— 两者互相独立
+    expect(acc1.requests).toBe(7)
+    expect(acc1.upstream_calls).toBe(4)
     expect(acc1.llm_tokens_in).toBe(100)
     expect(acc1.llm_tokens_out).toBe(200)
 
@@ -247,7 +256,8 @@ describe("GET /api/v1/admin/usage", () => {
     expect(acc2.used_pct).toBe(100) // 150% 夹到 100
     expect(acc2.remaining_pct).toBe(0)
     expect(acc2.exceeded).toBe(true)
-    expect(acc2.requests).toBe(1)
+    expect(acc2.requests).toBe(3)
+    expect(acc2.upstream_calls).toBe(1)
     expect(acc2.llm_tokens_in).toBe(10)
     expect(acc2.llm_tokens_out).toBe(20)
 
@@ -259,7 +269,8 @@ describe("GET /api/v1/admin/usage", () => {
     expect(acc3.exceeded).toBe(false)
     // 无 quotas 行 = 窗口起点是 now → 窗口内用量 0（不是 null）
     expect(acc3.window_start).toBeGreaterThanOrEqual(NOW)
-    expect(acc3.requests).toBe(0)
+    expect(acc3.requests).toBe(0) // 无 quotas 行 → 0
+    expect(acc3.upstream_calls).toBe(0)
     expect(acc3.llm_tokens_in).toBe(0)
     expect(acc3.llm_tokens_out).toBe(0)
 
@@ -348,9 +359,9 @@ describe("GET /api/v1/admin/usage", () => {
   })
 })
 
-// ────────── key_usage 账号维度聚合：requests / llm_tokens_in / llm_tokens_out ──────────
+// ────────── 账号维度真值：requests（quotas）/ upstream_calls 与 llm_tokens（key_usage）──────────
 
-describe("/admin/usage 的 key_usage 账号维度真值", () => {
+describe("/admin/usage 的账号维度真值（requests 来自 quotas，token 来自 key_usage）", () => {
   /** 跑一次 /admin/usage，返回 items（按 account_id 索引）+ D1 调用记录。 */
   async function fetchItems(opts: Parameters<typeof makeDb>[0], env: Partial<Env> = {}) {
     const { db, calls } = makeDb(opts)
@@ -363,7 +374,9 @@ describe("/admin/usage 的 key_usage 账号维度真值", () => {
     const body = (await resp.json()) as {
       items: Array<{
         account_id: string
+        used_tokens: number
         requests: number
+        upstream_calls: number
         llm_tokens_in: number
         llm_tokens_out: number
         window_start: number
@@ -373,19 +386,24 @@ describe("/admin/usage 的 key_usage 账号维度真值", () => {
     return { byId, items: body.items, calls }
   }
 
-  it("窗口内计数；窗口外/未来/匿名/未知账号不计；embed|rerank 只计请求不计 token", async () => {
-    const { byId } = await fetchItems({ usageRows: usageRows(), keyUsageRows: keyUsageRows() })
+  it("窗口内计数；窗口外/未来/匿名/未知账号不计；embed|rerank 只计调用不计 token", async () => {
+    const { byId, calls } = await fetchItems({ usageRows: usageRows(), keyUsageRows: keyUsageRows() })
 
-    expect(byId.get("acc-1")!.requests).toBe(4) // embeddings + rerank + 2×chat（窗口外与未来行被剔除）
+    // requests = quotas.requests（扣费成功的真实请求数，与 key_usage 无关）
+    expect(byId.get("acc-1")!.requests).toBe(7)
+    expect(byId.get("acc-2")!.requests).toBe(3)
+    // upstream_calls = key_usage 行数（老口径）：embeddings + rerank + 2×chat（窗口外与未来行被剔除）
+    expect(byId.get("acc-1")!.upstream_calls).toBe(4)
     expect(byId.get("acc-1")!.llm_tokens_in).toBe(100) // 只有 chat 的 100 计入（embeddings 7 / rerank 5 / 999 / 888 都不计）
     expect(byId.get("acc-1")!.llm_tokens_out).toBe(200)
 
-    expect(byId.get("acc-2")!.requests).toBe(1)
+    expect(byId.get("acc-2")!.upstream_calls).toBe(1)
     expect(byId.get("acc-2")!.llm_tokens_in).toBe(10)
     expect(byId.get("acc-2")!.llm_tokens_out).toBe(20)
 
     // 无 quotas 行的账号 = 新窗口（window_start 上移到 now）→ 历史行全在窗口外
     expect(byId.get("acc-3")!.requests).toBe(0)
+    expect(byId.get("acc-3")!.upstream_calls).toBe(0)
     expect(byId.get("acc-3")!.llm_tokens_in).toBe(0)
     expect(byId.get("acc-3")!.llm_tokens_out).toBe(0)
 
@@ -393,20 +411,32 @@ describe("/admin/usage 的 key_usage 账号维度真值", () => {
     expect(byId.has("")).toBe(false)
     expect(byId.has("acc-gone")).toBe(false)
     expect(byId.size).toBe(3)
+    // requests 走 accounts ⟕ quotas 的**同一条** JOIN（零额外查询）
+    expect(calls.filter((c) => /FROM accounts/i.test(c.sql))).toHaveLength(1)
+    expect(calls.find((c) => /FROM accounts/i.test(c.sql))!.sql).toContain("q.requests AS requests")
   })
 
-  it("没有任何 key_usage 行 → 三个数字都是 0（不是 null）", async () => {
+  it("没有任何 key_usage 行 → token/upstream_calls 为 0；requests 只认 quotas", async () => {
     const { byId } = await fetchItems({ usageRows: usageRows(), keyUsageRows: [] })
     for (const item of byId.values()) {
-      expect(item.requests).toBe(0)
+      expect(item.upstream_calls).toBe(0)
       expect(item.llm_tokens_in).toBe(0)
       expect(item.llm_tokens_out).toBe(0)
     }
+    expect(byId.get("acc-1")!.requests).toBe(7) // 不受 key_usage 影响（真值来自 quotas）
+    expect(byId.get("acc-3")!.requests).toBe(0)
   })
 
-  it("窗口已过期 → 只统计「新窗口」内的行（旧行归 0）", async () => {
+  it("窗口已过期 → 只统计「新窗口」内的行（旧行归 0，requests 也归 0）", async () => {
     const rows = [
-      { account_id: "acc-old", status: "active", created_at: 1, period_start: NOW - 6 * 3_600_000, used_cost: 900 },
+      {
+        account_id: "acc-old",
+        status: "active",
+        created_at: 1,
+        period_start: NOW - 6 * 3_600_000,
+        used_cost: 900,
+        requests: 5, // 旧窗口里扣费成功过 5 次 → 过期窗口一律按 0 呈现（与 used_cost 同口径）
+      },
     ]
     const { byId, calls } = await fetchItems({
       usageRows: rows,
@@ -415,7 +445,9 @@ describe("/admin/usage 的 key_usage 账号维度真值", () => {
         { account_id: "acc-old", endpoint: "chat", tokens_in: 42, tokens_out: 43, created_at: NOW - 3_600_000 },
       ],
     })
+    expect(byId.get("acc-old")!.used_tokens).toBe(0)
     expect(byId.get("acc-old")!.requests).toBe(0)
+    expect(byId.get("acc-old")!.upstream_calls).toBe(0)
     expect(byId.get("acc-old")!.llm_tokens_in).toBe(0)
     expect(byId.get("acc-old")!.llm_tokens_out).toBe(0)
     // 粗筛下界 = 该账号（新窗口）起点；窗口外行由 JS 侧剔除，不依赖 SQL
@@ -500,7 +532,7 @@ describe("aggregateKeyUsage（纯函数，窗口 / endpoint 口径）", () => {
 // ─────────────────────────── POST /admin/db/apply-schema ───────────────────────────
 
 describe("POST /api/v1/admin/db/apply-schema（迁移容错）", () => {
-  /** D1 mock：按语句内容决定抛什么错；`ran` 只记录 DDL 语句（审计 INSERT 不计入）。 */
+  /** D1 mock：按语句内容决定抛什么错；`ran` 只记录 DDL 语句（ALTER/CREATE/**DROP**；审计 INSERT 不计入）。 */
   function makeSchemaDb(failFor: (sql: string) => string | null = () => null) {
     const ran: string[] = []
     const db = {
@@ -512,7 +544,7 @@ describe("POST /api/v1/admin/db/apply-schema（迁移容错）", () => {
             return stmt
           },
           async run() {
-            if (/^(ALTER|CREATE)/i.test(sql)) ran.push(sql)
+            if (/^(ALTER|CREATE|DROP)/i.test(sql)) ran.push(sql)
             const msg = failFor(sql)
             if (msg) throw new Error(msg)
             return { success: true, results: [], meta: { changes: 1 } }
@@ -645,7 +677,7 @@ describe("POST /api/v1/admin/db/apply-schema（迁移容错）", () => {
           },
           async run() {
             if (/INSERT INTO audit_log/i.test(sql)) auditRows.push({ sql, args: stmt.args })
-            if (/^(ALTER|CREATE)/i.test(sql)) ran.push(sql)
+            if (/^(ALTER|CREATE|DROP)/i.test(sql)) ran.push(sql)
             return { success: true, results: [], meta: { changes: 1 } }
           },
           async all() {

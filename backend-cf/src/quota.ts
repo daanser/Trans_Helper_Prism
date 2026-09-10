@@ -356,6 +356,19 @@ export async function ensureWindow(
       )
       .bind(accountId, gridStart, 5.0, nowMs)
       .run()
+    // ⓪ 窗口切换前先清零 `requests`（技术债 #4：`/admin/usage` 的"本窗口真实请求数"）。
+    // **必须放在 ① 之前**：条件 `period_start < gridStart` 只在"行还停在旧窗口"时成立，
+    // ① 一执行 period_start 就等于 gridStart，本语句就再也匹配不到了。
+    // **单独一条 + 单独 try/catch**：`requests` 列由 SCHEMA_MIGRATIONS 补，旧库可能还没迁移；
+    // 缺列失败**绝不能**影响窗口推进，否则 ensureWindow 返回 null → chargeQuota 判 db-unavailable
+    // → 配额闸门整体 fail-open（那比少一个后台指标严重得多）。
+    // 竞态说明：本语句只碰"旧窗口"的行，新窗口上刚扣的请求不会被清掉（最多丢掉窗口边界上
+    // 旧窗口里的那 1~2 次计数，属观测噪声）。
+    try {
+      await db.prepare("UPDATE quotas SET requests = 0 WHERE account_id = ? AND period_start < ?").bind(accountId, gridStart).run()
+    } catch {
+      // 列未迁移 / 写失败 → 跳过（迁移完成后 requests 从头开始计数）
+    }
     // ① 网格推进（旧起点落后于当前网格起点）→ 清零并对齐。单条条件写，并发下只会成功一次。
     await db
       .prepare("UPDATE quotas SET used_cost = 0, period_start = ?, updated_at = ? WHERE account_id = ? AND period_start < ?")
@@ -411,7 +424,7 @@ export async function getQuota(
 }
 
 /**
- * 原子扣减配额（T3.2 核心）。
+ * 原子扣减配额（T3.2 核心；2026-09-11 增补 `requests` 计数，技术债 #4）。
  * @param tokens 加权 token 消耗（见 computeQuotaCost）
  * @param nowMs  当前时间（epoch ms；用于窗口推进）
  * @param env    读取 `QUOTA_WINDOW_TOKENS` / `QUOTA_WINDOW_HOURS`
@@ -420,6 +433,20 @@ export async function getQuota(
  *   - 超额：ok=false, reason="quota-exceeded"（未扣，调用方切回退分支）；
  *   - 无 D1/DB 异常：ok=false, reason="db-unavailable"（调用方按「放行 + warning」处理）。
  * tokens <= 0（如回退）直接放行，不写库。
+ *
+ * ── `requests`（本窗口**真实用户请求数**，adminstats 的 `/admin/usage` 用它）──
+ * 与 `used_cost` 在**同一条 UPDATE** 里自增，因此：
+ *   · 零额外写（D1 免费版 10 万行写/天，见 history.md §5 坑 14）；
+ *   · **只在扣费成功时 +1** —— `WHERE used_cost + ? <= ?` 不成立时整条语句不改任何列，
+ *     `requests` 也就不会涨。所以"额度耗尽后走关键词回退"的请求**不计入**（口径见 adminstats.ts）；
+ *   · 原子性与并发安全完全继承原语句（判-扣-计数三者同一条语句，不存在"扣了没记"或"记了没扣"）。
+ * 窗口切换时由 `ensureWindow()` 把它清零（与 used_cost 同步）。
+ *
+ * ── 未迁移旧库的兼容（重要）──
+ * `requests` 列由 `SCHEMA_MIGRATIONS` 的 `ALTER TABLE quotas ADD COLUMN requests` 补上。
+ * 若部署后**还没跑 apply-schema**（列不存在），带 `requests` 的语句会报 `no such column`；
+ * 此处**退化为旧语句**（只扣 used_cost），保证配额闸门不会因为没有这一列而整体 fail-open
+ * （那会让额度形同虚设）。代价仅是迁移完成前 requests 恒为 0（在 /admin/usage 上可见）。
  */
 export async function chargeQuota(
   db: QuotaDb,
@@ -445,11 +472,24 @@ export async function chargeQuota(
 
   const limit = limitTokens(env)
   try {
-    // 单条原子「判-扣」：并发下不会超卖（meta.changes === 0 即超额/已被扣光）。
-    const res = await db
-      .prepare("UPDATE quotas SET used_cost = used_cost + ?, updated_at = ? WHERE account_id = ? AND used_cost + ? <= ?")
-      .bind(cost, nowMs, accountId, cost, limit)
-      .run()
+    // 单条原子「判-扣-计数」：并发下不会超卖（meta.changes === 0 即超额/已被扣光）。
+    const runCharge = (withRequests: boolean) =>
+      db
+        .prepare(
+          withRequests
+            ? "UPDATE quotas SET used_cost = used_cost + ?, requests = requests + 1, updated_at = ? WHERE account_id = ? AND used_cost + ? <= ?"
+            : // 旧库兜底（requests 列还没迁移）：只扣 used_cost，绝不因为缺列而放行整站
+              "UPDATE quotas SET used_cost = used_cost + ?, updated_at = ? WHERE account_id = ? AND used_cost + ? <= ?",
+        )
+        .bind(cost, nowMs, accountId, cost, limit)
+        .run()
+
+    let res: Awaited<ReturnType<typeof runCharge>>
+    try {
+      res = await runCharge(true)
+    } catch {
+      res = await runCharge(false)
+    }
     if (res?.meta?.changes === 1) {
       const view = await getQuota(db, accountId, nowMs, env)
       return { ok: true, used_tokens: view.used_tokens, used_pct: view.used_pct, remaining_pct: view.remaining_pct }

@@ -70,6 +70,7 @@ import {
 } from "./ratecount"
 import { listAudit, writeAudit } from "./audit"
 import { SCHEMA_MIGRATIONS, SCHEMA_STATEMENTS, isToleratedSchemaError } from "./db/schemaStatements"
+import { clampIngestRunsLimit, insertIngestRun, listIngestRuns, parseIngestRunInput } from "./ingestruns"
 import { runFallback, type FallbackResponse } from "./fallback"
 import {
   buildPrompt,
@@ -1304,6 +1305,57 @@ api.get("/admin/audit", async (c) => {
     offset: Number(c.req.query("offset") ?? 0),
   })
   return c.json({ rows })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 摄取历史记账（ingest_runs）—— 技术债 #1：摄取跑在 GitHub Actions（无 D1 绑定），
+// 由 Actions 调这两个端点让 Worker 代笔，后台才看得见摄取历史（history.md §8.2 第 1 条）。
+// 鉴权：adminAuthorize（ADMIN_API_KEY 或 admin JWT）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /admin/ingest/runs —— 追加一条摄取记录
+//   header: Authorization: Bearer <ADMIN_API_KEY>
+//   body:   { wiki_id, status: "success"|"failed", commit_sha?, started_at?, finished_at?,
+//             files_changed?, chunks_upserted?, error? }
+// 字段映射（粗粒度摘要 → 细粒度列）见 src/ingestruns.ts 文件头。
+// 返回：{ ok:true, run }（含落库后的整行，便于 Actions 日志核对）；校验失败 → 422；D1 异常 → 503。
+api.post("/admin/ingest/runs", async (c) => {
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
+  if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
+
+  let body: unknown = {}
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: "invalid-body" }, 422)
+  }
+  const parsed = parseIngestRunInput(body, Date.now())
+  if (!parsed.ok) return c.json({ error: parsed.error }, 422)
+
+  try {
+    await insertIngestRun(c.env.DB, parsed.run)
+  } catch {
+    // 记账端点的失败必须可见（这里除了记账没有别的事），不回显 SQL/驱动细节
+    return c.json({ error: "db-unavailable" }, 503)
+  }
+  return c.json({ ok: true, run: parsed.run })
+})
+
+// GET /admin/ingest/runs?limit=20 —— 最近若干条（按 finished_at DESC，未完成的排最后）
+// 只读；limit 缺省 20、夹到 [1,200]。
+api.get("/admin/ingest/runs", async (c) => {
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
+  if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
+
+  const limit = clampIngestRunsLimit(c.req.query("limit"))
+  try {
+    const runs = await listIngestRuns(c.env.DB, limit)
+    return c.json({ runs, limit })
+  } catch {
+    return c.json({ error: "db-unavailable" }, 503)
+  }
 })
 
 // POST /api/v1/admin/ingest/trigger —— 手动触发 ingest（T2.2 运维入口，受 ADMIN_API_KEY 保护）

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // 校验 src/db/schemaStatements.ts 与 src/db/schema.sql 一致（防止两处漂移）。
 // 改 schema.sql 后请重新生成 schemaStatements.ts（去注释 → 按 ; 切分 → 空白折叠）。
-// 另外校验 key_usage.account_id 的**历史表补列迁移**：它天然不幂等，故单独导出（SCHEMA_MIGRATIONS）
-// 并用 isToleratedSchemaError() 明确「哪些报错其实代表已经是对的状态」。
+// 另外校验历史表变更（SCHEMA_MIGRATIONS）：两处补列（key_usage.account_id / quotas.requests）
+// 天然不幂等，另加 `DROP TABLE IF EXISTS bigram_index`（技术债 #2：废弃表清理）。
+// 两者都单独导出（不混进 schema.sql 的"建表形状"），并用 isToleratedSchemaError() 明确
+// 「哪些报错其实代表已经是对的状态」。
 import { describe, it, expect } from "vitest"
 import { readFileSync } from "node:fs"
 import { SCHEMA_MIGRATIONS, SCHEMA_STATEMENTS, isToleratedSchemaError } from "../src/db/schemaStatements"
@@ -43,16 +45,27 @@ describe("key_usage.account_id：新库建表 + 历史表补列迁移", () => {
   })
 
   it("补列迁移单独导出（不混进 schema.sql 的派生结果），语义正确且可重复执行", () => {
-    expect(SCHEMA_MIGRATIONS).toEqual([`ALTER TABLE key_usage ADD COLUMN account_id TEXT NOT NULL DEFAULT ''`])
+    expect(SCHEMA_MIGRATIONS).toEqual([
+      `ALTER TABLE key_usage ADD COLUMN account_id TEXT NOT NULL DEFAULT ''`,
+      `ALTER TABLE quotas ADD COLUMN requests INTEGER NOT NULL DEFAULT 0`,
+      `DROP TABLE IF EXISTS bigram_index`,
+      `DROP INDEX IF EXISTS idx_bigram_gram_wiki`,
+      `DROP INDEX IF EXISTS idx_bigram_path_wiki`,
+    ])
     // 迁移语句**不在** schema.sql 派生清单里（否则"逐条一致"的含义会被污染）
-    expect([...SCHEMA_STATEMENTS]).not.toContain(SCHEMA_MIGRATIONS[0])
-    // 列可空性/默认值正确：历史行补列后 account_id=''（匿名归属），不会因 NOT NULL 失败
-    const stmt = SCHEMA_MIGRATIONS[0]
-    expect(stmt).toMatch(/^ALTER TABLE key_usage ADD COLUMN account_id TEXT NOT NULL DEFAULT ''$/)
+    for (const m of SCHEMA_MIGRATIONS) expect([...SCHEMA_STATEMENTS]).not.toContain(m)
+    // 列可空性/默认值正确：历史行补列后 account_id=''（匿名归属）、requests=0，不会因 NOT NULL 失败
+    expect(SCHEMA_MIGRATIONS[0]).toMatch(/^ALTER TABLE key_usage ADD COLUMN account_id TEXT NOT NULL DEFAULT ''$/)
+    expect(SCHEMA_MIGRATIONS[1]).toMatch(/^ALTER TABLE quotas ADD COLUMN requests INTEGER NOT NULL DEFAULT 0$/)
   })
 
   it("容忍的报错：duplicate column name（任意语句）、ALTER 的 no such table", () => {
     const alter = SCHEMA_MIGRATIONS[0]
+    // 两条 ALTER 走同一套容忍规则（quotas.requests 与 key_usage.account_id 语义一致）
+    expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[1], "D1_ERROR: duplicate column name: requests")).toBe(true)
+    expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[1], "SQLITE_ERROR: no such table: quotas")).toBe(true)
+    // DROP 不需要容忍规则：它本身幂等；真报错（库不可用）必须算 failed
+    expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[2], "D1_ERROR: network connection lost")).toBe(false)
     // 已迁移过 / 新库建表时已带该列
     expect(isToleratedSchemaError(alter, "SQLITE_ERROR: duplicate column name: account_id")).toBe(true)
     expect(isToleratedSchemaError(alter, "D1_ERROR: duplicate column name: account_id")).toBe(true)

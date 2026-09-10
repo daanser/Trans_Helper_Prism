@@ -5,8 +5,8 @@
 //
 // ── 数据来源（与 quota.ts 同一口径）──
 //   · accounts        → account_id / status / created_at（封禁状态原样透出）
-//   · quotas          → `period_start` = window_start、`used_cost` = used_tokens（零 DDL 复用，见 quota.ts 文件头）
-//   · key_usage       → `account_id` 维度的窗口内用量（requests / llm_tokens_in / llm_tokens_out）
+//   · quotas          → `period_start` = window_start、`used_cost` = used_tokens、`requests` = 本窗口真实请求数
+//   · key_usage       → `account_id` 维度的窗口内用量（llm_tokens_in / llm_tokens_out）
 //   · 额度/窗口长度   → `limitTokens(env)` / `windowHours(env)`（**唯一**来源，不读 DB 的 monthly_limit）
 //   · provider_keys   → `keys[]`（脱敏投影，见 keyadmin.ts）
 //
@@ -15,18 +15,19 @@
 // （window_start=now、used_tokens=0、窗口内用量计数 0）。落库推进由 chargeQuota/ensureWindow 负责；
 // 管理接口只读，绝不写库。
 //
-// ── requests / llm_tokens_in / llm_tokens_out 的口径 ──
-// `key_usage` 自 M4 起带 `account_id`（见 schema.sql + SCHEMA_MIGRATIONS），记账时由
-// `makeKeyUsageDb(env, accountId)` 写入（匿名 = 空串），因此这三个数字现在是**真值**：
-//   · requests        = 该账号**当前窗口内**的 key_usage 行数（每一次上游模型调用一行，
-//                       含换 key 重试产生的失败行）
+// ── requests / llm_tokens_in / llm_tokens_out 的口径（2026-09-11 技术债 #4 改口径）──
+//   · requests        = **真实用户请求数**：`quotas.requests`（本窗口内扣费成功的请求数，
+//                       由 chargeQuota 与 used_cost 在同一条原子 UPDATE 里 +1）。
+//       ⚠️ 口径：**只有扣费成功的请求**计入 —— 额度耗尽后走关键词回退、或零消耗（回退/免费）的请求
+//          不扣费、因而不 +1；窗口切换时由 ensureWindow 清零。它**不再**是"上游调用行数"。
 //   · llm_tokens_in   = 该账号窗口内 **endpoint='chat'** 的 tokens_in 之和（embed/rerank 计 0）
 //   · llm_tokens_out  = 同上，tokens_out 之和
-// 无数据 = 0（不是 null）。**匿名调用（account_id=''）不归属任何账号**，不计入 items（仍留在 key_usage）。
-// ⚠️ 已知口径缺口（既有实现，非本文件引入）：`key_usage` 目前**只有 chat 路径真的写行**——
-//    llm.ts 会调 `pool.recordUsage()`；而 embeddings.ts / rerank.ts 虽然接收 KeyPoolDb，
-//    却从不调 recordUsage。所以一个只用检索（不开 LLM）的账号，requests 仍会显示 0。
-//    修法在 embeddings.ts / rerank.ts 各补一次 recordUsage（本任务文件所有权范围外，需 captain 授权）。
+// 这两个 token 数仍来自 `key_usage`（每账号一行一次模型调用；`account_id` 由
+// `makeKeyUsageDb(env, accountId)` 写入，匿名 = 空串）。无数据 = 0（不是 null）。
+// **匿名调用（account_id=''）不归属任何账号**，不计入 items（仍留在 key_usage）。
+// 历史口径（老 `requests`）保留在 `aggregateKeyUsage()` 里：那是 key_usage 行数
+// （含换 key 重试的失败行），即"上游调用次数"。`AdminUsageItem.upstream_calls` 会把它透出，
+// 便于看"重试放大"；`requests` 则回答"这个账号到底点了多少次"。
 // 窗口过滤在 JS 里按每个账号自己的 window_start 做（唯一真值来源 = resolveWindowStart），
 // SQL 只做「窗口并集 + 排除匿名」的粗筛，避免 N+1 也避免多读无谓的行。
 //
@@ -55,8 +56,13 @@ export interface AdminUsageItem {
   /** 剩余百分比（0–100，1 位小数） */
   remaining_pct: number
   exceeded: boolean
-  /** 见文件头口径：该账号当前窗口内的 key_usage 行数（目前只有 chat 路径写行；无数据 = 0） */
+  /** 见文件头口径：该账号当前窗口内**扣费成功**的真实请求数（`quotas.requests`；无数据 = 0） */
   requests: number
+  /**
+   * 老口径（保留可观测性）：该账号窗口内的 `key_usage` 行数 = 上游模型调用次数
+   * （含换 key 重试产生的失败行）。与 `requests` 之差 ≈ 重试/失败放大。
+   */
+  upstream_calls: number
   /** 该账号窗口内 endpoint='chat' 的 tokens_in 之和（embed/rerank 计 0，无数据 = 0） */
   llm_tokens_in: number
   /** 同上，tokens_out 之和 */
@@ -86,6 +92,8 @@ interface UsageDbRow {
   created_at: unknown
   period_start: unknown
   used_cost: unknown
+  /** `quotas.requests`（旧库未迁移该列时查询会退化，见 buildAdminUsage） */
+  requests: unknown
 }
 
 /** key_usage 窗口粗筛行形状（只取聚合需要的列）。 */
@@ -185,6 +193,9 @@ export function toUsageItem(
   const windowStart = resolveWindowStart(row.period_start, nowMs, env)
   const expired = windowExpired(row.period_start, nowMs, env)
   const used = expired ? 0 : Math.max(0, num(row.used_cost, 0))
+  // 窗口过期 = 新窗口：used_cost 与 requests 都按 0 呈现（与 quota.ts 的 toView 同口径；
+  // 落库清零由 ensureWindow 负责，这里只读不改库）。
+  const requests = expired ? 0 : nonNegInt(row.requests)
   const pct = usedPct(used, limit)
   return {
     account_id: accountIdOf(row.account_id),
@@ -196,7 +207,8 @@ export function toUsageItem(
     used_pct: pct,
     remaining_pct: clampPct(round1(100 - pct)),
     exceeded: used >= limit,
-    requests: nonNegInt(usage?.requests),
+    requests,
+    upstream_calls: nonNegInt(usage?.requests),
     llm_tokens_in: nonNegInt(usage?.llm_tokens_in),
     llm_tokens_out: nonNegInt(usage?.llm_tokens_out),
   }
@@ -238,6 +250,9 @@ async function fetchAccountUsage(
  * 聚合用量总览（真实数据，只读）。
  * 单条 SQL 取 accounts ⟕ quotas（避免 N+1），另加**一条** key_usage 窗口粗筛聚合（同样无 N+1）；
  * keys[] 单独取且失败即降级为空数组。SQL 异常向上抛（路由回 503），绝不返回编造数据。
+ *
+ * `quotas.requests`（技术债 #4）来自同一条 JOIN，零额外查询；旧库未迁移该列时退化为旧查询
+ * （`NULL AS requests` → items[].requests = 0），见下方 try/catch 的说明。
  */
 export async function buildAdminUsage(
   db: D1Database,
@@ -247,17 +262,36 @@ export async function buildAdminUsage(
   const limit = limitTokens(env)
   const hours = windowHours(env)
 
-  const res = await db
-    .prepare(
-      `SELECT a.id AS account_id, a.status AS status, a.created_at AS created_at,
-              q.period_start AS period_start, q.used_cost AS used_cost
-         FROM accounts a
-    LEFT JOIN quotas q ON q.account_id = a.id
-        ORDER BY a.created_at DESC, a.id ASC
-        LIMIT ?`,
-    )
-    .bind(ADMIN_USAGE_ACCOUNT_LIMIT)
-    .all<UsageDbRow>()
+  // `quotas.requests` 由 SCHEMA_MIGRATIONS 补列。若部署后还没跑 apply-schema（旧库没有该列），
+  // 带 requests 的查询会报 `no such column` —— 那时**退化为旧查询**（requests 记 0），
+  // 保证整个管理面板不会因为少一列而 503；迁移完成后自动恢复真值。
+  // 注意：真正的 DB 故障（库不可用）会让退化查询同样失败 → 继续向上抛 → 路由回 503，不会被吞掉。
+  const selectAccounts = (withRequests: boolean) =>
+    db
+      .prepare(
+        withRequests
+          ? `SELECT a.id AS account_id, a.status AS status, a.created_at AS created_at,
+                    q.period_start AS period_start, q.used_cost AS used_cost, q.requests AS requests
+               FROM accounts a
+          LEFT JOIN quotas q ON q.account_id = a.id
+              ORDER BY a.created_at DESC, a.id ASC
+              LIMIT ?`
+          : `SELECT a.id AS account_id, a.status AS status, a.created_at AS created_at,
+                    q.period_start AS period_start, q.used_cost AS used_cost, NULL AS requests
+               FROM accounts a
+          LEFT JOIN quotas q ON q.account_id = a.id
+              ORDER BY a.created_at DESC, a.id ASC
+              LIMIT ?`,
+      )
+      .bind(ADMIN_USAGE_ACCOUNT_LIMIT)
+      .all<UsageDbRow>()
+
+  let res: Awaited<ReturnType<typeof selectAccounts>>
+  try {
+    res = await selectAccounts(true)
+  } catch {
+    res = await selectAccounts(false)
+  }
 
   const rows = res?.results ?? []
 

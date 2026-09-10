@@ -122,3 +122,29 @@ X OAuth 的回调地址是 `https://transhelper-prism-backend.transprism.workers
 ---
 
 _最后更新：2026-09-09_
+
+---
+
+## ⏸ 明天从这里继续（2026-09-10 收工时的状态）
+
+### 已本地提交、**故意未推送**的一批：技术债 A/B/D + C 的端点
+提交信息：`wip(tech-debt): 清 bigram_index / 删 listActiveKeys / ingest_runs 端点 / quotas.requests 真值`
+（工作区干净；`git log origin/main..HEAD` 可看到）
+
+- **A ✅** 移除死亡 bigram 写入路径 + schema 去表 + 幂等迁移 `DROP TABLE IF EXISTS bigram_index`（**保留 `splitBigrams`**，`fallback.ts` 还在用）
+- **B ✅** 删掉从未被消费的 `KeyPoolDb.listActiveKeys?`
+- **C ◐** `POST/GET /api/v1/admin/ingest/runs` 端点已完成；**`.github/workflows/ingest.yml` 的回传步骤还没加**（subagent 被中断）；仓库 Secrets 也还没加 `ADMIN_API_KEY`
+- **D ✅** `quotas.requests` 列 + 在 `chargeQuota` 同一条原子 UPDATE 里自增 → `/admin/usage.requests` 变真实用户请求数
+- 验证：`tsc --noEmit` 0 错、`vitest run` **537 全绿**（基线 529 + 8）
+
+### ⚠️ 明天推送时的**硬顺序**（不遵守会出故障）
+1. `git push`（Worker 会随 GitHub 集成重部署）
+2. **立刻** `POST /api/v1/admin/db/apply-schema`（建 `quotas.requests` 列 + `DROP bigram_index`）
+   —— 因为 D 项的 `chargeQuota` 已经引用新列，**迁移跑完前配额扣费会 fail-open 失效**（可用性不受影响，但不计费）
+3. 验收：`/admin/usage` 的 `requests` 是否随搜索增长；`POST /admin/ingest/runs` + `GET /admin/ingest/runs` 各来一条
+4. 补 C 的 workflow 步骤 + 你加 `ADMIN_API_KEY` 到 GitHub Secrets
+
+### 其余待办
+- 技术债 #5（0-chunk 短文件每次复核）—— C 的通道打通后可解
+- M4（灰度运营）：内测反馈、压测复跑、月账、运营面板
+- 技术债 #7（ASN 清单按真实流量校准）—— 等有量再说

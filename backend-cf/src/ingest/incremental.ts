@@ -3,12 +3,11 @@
 // 流程：Cron(UTC 01:00) → 每 wiki 发 Queue 消息 → 本模块 ingestWiki：
 //   拉 tarball → 定位 content_dir → 只收 .md → 对比 D1 上次成功 commit sha（相同则 skip，0 拉包）
 //   → 按 ingest_files 表的内容 hash 做文件级 diff：只对 新增/修改 的文件 解析/embed/upsert，
-//     对消失的文件删 Qdrant points + bigram 行 → 更新 ingest_files → 写 D1 ingest_runs（记账）。
+//     对消失的文件删 Qdrant points → 更新 ingest_files → 写 D1 ingest_runs（记账）。
 // 真·增量（M2 真增量版）：hash 相同不重嵌（省 embedding token）；无 ingest_files 表时退化全量重嵌（幂等覆盖）。
 // 单 wiki 失败不影响其它 wiki（Queue 天然隔离）；本模块全部可注入 fetchImpl/nowMs，便于单测。
 // Serverless 兼容：hash 用 WebCrypto crypto.subtle（workerd 原生），不依赖 node:crypto。
 import { createEmbeddingProvider } from "../embeddings"
-import { splitBigrams, writeBigramRow } from "../bigram"
 import { getWiki } from "../wiki_registry"
 import { buildSiteUrl } from "../wikiUrl"
 import {
@@ -173,16 +172,6 @@ async function deletePointsByPath(
   if (!resp.ok) throw new Error(`qdrant-delete-failed path=${path} status=${resp.status}`)
 }
 
-/** 删除 D1 中某 path 的 bigram 索引行。DB 缺失/失败不抛错。 */
-async function deleteBigramByPath(db: D1Database | undefined, wikiId: string, path: string): Promise<void> {
-  if (!db) return
-  try {
-    await db.prepare("DELETE FROM bigram_index WHERE wiki_id = ? AND path = ?").bind(wikiId, path).run()
-  } catch {
-    // 索引删除失败不阻断（下次 ingest 覆盖）
-  }
-}
-
 /** Qdrant 批量 upsert（与 one-shot-import 行为一致，64 一批）。 */
 async function upsertPoints(
   baseUrl: string,
@@ -269,7 +258,7 @@ export async function ingestWiki(env: Env, wikiId: string, opts: { fetchImpl?: t
   const addedCount = changedPaths.filter((p) => !prevHashes.has(p)).length
   const updatedCount = changedPaths.length - addedCount
 
-  // 5. 只解析 changed 文件 → chunk（含文本，供 embed + bigram）
+  // 5. 只解析 changed 文件 → chunk（含文本，供 embed 与 Qdrant payload.text 全文索引）
   const dirMeta = buildDirMeta(contentFiles.map((f) => ({ path: f.contentDirRel, content: f.content })))
   const chunks: Array<{ record: ChunkRecord; text: string }> = []
   for (const f of contentFiles.sort((a, b) => a.repoRootPath.localeCompare(b.repoRootPath))) {
@@ -296,7 +285,7 @@ export async function ingestWiki(env: Env, wikiId: string, opts: { fetchImpl?: t
     chunks.push(...items)
   }
 
-  // 6. 对 changed 文件 embed + upsert（幂等 point id）+ bigram 索引
+  // 6. 对 changed 文件 embed + upsert（幂等 point id）
   let pointsUpserted = 0
   let tokensUsed = 0
   if (chunks.length > 0 && env.QDRANT_URL) {
@@ -321,34 +310,15 @@ export async function ingestWiki(env: Env, wikiId: string, opts: { fetchImpl?: t
         },
       }))
       await upsertPoints(env.QDRANT_URL, env.QDRANT_API_KEY, collName(wiki.id), points, fetchImpl)
-      // bigram 索引（回退分支用）：先删该 path 旧行再写新（chunk 结构可能变）。
-      // DB undefined（无 D1 环境）跳过——回退分支本就依赖 D1。
-      if (env.DB) {
-        for (let j = 0; j < batch.length; j++) {
-          const c = batch[j]
-          await deleteBigramByPath(env.DB, wiki.id, c.record.path)
-          const grams = splitBigrams(c.text)
-          for (const gram of grams) {
-            await writeBigramRow(env.DB, {
-              id: `${pointId(c.record.wiki_id, c.record.path, c.record.chunk_index)}:${gram}`,
-              wiki_id: c.record.wiki_id,
-              path: c.record.path,
-              title: c.record.title,
-              section: c.record.section,
-              url: c.record.url,
-              gram,
-              snippet: c.text.slice(0, 500),
-              updatedAt: new Date(c.record.updated_at).getTime(),
-            }).catch(() => undefined)
-          }
-        }
-      }
+      // 注：曾经在这里写 D1 `bigram_index` 倒排索引（回退分支用）。该表已废弃并删除
+      // （见 src/bigram.ts 文件头与 schemaStatements.ts 的 DROP 迁移）：回退检索改用 Qdrant 全文索引，
+      // 表只写不读且写放大超免费额度 5 倍。**不要**再把写入加回来。
       pointsUpserted += points.length
     }
     tokensUsed = chunks.reduce((acc, c) => acc + Math.ceil(c.text.length / 2), 0)
   }
 
-  // 7. 删除消失文件：Qdrant points + D1 bigram 行 + ingest_files 记录
+  // 7. 删除消失文件：Qdrant points + ingest_files 记录
   let pointsDeleted = 0
   for (const p of deletedPaths) {
     try {
@@ -356,7 +326,6 @@ export async function ingestWiki(env: Env, wikiId: string, opts: { fetchImpl?: t
         await deletePointsByPath(env.QDRANT_URL, env.QDRANT_API_KEY, collName(wiki.id), p, fetchImpl)
         pointsDeleted++
       }
-      await deleteBigramByPath(env.DB, wiki.id, p)
       await deleteIngestFile(env.DB, wiki.id, p)
     } catch {
       // 单 path 删除失败不阻断

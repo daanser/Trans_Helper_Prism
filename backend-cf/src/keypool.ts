@@ -26,8 +26,17 @@ export interface KeyPoolDb {
   recordUsage(rec: UsageRecord): Promise<void>
   /** 可选：把失败持久化到 provider_keys，便于跨请求冷却/判定剔除。 */
   markFailure?(pool: PoolName, keyRef: string, reason: string): Promise<void>
-  /** 可选：把 key 池状态持久化（现用内存态即可，后续可接 D1）。 */
-  listActiveKeys?(pool: PoolName): Promise<string[]>
+  // ── 关于「跨请求禁用 / 剔除某个 key」的口径（改前先读，别再长出第二套真相源）──
+  // **唯一真相源 = KV 禁用集 `keydeny:<pool>`**（见 keyadmin.ts 的 readDeniedPools / setKeyDenied）：
+  //   · admin 在面板上禁用/恢复某个 key → 只写 KV；
+  //   · 每个请求进来时 `KeyPool.usableKeys()` 按该集合过滤（KV 挂了/读失败 → 视为无禁用 = fail-open）；
+  //   · 跨 isolate 立即生效，无需重建池。
+  // `provider_keys.enabled` / `status` / `cooldown_until` **只用于管理端展示与审计**
+  // （脱敏投影见 keyadmin.ts），**不参与**运行时的选 key 决策 —— 改了 DB 也不会自动生效。
+  //
+  // 历史：本接口曾有一个 `listActiveKeys?(pool): Promise<string[]>`，**从未被任何代码消费**
+  // （2026-09-11 技术债清理删除）。它当年的设想是"从 D1 恢复池状态"，但那会引入第二套真相源，
+  // 且可能与 KV 禁用集互相矛盾。**不要**把它加回来：要新增跨请求控制面就扩展 KV 禁用集。
 }
 
 /** 池内单个 key 的运行时状态。 */
