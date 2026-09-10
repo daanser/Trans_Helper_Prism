@@ -309,6 +309,94 @@ CREATE INDEX IF NOT EXISTS idx_rate_counters_window ON rate_counters (window_sta
 
 > **两者收益相同**：Worker 拿到真实客户端 IP 与真实 `request.cf`（country/asn），可删掉 Pages Function 反代与共享密钥信任链。
 
+#### 8.2.1 零基础逐步操作（方案 A：委派 `api.*`，第一次做照着点即可）
+
+**名词先对齐**：CF 里「**添加站点 / Add a site**」= 在这个账号下新建一个「zone（域）」。
+委派就是：**在父域里加两条 NS 记录，把子域的管理权交给另一个账号新建的那个 zone**。
+
+---
+
+**第 0 步 · 先搞清楚两个父域分别在哪个账号（1 分钟）**
+
+`dash.cloudflare.com` → 右上角**账号切换器** → 分别切到各账号 → 看左侧 **「域 / Websites」** 列表：
+
+| 看到什么 | 结论 |
+|---|---|
+| `transhelper.org` **已经**在 `transprism` 账号里 | 它**不需要委派**，跳到第 4 步直接加 Worker 自定义域 |
+| 不在 | 按下面完整流程做（和 chengxi.moe 一样）|
+
+> 建议**先只做 `api.chengxi.moe` 一个**，跑通后再做第二个 —— 出问题好定位。
+
+---
+
+**第 1 步 · 在 transprism 账号里新建子域 zone**
+
+1. 切到 **`transprism`** 账号
+2. 左侧「**域 / Websites**」→ 右上「**添加站点 / Add a site**」
+3. 输入 **`api.chengxi.moe`** → Continue
+4. 选 **Free** 套餐 → Continue
+5. 它会扫描 DNS 记录（子域一般没有记录，直接 Continue）
+6. **最后屏幕会给出两个 nameserver 名字**，形如：
+   ```
+   xxxx.ns.cloudflare.com
+   yyyy.ns.cloudflare.com
+   ```
+   👉 **把这两个名字复制下来/记下来**（第 2 步要用）。如果这页没看到，就在该 zone 的 **Overview** 页找「Cloudflare nameservers」。
+7. 此时这个 zone 显示 **Pending（待激活）** —— **这是正常的**，因为我们还没做委派。
+
+---
+
+**第 2 步 · 去 chengxi.moe 所在账号加两条 NS 记录**
+
+1. 切到**持有 `chengxi.moe` 的那个账号**
+2. 点进 **`chengxi.moe`** → 左侧 **「DNS」→「记录 / Records」**
+3. ⚠️ **不要动 `search` 那条记录**（它正跑着你的前端）
+4. 点「**添加记录 / Add record**」两次，分别填：
+
+| 类型 | 名称 | 内容 | TTL |
+|---|---|---|---|
+| `NS` | `api` | 第 1 个 nameserver | 自动 |
+| `NS` | `api` | 第 2 个 nameserver | 自动 |
+
+> 名称**只填 `api`**（CF 会自动补全成 `api.chengxi.moe`）；内容就是第 1 步复制的那两个名字。
+> 如果原来就有 `api` 这个名的 A/CNAME 记录，要先删掉那条（我们没用过 `api`，一般不会遇到）。
+
+---
+
+**第 3 步 · 等激活**
+
+回 transprism 账号看 `api.chengxi.moe`：状态应从 **Pending** 变成 **Active（活动）**（通常几分钟）。
+超过 10 分钟还没变，告诉我 —— 我用 `dig NS api.chengxi.moe @1.1.1.1` 帮你判断委派有没有生效。
+
+---
+
+**第 4 步 · 把 Worker 挂到这个域名上**
+
+1. transprism → **Workers & Pages** → `transhelper-prism-backend`
+2. **Settings → Domains & Routes（域与路由）→ Add → Custom Domain**
+3. 输入 **`api.chengxi.moe`** → Add
+4. 等它变成 Active（CF 自动签证书，几十秒到几分钟）
+
+---
+
+**第 5 步 · 告诉我，我收尾**
+
+我做：改 `NUXT_PUBLIC_API_BASE` / `OAUTH_REDIRECT_URI` / `ALLOWED_ORIGINS`，删除 `frontend/functions/` 反代，复测搜索 + 登录 + AI 流式。
+
+**你要做**：X 开发者后台加一条 Redirect URI：
+```
+https://api.chengxi.moe/api/v1/auth/oauth/x/callback
+```
+（**原来的那条不要删**，留作回滚。）
+
+---
+
+**常见问题**
+- 「这个域名看起来是子域」的提示 → 正常，继续。
+- zone 一直 Pending → 检查父域那两条 NS 记录的**名称是不是 `api`**、内容是不是第 1 步给的两个名字。
+- 加自定义域报 1014/1016 → 说明 zone 还没 Active，先等激活再加。
+- 想回滚 → 删掉父域那两条 NS 记录即可（`api.*` 从未承载过线上流量，**无停机风险**）。
+
 #### ⚠️ 共同注意事项
 1. **删反代后前端与 API 变成跨域**（`search.chengxi.moe` → `api.chengxi.moe`）：CORS 与 OPTIONS 预检回来了，
    需把 `ALLOWED_ORIGINS` 配好；换来的是 Worker 直连（少一跳、限流天然准确）。
@@ -388,4 +476,4 @@ window_start = registration_time + floor((now - registration_time) / window_ms) 
 
 ---
 
-_最后更新：2026-09-09（CN 机房档 10→6；LLM 除数规则；子域名委派操作手册 §8.2：推荐方案 A「委派 api.*，零停机」）_
+_最后更新：2026-09-09（限流实施进度：R2✅ R3✅ R5🔄 R1⏸；子域委派操作手册 §8.2 + 零基础逐步操作 §8.2.1）_
