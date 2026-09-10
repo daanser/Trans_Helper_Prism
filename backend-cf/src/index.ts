@@ -811,6 +811,33 @@ api.post("/admin/accounts/:id/quota", async (c) => {
   return c.json({ ok: true, quota: view, quota_display: formatPct(view.used_pct) })
 })
 
+// GET /admin/whoami —— 诊断：看 Worker 到底收到了哪些「来源相关」请求头
+// 用途：经 Pages Function 反代后，判断客户端 IP 是否还能被正确识别（限流依赖它，见 TODO.md P0 / R2）。
+// 安全：需 admin 鉴权；只回白名单头，绝不回 Authorization / Cookie / 任何密钥。
+api.get("/admin/whoami", async (c) => {
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
+
+  const h = c.req.raw.headers
+  const pick = (name: string): string | null => h.get(name)
+  return c.json({
+    ok: true,
+    // 只看这些「谁在调用我」相关的头
+    "cf-connecting-ip": pick("cf-connecting-ip"),
+    "x-forwarded-for": pick("x-forwarded-for"),
+    "x-real-ip": pick("x-real-ip"),
+    "x-prism-client-ip": pick("x-prism-client-ip"),
+    "cf-ray": pick("cf-ray"),
+    "cf-ipcountry": pick("cf-ipcountry"),
+    "user-agent-length": (pick("user-agent") ?? "").length,
+    origin: pick("origin"),
+    host: pick("host"),
+    // 后端实际会用于限流的取值（复现 clientIpFromHeaders 的逻辑）
+    resolved_ip: clientIpFromHeaders(h) ?? null,
+    resolved_by: pick("cf-connecting-ip") ? "cf-connecting-ip" : pick("x-forwarded-for") ? "x-forwarded-for" : "none",
+  })
+})
+
 // POST /admin/db/apply-schema —— 幂等应用 D1 schema
 // 用途：受限环境（wrangler d1 execute 不可用）下，用 Worker 的 D1 binding 完成建表/迁移。
 // 安全性：只执行 src/db/schemaStatements.ts 中固定的语句（建表 + 迁移），不接受任意 SQL；
