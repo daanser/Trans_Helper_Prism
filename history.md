@@ -96,6 +96,11 @@
 28. **CF Pages 预渲染路由会 308 到带尾斜杠**：OAuth 回跳若落 `/login` 会多一跳（fragment 按规范会继承，但为稳妥我们直接回跳 `/login/`）。
 29. **上游流式常不返回 `usage`**：LLM token 记账会退化成按字符估算（`estimated:true`）；要精确就得让上游开 `stream_options.include_usage` 或改用非流式结算。
 
+30. **OAuth 回调的 `Location` 必须是绝对 URL**：若发相对路径 `/login#token=…`，浏览器会按**当前域**解析——回调发生在 Worker 域，于是跳到 `https://<worker>/login#token=…` → 404 且登录态不生效（线上踩过，用户贴回跳 URL 才定位）。修法：`sanitizeRedirect` 一律 `new URL(raw, base).toString()`，`loginRedirectUrl` 只接受 `http(s)://` 开头、否则回落前端默认页。
+31. **`recordUsage` 原先只有 `llm.ts` 会调用**：`embeddings.ts` / `rerank.ts` 虽接收 `KeyPoolDb` 却从不记账 → `/admin/usage` 里「只搜索不开 LLM」的账号 `requests` 永远是 0。修法：给 `withKeyRetry` 加可选 `onAttempt` 回调（成功/失败都回调、回调抛错被吞），embeddings/rerank 在回调里写 `key_usage`（批量路径另补两处）。
+32. **`key_usage` 加列不能用 `CREATE TABLE IF NOT EXISTS` 补**（SQLite 无 `ADD COLUMN IF NOT EXISTS`）：迁移语句要单独导出，apply-schema 先跑迁移再建表，并把 `duplicate column name` / ALTER 的 `no such table` 视为成功（其它错误仍 failed）。**部署顺序硬要求：先 deploy，再立刻 POST apply-schema**——迁移完成前 `/admin/usage` 会 503（故意报错而不是显示假 0）。
+33. **登录回跳 fragment 要在 Nuxt 启动前消费**：放在 `onMounted` 里可能因水合/路由初始化重写 URL 而读不到 hash；现改为 `nuxt.config.ts` head 内联脚本先落 `localStorage.prism_token` 并清 hash（`useAuth.consumeHashToken` 保留作兜底，错误信息经 `sessionStorage` 传递）。
+
 ## 6. 前端现状（2026-09-08 全量重写 UI/UX；2026-09-09 已上线 Pages）
 - **设计语言已彻底换掉**：不再是照搬 `vitepress-theme-project-trans` 的 indigo 色板。现为自定「温润学术检索」风——浅底 `#F8FAFC` / 深底 `#0B1120`，品牌蓝 `#2563EB`（深 `#3B82F6`），token 全走 `assets/css/main.css` 的 CSS 变量（`--bg-canvas/--bg-surface/--text-*/--primary*`），`tailwind.config.ts` 只做语义映射（`canvas/surface/primary/ink`）。
 - **用户明确否决过的方向（别再走回头路）**：① 高饱和四色彩虹 wiki 徽章（粉/天蓝/紫/翠绿）——太 AI 味；② 纯黑 `bg-slate-900` 实色选中块——太凝重死寂；③ 全大写英文终端风标签（`ARCHIVE RETRIEVAL //`、`SEARCH`、`PERF //`）——读不懂。现方案：四库**统一中性**选中态（淡蓝底 `bg-blue-50/80` + 勾选 `✓`，无彩色区分），中文标签，`max-w-7xl` 宽屏。
