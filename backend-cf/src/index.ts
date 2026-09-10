@@ -38,6 +38,7 @@ import {
   rateLimitHeaders,
 } from "./ratelimit"
 import { listAudit, writeAudit } from "./audit"
+import { SCHEMA_STATEMENTS } from "./db/schemaStatements"
 import { runFallback, type FallbackResponse } from "./fallback"
 import {
   buildPrompt,
@@ -604,6 +605,36 @@ api.post("/admin/accounts/:id/quota", async (c) => {
     nowMs,
   })
   return c.json({ ok: true, quota: view, quota_display: formatPct(view.used_pct) })
+})
+
+// POST /admin/db/apply-schema —— 幂等应用 D1 schema
+// 用途：受限环境（wrangler d1 execute 不可用）下，用 Worker 的 D1 binding 完成建表/迁移。
+// 安全性：只执行 src/db/schemaStatements.ts 中固定的 IF NOT EXISTS 语句，不接受任意 SQL；需 ADMIN_API_KEY。
+api.post("/admin/db/apply-schema", async (c) => {
+  const denied = adminGuard(c)
+  if (denied) return denied
+  if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
+
+  const applied: string[] = []
+  const failed: Array<{ stmt: string; error: string }> = []
+  for (const stmt of SCHEMA_STATEMENTS) {
+    try {
+      await c.env.DB.prepare(stmt).run()
+      applied.push(stmt.slice(0, 60))
+    } catch (e) {
+      failed.push({ stmt: stmt.slice(0, 60), error: (e as Error)?.message?.slice(0, 200) ?? "failed" })
+    }
+  }
+  await writeAudit(c.env.DB, {
+    actorId: "admin",
+    action: "apply_schema",
+    detail: `applied=${applied.length} failed=${failed.length}`,
+    nowMs: Date.now(),
+  })
+  return c.json(
+    { ok: failed.length === 0, applied: applied.length, total: SCHEMA_STATEMENTS.length, failed },
+    failed.length === 0 ? 200 : 207,
+  )
 })
 
 // GET /admin/audit —— 审计日志
