@@ -103,6 +103,11 @@
 
 34. **X 的 `/2/users/me` 必须有 `tweet.read`**：曾按"只取 id+username"把 OAuth scope 收窄成只 `users.read`，结果回调 403（前端 `登录失败（x-users-me-failed status=403）`）。**默认 scope 必须两条**，别删；`X_OAUTH_SCOPES` env 只是个实验口子，改完必须真机走一次登录。
 
+35. **KV 限流会「抢跑」分档限流**：R2 修好真实 IP 之后，KV 限流（原 `RATE_LIMIT_IP_PER_MIN=10`）突然开始生效，会**先于** D1 分档把登录用户（60/min）在第 11 次挡掉。分档上线时必须把 KV 两项调到**高于所有档位**（现为 120/120）当粗兜底，真正的判定交给 D1。
+36. **测固定窗口限流必须对齐窗口边界**：12 次间隔 0.3s 的请求跨越了分钟边界 → 被拆成 7+5，两个窗口都没到 10，于是"限流没生效"是我的测法问题，不是代码问题。正确测法：等到整分钟边界再开始（`while [ "$(date +%S)" != "00" ]; do sleep 0.2; done`）。
+37. **`peek` 的 `degraded` 不能把「无行」当「读失败」**：新窗口第一次请求前表里本来就没有行，`readCount` 返回 null 是正常的；线上曾据此把正常状态报成 `rate_count_degraded=true`，我据此误判限流失效排查了很久。真读异常要由 try/catch 兜。
+38. **D1 分档计数的写放大是 3 行/匿名请求**（分档桶 + 突发桶 + 全局桶），比 plan 里"1 写/请求"高；免费版 10 万写/天 ≈ 3.3 万次匿名检索。突发桶"热了才写"会更省但会漏计使突发层架空，故按正确性优先。
+
 ## 6. 前端现状（2026-09-08 全量重写 UI/UX；2026-09-09 已上线 Pages）
 - **设计语言已彻底换掉**：不再是照搬 `vitepress-theme-project-trans` 的 indigo 色板。现为自定「温润学术检索」风——浅底 `#F8FAFC` / 深底 `#0B1120`，品牌蓝 `#2563EB`（深 `#3B82F6`），token 全走 `assets/css/main.css` 的 CSS 变量（`--bg-canvas/--bg-surface/--text-*/--primary*`），`tailwind.config.ts` 只做语义映射（`canvas/surface/primary/ink`）。
 - **用户明确否决过的方向（别再走回头路）**：① 高饱和四色彩虹 wiki 徽章（粉/天蓝/紫/翠绿）——太 AI 味；② 纯黑 `bg-slate-900` 实色选中块——太凝重死寂；③ 全大写英文终端风标签（`ARCHIVE RETRIEVAL //`、`SEARCH`、`PERF //`）——读不懂。现方案：四库**统一中性**选中态（淡蓝底 `bg-blue-50/80` + 勾选 `✓`，无彩色区分），中文标签，`max-w-7xl` 宽屏。

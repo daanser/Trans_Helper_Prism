@@ -50,11 +50,17 @@ X OAuth 的回调地址是 `https://transhelper-prism-backend.transprism.workers
 **设计稿见 [`plan-ratelimit.md`](./plan-ratelimit.md)**（含分档阈值、ASN 清单维护方式、D1 计数表、熔断、隐私与验收标准）。
 
 实施顺序（详见该文档 §10）：
-1. **R1**（你，5 分钟）：CF 边缘限流规则 —— zone `chengxi.moe` → Security → WAF → Rate limiting rules
+1. **R1（进行中）**：CF 边缘限流规则 —— zone `chengxi.moe` → Security → WAF → Rate limiting rules
    → `/api/v1/search` + 按 IP + 10 秒窗口 / 20 次 → Block 10 秒。**这层在边缘拦，连 Worker 成本都省。**
+   ⚠️ 现状：规则已按此配置且状态设为「活动」，但 45 并发实测**没有出现 CF 的 403**（35 个 429 全是我们 Worker 的分档），
+   说明边缘规则**尚未实际生效** —— 需确认规则状态/zone 是否正确，或免费版是否支持。**R3 已能独立兜住，R1 属成本优化。**
 2. **R2**（你 + 我）：`PROXY_SHARED_SECRET` 在 **Pages env** 与 **Worker Secret** 两处设成同一个值（代码已就绪）。
-3. **R3–R5**（我/subagent）：D1 计数 + 分档（CN 家宽 30 / CN 其它 15 / **CN 机房 6** / 境外 10 / 登录 60 次每分钟；
-   **LLM 端点 = 该档限额 ÷ 5 向上取整**）+ 熔断 + 观测。
+3. **R3（分档计数 + 熔断）→ ✅ 已完成并线上验证（2026-09-09）**：
+   - 分档判定与限额全对：`whoami` 显示 `tier=overseas`、`limit_per_min=10`、`llm_limit_per_min=2`、`resolved_by=proxy-trusted`；
+   - **搜索档实测**：对齐窗口边界连打 13 次 → 前 10 次 200，**第 11 次 429** `{tier:"overseas",scope:"tier-limit"}`；
+   - **LLM 档实测**：连打 14 次 `/chat` → 前 12 次放行，**第 13 次 429** `{tier:"logged_in"}`（= `ceil(60/5)`）；
+   - `rate_counters` 表已建（apply-schema）；桶 key 为 HMAC 摘要、**表内无 IP 明文**；KV 限流已降级为 120/min 粗兜底。
+   - **待办（R5）**：`/admin/usage` 增加"今日匿名请求/各档命中/熔断次数"观测；前端被 429 时的友好提示。
 4. **R6.5（可选优化）**：把 **`search.chengxi.moe` 子域名单独 NS 委派**到 Worker 所在账号（不必迁 `chengxi.moe` 主体），
    然后加 `api.search.chengxi.moe` 作为 Worker 自定义域、**删掉 Pages Function 反代** ——
    这样 Worker 直接看到真实客户端 IP/ASN，限流天然准确、少一跳。方案与坑见 `plan-ratelimit.md` §8.1。
