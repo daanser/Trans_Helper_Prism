@@ -1199,6 +1199,18 @@ api.get("/admin/whoami", async (c) => {
         return `table-error: ${String((e as Error)?.message ?? e).slice(0, 240)}`
       }
     })(),
+    // 【临时诊断】把最近写入的计数行 dump 出来（bucket_key 是 HMAC 摘要，不含 IP）
+    rate_count_rows: await (async () => {
+      if (!c.env.DB) return null
+      try {
+        const rs = await c.env.DB.prepare(
+          "SELECT tier, window_sec, count, updated_at, substr(bucket_key,1,10) AS k FROM rate_counters ORDER BY updated_at DESC LIMIT 12",
+        ).all<{ tier: string; window_sec: number; count: number; updated_at: number; k: string }>()
+        return (rs?.results ?? []).map((r) => `${r.tier} | ws=${r.window_sec} | n=${r.count} | k=${r.k}`)
+      } catch (e) {
+        return [`error: ${String((e as Error)?.message ?? e).slice(0, 200)}`]
+      }
+    })(),
     cf: (() => {
       const meta2 = (c.req.raw as unknown as { cf?: Record<string, unknown> }).cf ?? {}
       return {
