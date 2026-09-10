@@ -108,6 +108,13 @@
 37. **`peek` 的 `degraded` 不能把「无行」当「读失败」**：新窗口第一次请求前表里本来就没有行，`readCount` 返回 null 是正常的；线上曾据此把正常状态报成 `rate_count_degraded=true`，我据此误判限流失效排查了很久。真读异常要由 try/catch 兜。
 38. **D1 分档计数的写放大是 3 行/匿名请求**（分档桶 + 突发桶 + 全局桶），比 plan 里"1 写/请求"高；免费版 10 万写/天 ≈ 3.3 万次匿名检索。突发桶"热了才写"会更省但会漏计使突发层架空，故按正确性优先。
 
+39. **别把「不装重型依赖」扩大解释成「不许用任何库」**：M3 那个 subagent 把用户的约束理解成"禁止引 md 库"，于是 AI 回答一直是纯文本渲染；用户后来明确「你用呗」。
+   现在用的是 **`markdown-it`（`html:false`）**——一条依赖就把 md 渲染做对，安全上比自研解析器更稳（原始 HTML 全转义、危险协议被 `validateLink` 拦掉）。
+   **教训**：约束要按原话执行，拿不准就问，别自行加码。
+40. **流式 AI 回答必须给「内部独立滚动」**：卡片原来是 `lg:sticky` 但**没有滚动容器**，内容一长（追问会不断追加到同一个 `answer` 字符串）就只能滚整页，`sticky` 也失效。
+   修法：消息区 `max-h-* + overflow-y-auto + overscroll-behavior: contain`（后者是关键——否则滚动链会穿透到页面，用户会觉得"我滚它整页都跟着动"），
+   并且**只在用户贴着底部时才自动跟随**（`scrollHeight - scrollTop - clientHeight < 48`），否则用户上翻读历史会被反复拽回底部。
+
 ## 6. 前端现状（2026-09-08 全量重写 UI/UX；2026-09-09 已上线 Pages）
 - **设计语言已彻底换掉**：不再是照搬 `vitepress-theme-project-trans` 的 indigo 色板。现为自定「温润学术检索」风——浅底 `#F8FAFC` / 深底 `#0B1120`，品牌蓝 `#2563EB`（深 `#3B82F6`），token 全走 `assets/css/main.css` 的 CSS 变量（`--bg-canvas/--bg-surface/--text-*/--primary*`），`tailwind.config.ts` 只做语义映射（`canvas/surface/primary/ink`）。
 - **用户明确否决过的方向（别再走回头路）**：① 高饱和四色彩虹 wiki 徽章（粉/天蓝/紫/翠绿）——太 AI 味；② 纯黑 `bg-slate-900` 实色选中块——太凝重死寂；③ 全大写英文终端风标签（`ARCHIVE RETRIEVAL //`、`SEARCH`、`PERF //`）——读不懂。现方案：四库**统一中性**选中态（淡蓝底 `bg-blue-50/80` + 勾选 `✓`，无彩色区分），中文标签，`max-w-7xl` 宽屏。
