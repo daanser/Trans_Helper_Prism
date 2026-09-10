@@ -30,8 +30,11 @@ ADMIN_X_IDS=
 # 窗口内额度（加权 token）；纯搜索 200 / +rerank +100 / LLM 按真实 tokens / 回退 0
 QUOTA_WINDOW_TOKENS=300000
 QUOTA_WINDOW_HOURS=5
-# 未登录是否只走关键词回退（"1"=是，plan §2 登录制；"0"=放开完整检索）
-REQUIRE_LOGIN=1
+# 未登录是否只走关键词回退（"1"=是；"0"=放开完整向量检索，仅靠限流挡滥用）
+REQUIRE_LOGIN=0
+# 限流（次/分钟）：匿名放开检索后，IP 维度是主要成本闸门
+RATE_LIMIT_IP_PER_MIN=20
+RATE_LIMIT_ACCOUNT_PER_MIN=60
 
 # ── LLM（T3.4 / T3.5）────────────────────────────────────
 LLM_MODEL=Qwen/Qwen3.5-4B

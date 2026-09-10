@@ -33,8 +33,8 @@ import {
 import {
   checkSubjectRateLimit,
   clientIpFromHeaders,
-  DEFAULT_RATE_LIMIT_POLICY,
   kvRateLimitStore,
+  type RateLimitPolicy,
   rateLimitHeaders,
 } from "./ratelimit"
 import { listAudit, writeAudit } from "./audit"
@@ -100,6 +100,21 @@ function getChatProvider(env: Env) {
 /** SearchHit → LLM 输入（截断由 llm.ts 内部负责）。 */
 function toLlmHits(hits: SearchResponse["hits"]): LlmHit[] {
   return hits.map((h) => ({ id: h.id, title: h.title, url: h.url, source: h.source, text: h.snippet }))
+}
+
+/**
+ * 限流策略（env 可调）。匿名放开向量检索后，IP 维度是唯一的成本闸门，故默认收紧到 20 次/分钟；
+ * 登录账号 60 次/分钟（另有配额计量兜底）。
+ */
+function rateLimitPolicy(env: Env): RateLimitPolicy {
+  const parse = (raw: string | undefined, fallback: number): number => {
+    const n = Number(raw)
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
+  }
+  return {
+    account: { limit: parse(env.RATE_LIMIT_ACCOUNT_PER_MIN, 60), windowSec: 60 },
+    ip: { limit: parse(env.RATE_LIMIT_IP_PER_MIN, 20), windowSec: 60 },
+  }
 }
 
 /** 未登录是否强制只走关键词回退（plan §2 登录制；REQUIRE_LOGIN=0 可关闭）。 */
@@ -225,7 +240,7 @@ api.post("/search", async (c) => {
   const rl = await checkSubjectRateLimit(
     c.env.SEARCH_CACHE ? kvRateLimitStore(c.env.SEARCH_CACHE) : undefined,
     { ip, accountId: session?.sub },
-    DEFAULT_RATE_LIMIT_POLICY,
+    rateLimitPolicy(c.env),
     nowMs,
   )
   if (rl.degraded) console.warn(`[ratelimit] degraded scope=${rl.scope}`)

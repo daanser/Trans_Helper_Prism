@@ -54,8 +54,12 @@ export interface Env {
   QUOTA_WINDOW_TOKENS?: string
   /** 窗口长度（小时），默认 5 */
   QUOTA_WINDOW_HOURS?: string
-  /** 未登录是否只走关键词回退（默认 "1"=是；"0"=放开完整检索） */
+  /** 未登录是否只走关键词回退（默认 "1"=是；"0"=放开完整检索，仅靠限流挡滥用） */
   REQUIRE_LOGIN?: string
+  /** 单 IP 限流（次/分钟），默认 20；匿名放开检索后这是主要成本闸门 */
+  RATE_LIMIT_IP_PER_MIN?: string
+  /** 单账号限流（次/分钟），默认 60 */
+  RATE_LIMIT_ACCOUNT_PER_MIN?: string
 
   // ── LLM（T3.4 / T3.5）──
   LLM_MODEL?: string
