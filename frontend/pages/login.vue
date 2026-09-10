@@ -91,15 +91,16 @@
           <span>使用 X 账号登录</span>
         </button>
         <NuxtLink to="/" class="text-xs text-ink-muted transition-colors hover:text-ink-title">
-          不登录，先以回退模式检索
+          不登录，直接开始检索
         </NuxtLink>
       </div>
 
       <!-- 隐私说明（T3.1 底线） -->
       <ul class="mt-8 space-y-2 border-t border-surface-border pt-5 text-xs leading-relaxed text-ink-muted">
-        <li>· 登录仅用于配额计量与防滥用，不要求实名、不收集手机号。</li>
-        <li>· 从 X 仅读取账号 id 与 handle，落库前做哈希最小化处理，不保存你的任何动态或关注关系。</li>
-        <li>· 未登录也可检索，此时自动走回退模式，可用性略低于向量检索。</li>
+        <li>· 登录仅用于额度计量与防滥用：不要求实名、不收集手机号、不绑定邮箱。</li>
+        <li>· 身份识别仅使用 X 账号 id 与用户名；数据库只存 id 的 sha256 摘要，不保存用户名，也不保存你的帖子或关注关系。</li>
+        <li>· 未登录也能搜索——走的是完整向量检索，只是按 IP 限流；登录后额外解锁 AI 伴读与追问，并显示本窗口剩余额度。</li>
+        <li>· 会话凭据只存在你自己的浏览器本地，30 天有效；点顶栏「退出」即可随时清除。</li>
       </ul>
     </div>
   </div>
@@ -127,7 +128,7 @@ const heading = computed(() => {
 const description = computed(() => {
   if (state.value === "success") return "正在返回首页，你的会话与剩余配额会显示在顶部导航栏。"
   if (state.value === "error") return errorText.value
-  return "登录后可获得完整的向量检索与 AI 伴读额度（滚动窗口固定额度，顶栏显示剩余百分比），并可在设置页保存个人检索偏好。"
+  return "登录后可解锁 AI 伴读与多轮追问，顶栏会显示本窗口剩余额度百分比，并可在设置页保存个人检索偏好。不登录也能正常搜索。"
 })
 
 const toneBoxClass = computed(() => {

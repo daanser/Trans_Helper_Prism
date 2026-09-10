@@ -136,9 +136,9 @@
             </span>
             <span class="text-xs leading-relaxed text-amber-800 dark:text-amber-200">
               <template v-if="loginRequired">
-                未登录时使用关键词回退检索（不消耗额度）。
+                当前按关键词回退检索（服务端开启了强制登录时会这样）。
                 <NuxtLink to="/login" class="font-medium underline underline-offset-2">登录</NuxtLink>
-                后可获得完整的向量检索与 AI 伴读。
+                后即可用完整向量检索、AI 伴读与多轮追问。
               </template>
               <template v-else>
                 因上游向量服务波动，当前已自动切换为基础分词索引模式。
@@ -245,7 +245,7 @@ const error = ref("")
 const results = ref<SearchResponse["hits"]>([])
 const responseTimings = ref<SearchTimings | null>(null)
 const fallback = ref(false)
-/** 未登录时后端只给关键词回退（warnings: ["login-required"]）→ 提示登录 */
+/** 服务端在 REQUIRE_LOGIN=1 时对匿名请求回 keywords 回退（warnings 含 "login-required"）→ 提示登录 */
 const loginRequired = ref(false)
 const quota = ref<SearchResponse["quota"] | null>(null)
 const warnings = ref<string[]>([])
@@ -521,7 +521,7 @@ async function doSearch(payload: Pick<SearchRequest, "query" | "corpora" | "use_
     if (res.warnings?.length) {
       for (const w of res.warnings) {
         if (w === "login-required") {
-          pushToast("未登录：当前为关键词回退检索，登录后可用完整向量检索", "info")
+          pushToast("未登录：当前为关键词回退检索；登录后解锁完整向量检索与 AI 伴读", "info")
         } else if (w.includes("fallback")) {
           pushToast("已自动切换至降级检索模式", "warning")
         }

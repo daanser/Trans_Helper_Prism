@@ -34,6 +34,9 @@
 ## 🟡 P1：其它已知缺口
 
 1. ~~**`/admin/usage` 的每账号 `requests` / `llm_tokens_*`**：需要 `key_usage` 加 `account_id` 列并接线~~ → **已完成（2026-09-09）**：`key_usage` 加 `account_id`、检索链路（embed/rerank）与 chat 都记账，线上实测 `requests=4 / llm_in=2281 / llm_out=491`。
+2. **X 授权范围可再收窄（隐私增强，需验证）**：当前 scope 是 `users.read tweet.read`，所以 X 授权页会显示"可查看你能查看的所有帖子"。
+   但我们只调 `/2/users/me`（取 id + username），理论上 **`tweet.read` 可以去掉**。改动点：`backend-cf/src/auth.ts` 的 `X_SCOPES`，
+   改后需**真机走一次登录**确认还能取到用户信息；失败就回滚。去掉后授权页文案更克制，与"仅用 id 与用户名"的表述完全一致。
 2. **反滥用第二层**：CF 边缘 Rate Limiting 规则（零代码，优先）与 Turnstile 人机验证。
    **当前决策：刻意暂缓——被刷了再加**。现在匿名可用完整向量检索（`REQUIRE_LOGIN=0`），成本闸门只有 KV 限流（IP 10 次/分钟）。
 3. **`ingest_runs` 记账未接**：摄取跑在 GitHub Actions，无 D1 访问权限；要接需给 Actions 加 CF API token。

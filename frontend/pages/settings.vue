@@ -24,7 +24,7 @@
       </div>
 
       <div v-if="!isLoggedIn" class="text-xs leading-relaxed text-ink-sub">
-        当前未登录：检索自动走回退模式。登录后可获得每月配额，并开启 AI 伴读与追问。
+        当前未登录：可以正常检索（按 IP 限流）。登录后可解锁 AI 伴读与多轮追问，并在顶栏看到本窗口剩余额度百分比。
       </div>
 
       <div v-else class="space-y-4">
