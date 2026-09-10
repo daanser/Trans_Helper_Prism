@@ -1,6 +1,6 @@
 # task-second-domain.md —— 第二前端域名 `search.transhelper.org`（待执行）
 
-> 状态：**待执行**（2026-09-09 记录；当前卡在**权限**：需要 `transhelper.org` 所在 CF 账号的 DNS 修改权限）
+> 状态：**可执行**（2026-09-10 用户已拿到 `transhelper.org` 账号权限；⚠️ 新增前置条件见 §3.5：该 zone 现在整站开着人机验证，必须先关掉）
 > 关联：`plan-ratelimit.md` §8.1（委派已取消）、`history.md` 坑 17（跨账号 CNAME 1014/1016）、`TODO.md`
 > 预计耗时：**10 分钟**（不含等证书）
 
@@ -39,6 +39,31 @@
 | `transhelper.org` | NS `carlos.ns.cloudflare.com` / `izabella.ns.cloudflare.com` | 父域在**另一个账号** |
 | `search.transhelper.org` | CNAME → `search.chengxi.moe`（已代理）| **现在只是个指向主域的别名，需要改目标** |
 | `search.chengxi.moe` | A `104.21.71.79` / `172.67.143.246`（已代理）| 主域，指向 Pages，工作正常 |
+
+---
+
+## 3.5 ⚠️ 前置条件二：先关掉 zone 上的人机验证（2026-09-10 实测发现）
+
+实测 `transhelper.org` **整个 zone**（apex、www、search 全部）返回：
+
+```
+HTTP 403  <title>Just a moment...</title>      cf-mitigated: challenge
+```
+
+即 zone 级托管挑战（多半是 **Security Level = I'm under attack**，或 **Bot Fight Mode** 开着）。
+
+**为什么必须处理**：浏览器的 JS 挑战能过（转圈后能进站），但**前端的 `/api/*` 是 `fetch()` 调用，过不了托管挑战**
+—— 拿到的是 HTML 挑战页而不是 JSON，结果是「页面能开、搜索/登录全废」。修好之前，第二个域名不可用。
+
+**两种改法**（二选一）：
+
+| 方案 | 操作 | 影响面 |
+|---|---|---|
+| **A. 关掉挑战（推荐，若那套保护不是有意为之）** | zone → **Security → Settings → Security Level** 设为 **Medium**（不是 "I'm under attack"）；再检查 **Security → Bots → Bot Fight Mode** 是否开着，开着就关 | 整个 `transhelper.org` |
+| **B. 只给这个主机名开绿灯（精细，若其他服务需要保护）** | **Security → WAF → Custom rules → Create rule**：表达式 `(http.host eq "search.transhelper.org")`，动作 **Skip** → 勾选跳过 *Managed Challenge / Security Level / Bot Fight Mode* 等 | 只影响 `search.transhelper.org` |
+
+> 验证是否修好：`curl -s -o /dev/null -w '%{http_code}\n' https://transhelper.org/` 不再返回 403；
+> 或看响应头里不再有 `cf-mitigated: challenge`。
 
 ---
 
@@ -127,6 +152,7 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
 | **Error 1016** | 同上（跨账号解析被拒）；也可能 CNAME 目标写成了别的 Pages 项目 |
 | Custom domain 一直「待验证」 | CNAME 目标不是 `transhelper-prism.pages.dev`；或代理状态被关（应为**橙云**）|
 | 页面能开但 `/api/*` 404 | 说明请求没走到 Pages Function：检查是不是访问了 `transhelper-prism.pages.dev` 之外的旧别名 |
+| 浏览器能开、但搜索/登录失败（Network 里 `/api/*` 返回 HTML 或 403） | zone 上的人机验证没关（见 §3.5）；`fetch` 过不了托管挑战 |
 | 证书报错 / `ERR_CERT_COMMON_NAME_INVALID` | 等 CF 签发（最长 15 分钟）；仍未好则删掉自定义域重新添加 |
 
 ---
