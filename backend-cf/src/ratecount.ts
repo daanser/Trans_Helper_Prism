@@ -266,7 +266,9 @@ export async function peekRateCount(
   if (!db) return { count: 0, degraded: true, bucketKey }
   try {
     const count = await readCount(db, bucketKey)
-    return { count: count ?? 0, degraded: count === null, bucketKey }
+    // 注意：`readCount` 返回 null 有两种含义——「读出错」和「本窗口还没有行」（新窗口第一次请求前，完全正常）。
+    // 二者混为一谈会让诊断把正常状态报成 degraded（线上曾据此误判限流失效）。真正的读异常由下面的 catch 兜住。
+    return { count: count ?? 0, degraded: false, bucketKey }
   } catch {
     return { count: 0, degraded: true, bucketKey }
   }
