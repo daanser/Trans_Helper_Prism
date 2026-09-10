@@ -29,6 +29,12 @@
 // 结论：KV 上的 IP 限流只能当「同一 colo 内的尽力而为闸门」，
 // 真正的边缘限流要靠 CF 的 Rate Limiting 规则（待办，不在本模块职责内）。
 // **不要**为了这个现象去改算法或换存储（换 D1 也绕不开跨 colo 请求分布）。
+//
+// （2026-09-10 补充：跨 colo 的**权威计数**已由 `src/ratecount.ts` 的 **D1 原子计数**接手，
+//   本模块的 KV 限流**原样保留**为「同一 colo 内的廉价近似闸门」，不再作为判定依据 ——
+//   见 plan-ratelimit.md §5。KV 与 D1 两个闸门串联，互不替代。）
+
+import { normalizeAsn, normalizeCountry } from "./tiers"
 
 /** 限流存储的最小契约（KVNamespace 与测试内存 mock 都能满足）。 */
 export interface RateLimitStore {
@@ -368,4 +374,90 @@ export function rateLimitHeaders(result: RateLimitResult): Record<string, string
   const h: Record<string, string> = { "Retry-After": String(result.retryAfterSec) }
   if (result.degraded) h["X-RateLimit-Degraded"] = "1"
   return h
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 客户端网络元数据（country / ASN）的信任链 —— 与上面的 IP 信任链**同一道门**
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ── 为什么元数据也要走信任链（plan §3）──
+// 经 Pages Function 反代时，Worker 的 `request.cf` 描述的是 **CF 内部子请求自己**：
+// 线上实测 `asn=13335 / org=Cloudflare, Inc.`（直连时才是真实的 `asn=16509 / Amazon Data Services Singapore`）。
+// 所以按 IP 分档（plan §4）要用的 country/asn **只能**由 Pages Function 从**入站请求**的
+// `request.cf` 读取后经信任链转发（`x-prism-country` / `x-prism-asn` / `x-prism-colo`）。
+//
+// ── 判定顺序（与 resolveClientIp 完全一致，不要重排）──
+//   1) `env.PROXY_SHARED_SECRET` 非空 **且** `x-prism-proxy` 与之恒时相等：
+//      采信 `x-prism-country` / `x-prism-asn`（代理先删后写，客户端自带的同名头已被覆盖）。
+//      ⚠️ 此时**不回落** `request.cf`：那个 cf 是子请求自己的（恒为 Cloudflare 的 13335），
+//      用它只会把所有人误判成境外/机房，比「取不到 → unknown（最保守 5/min）」更糟。
+//   2) 否则（直连 / 代理未配密钥）：从**本请求的 `request.cf`** 取（直连时它就是真实客户端元数据）。
+//
+// `cf` 由调用方从 `c.req.raw.cf` 传进来 —— 本函数因此保持**纯函数**（不读全局、可单测）。
+
+/** 代理转发的真实 country 头名（与 Pages Function 的写入端逐字符一致）。 */
+export const PROXY_COUNTRY_HEADER = "x-prism-country"
+
+/** 代理转发的真实 ASN 头名（同上）。 */
+export const PROXY_ASN_HEADER = "x-prism-asn"
+
+/** 代理转发的 colo 头名（同上；仅诊断用）。 */
+export const PROXY_COLO_HEADER = "x-prism-colo"
+
+/** `request.cf` 里本模块用得到的字段（故意放宽为 unknown，便于单测传普通对象）。 */
+export interface ClientMetaCf {
+  country?: unknown
+  asn?: unknown
+  colo?: unknown
+  asOrganization?: unknown
+}
+
+/** 元数据采信来源：代理信任链 / 直连 request.cf / 都取不到。 */
+export type ClientMetaSource = "proxy-trusted" | "cf" | "none"
+
+/** 元数据判定结果（`/admin/whoami` 直接回显，便于线上排障）。 */
+export interface ClientMetaResolution {
+  /** 客户端 IP（信任链同 `resolveClientIp`） */
+  ip?: string
+  /** 真实客户端国家码（归一化为大写两字母） */
+  country?: string
+  /** 真实客户端 ASN（归一化为纯数字字符串） */
+  asn?: string
+  /** 元数据是从哪条路径采信的 */
+  by: ClientMetaSource
+}
+
+/**
+ * 判定客户端 IP + country + ASN（信任链见本段顶部注释）。
+ * @param headers 请求头
+ * @param env     运行时 env（读 `PROXY_SHARED_SECRET`）；缺失 → 退化为直连逻辑
+ * @param cf      本请求的 `request.cf`（直连场景的元数据来源；`c.req.raw.cf`）
+ */
+export function resolveClientMeta(
+  headers: Headers,
+  env?: ClientIpEnv,
+  cf?: ClientMetaCf | null,
+): ClientMetaResolution {
+  const { ip } = resolveClientIp(headers, env)
+
+  const secret = typeof env?.PROXY_SHARED_SECRET === "string" ? env.PROXY_SHARED_SECRET : ""
+  if (secret.length > 0) {
+    const proof = headers.get(PROXY_SECRET_HEADER)
+    if (proof !== null && timingSafeEqualString(proof, secret)) {
+      // 只信代理写的 `x-prism-*`；缺哪个就是哪个取不到（→ decideTier 落 unknown，最保守）。
+      return {
+        ip,
+        country: normalizeCountry(headers.get(PROXY_COUNTRY_HEADER)),
+        asn: normalizeAsn(headers.get(PROXY_ASN_HEADER)),
+        by: "proxy-trusted",
+      }
+    }
+  }
+
+  const country = normalizeCountry(typeof cf?.country === "string" ? cf.country : undefined)
+  const asn = normalizeAsn(
+    typeof cf?.asn === "string" || typeof cf?.asn === "number" ? (cf.asn as string | number) : undefined,
+  )
+  if (!country && !asn) return { ip, by: "none" }
+  return { ip, country, asn, by: "cf" }
 }

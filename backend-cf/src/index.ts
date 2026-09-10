@@ -40,8 +40,33 @@ import {
   type RateLimitPolicy,
   rateLimitHeaders,
   resolveClientIp,
+  resolveClientMeta,
   timingSafeEqualString,
+  type ClientMetaCf,
+  type ClientMetaSource,
 } from "./ratelimit"
+import {
+  anonGlobalHardLimit,
+  anonGlobalLimit,
+  burstPer10s,
+  BURST_BLOCK_SEC,
+  BURST_WINDOW_SEC,
+  decideTier,
+  isKnownHostingAsn,
+  limitForTier,
+  llmLimitForTier,
+  RATE_WINDOW_SEC,
+  type Tier,
+} from "./tiers"
+import {
+  consumeRateToken,
+  deriveRateLimitHmacKey,
+  isDegradedHmacKey,
+  peekRateCount,
+  purgeExpiredCounters,
+  readBlockUntil,
+  writeBlockUntil,
+} from "./ratecount"
 import { listAudit, writeAudit } from "./audit"
 import { SCHEMA_MIGRATIONS, SCHEMA_STATEMENTS, isToleratedSchemaError } from "./db/schemaStatements"
 import { runFallback, type FallbackResponse } from "./fallback"
@@ -181,6 +206,230 @@ function requireLogin(env: Env): boolean {
   return (env.REQUIRE_LOGIN ?? "1") !== "0"
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// D1 分档限流接线（plan-ratelimit.md §4 分档 / §5 D1 计数 / §6 突发与熔断）
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ── 与既有 KV 限流的关系 ──
+// KV 那段（checkSubjectRateLimit）**原样保留**：它仍是「同一 colo 内的廉价近似闸门」，
+// 直连流量还在用它。本段是**权威判定**：跨 colo 收敛（D1 单点一致），按档位给额度。
+// 两者串联：先 KV（便宜、可能失准），再 D1（准、但每条请求 1 写 + 1 读）。
+//
+// ── 绝不打印 IP ──
+// 本段所有日志只含档位/限额/原因（**没有 IP，没有密钥**）。IP 只在 ratecount 内部参与 HMAC，
+// 随即丢弃（plan §5 隐私节：审计/错误日志/admin 面板一律不得输出 IP；whoami 除外，它是 admin 专用诊断）。
+
+/** 拒绝原因（进 429 响应体与日志，便于线上定位是哪一层挡的）。 */
+export type RateGateReason = "tier-limit" | "burst" | "blocked" | "global-hard"
+
+/** 分档闸门的拒绝描述（由调用方拼 429 响应）。 */
+interface RateGateDeny {
+  reason: RateGateReason
+  tier: Tier
+  limit: number
+  count: number
+  retryAfterSec: number
+}
+
+/** 分档闸门结果。 */
+interface RateGateResult {
+  tier: Tier
+  /** 本次生效的限额（搜索档或 LLM 档） */
+  limit: number
+  /** 本窗口计数（含本次；D1 不可用为 0） */
+  count: number
+  /** D1 不可用 → 已 fail-open 放行（调用方已打 warning） */
+  degraded: boolean
+  /** 元数据采信来源（诊断用） */
+  resolvedBy: ClientMetaSource
+  /** 全局匿名软熔断：匿名只走关键词回退（不调 embedding/rerank） */
+  softBreak: boolean
+  /** 非 undefined = 直接返回 429 */
+  deny?: RateGateDeny
+}
+
+/** 过期计数行的清理间隔（每 N 次受限请求顺手删一批；env `RATE_COUNT_PURGE_EVERY`，默认 200）。 */
+function purgeEvery(env: Env): number {
+  const n = Number(env.RATE_COUNT_PURGE_EVERY)
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 200
+}
+
+/** 模块级计数（每个 isolate 各自记；只是"顺手清理"的节奏，不需要精确）。 */
+let rateOpsSincePurge = 0
+
+/**
+ * 顺手清理过期计数行（plan §5：**不引入定时任务**）。
+ * 生产走 `c.executionCtx.waitUntil`（不增加请求延迟）；测试环境没有 ExecutionContext 时静默跳过。
+ */
+function maybePurgeCounters(c: Context<{ Bindings: Env }>, nowMs: number): void {
+  rateOpsSincePurge += 1
+  if (rateOpsSincePurge < purgeEvery(c.env)) return
+  rateOpsSincePurge = 0
+  const job = purgeExpiredCounters(c.env.DB, nowMs).catch(() => 0)
+  try {
+    c.executionCtx.waitUntil(job)
+  } catch {
+    // 无 ExecutionContext（单测 / 非 Worker 调用）：丢弃这次清理，下次请求再来
+  }
+}
+
+/**
+ * 分档闸门（plan §4/§5/§6 的接线点）：解析真实元数据 → 定档 → D1 原子计数 → 突发/熔断判定。
+ *
+ * 顺序（每一层都比下一层便宜，先便宜后贵）：
+ *   ① 封禁检查（`block_until`，只读一行）—— 突发封禁期内一律 429（**先于计数**，被拒不再占名额）；
+ *   ② 分档计数（search 或 llm 桶，互不占用额度）—— 超限直接 429；
+ *   ③ 突发（10 秒窗口 ≥ `BURST_PER_10S`）—— 429 并封禁 60s（`block_until`）；
+ *   ④ 全局匿名软/硬熔断 —— 只掐匿名，登录用户不受影响。
+ *
+ * ── 写放大（诚实版，history.md §5 坑 14：D1 免费版 10 万行写/天）──
+ * 每条被闸门处理的请求 = 1 次只读（封禁行）+ 2 次原子计数（分档桶 + 突发桶）；
+ * 匿名 `/search` 再多 1 次（全局熔断桶）。即：登录 2 写/请求、匿名搜索 3 写/请求。
+ * 为什么不让突发桶"热了才写"（更省写的做法）：**那样会漏计**——闸门只能在"已经计数很高"时才打开，
+ * 而突发桶从 0 开始数，于是突发阈值永远追不上（例如 cn_residential 上限 30/min 时根本触发不了 20/10s）。
+ * 正确性优先于省写：突发是"大流量直接崩"这条硬需求的实现（plan §6）。R7 的混合计数（KV 近似 + D1 精确）
+ * 是将来省写的正路，不在本次范围。
+ *
+ * @param opts.loggedIn        是否持有有效会话（true → `logged_in` 档）
+ * @param opts.scope           `search`（纯检索）或 `llm`（stream/chat，限额 = ceil(搜索/除数)）
+ * @param opts.applyGlobalBreak 是否参与全局匿名熔断（只有匿名可达的路径才需要）
+ */
+async function rateGate(
+  c: Context<{ Bindings: Env }>,
+  opts: { loggedIn: boolean; scope: "search" | "llm"; nowMs: number; applyGlobalBreak: boolean },
+): Promise<RateGateResult> {
+  const { nowMs } = opts
+  const cf = (c.req.raw as unknown as { cf?: ClientMetaCf }).cf ?? null
+  const meta = resolveClientMeta(c.req.raw.headers, c.env, cf)
+  const tier = decideTier({ loggedIn: opts.loggedIn, country: meta.country, asn: meta.asn })
+  const limit = opts.scope === "llm" ? llmLimitForTier(tier, c.env) : limitForTier(tier, c.env)
+  const base: RateGateResult = { tier, limit, count: 0, degraded: false, resolvedBy: meta.by, softBreak: false }
+
+  const hmacKey = await deriveRateLimitHmacKey(c.env)
+  if (isDegradedHmacKey(hmacKey)) {
+    // 只打一次警告就够，但 isolate 生命周期短，这里每次打也只是 noise 级；**绝不打印密钥**。
+    console.warn("[ratelimit] PROXY_SHARED_SECRET 未配置 → 计数桶匿名化强度下降（生产必须配置）")
+  }
+  if (!c.env.DB) {
+    console.warn("[ratelimit] D1 不可用 → 分档计数 fail-open")
+    return { ...base, degraded: true }
+  }
+
+  // ① 突发封禁检查（硬停）：封禁期内一律 429，且**不再消耗**任何名额
+  if (meta.ip) {
+    const blockedUntil = await readBlockUntil(c.env.DB, { hmacKey, ip: meta.ip, tier, nowMs })
+    if (blockedUntil > nowMs) {
+      return {
+        ...base,
+        deny: {
+          reason: "blocked",
+          tier,
+          limit,
+          count: 0,
+          retryAfterSec: Math.max(1, Math.ceil((blockedUntil - nowMs) / 1000)),
+        },
+      }
+    }
+  }
+
+  // ② 分档计数（D1 原子「判-占」）
+  const res = await consumeRateToken(c.env.DB, {
+    scope: opts.scope,
+    tier,
+    hmacKey,
+    ip: meta.ip,
+    windowSec: RATE_WINDOW_SEC,
+    limit,
+    nowMs,
+  })
+  maybePurgeCounters(c, nowMs)
+  if (res.degraded) console.warn(`[ratelimit] D1 异常 → fail-open scope=${opts.scope} tier=${tier}`)
+  if (!res.ok) {
+    return {
+      ...base,
+      count: res.count,
+      degraded: res.degraded,
+      deny: { reason: "tier-limit", tier, limit, count: res.count, retryAfterSec: res.retryAfterSec },
+    }
+  }
+
+  // ③ 突发（10 秒窗口；每次请求都计入，见上方"写放大"说明）
+  const burstLimit = burstPer10s(c.env)
+  if (meta.ip) {
+    const burst = await consumeRateToken(c.env.DB, {
+      scope: "burst",
+      tier,
+      hmacKey,
+      ip: meta.ip,
+      windowSec: BURST_WINDOW_SEC,
+      limit: burstLimit,
+      nowMs,
+    })
+    if (!burst.ok && !burst.degraded) {
+      await writeBlockUntil(c.env.DB, {
+        hmacKey,
+        ip: meta.ip,
+        tier,
+        blockUntilMs: nowMs + BURST_BLOCK_SEC * 1000,
+        nowMs,
+        blockSec: BURST_BLOCK_SEC,
+      })
+      console.warn(`[ratelimit] 突发触发 → 封禁 ${BURST_BLOCK_SEC}s tier=${tier} burst=${burst.count}/${burstLimit}`)
+      return {
+        ...base,
+        count: res.count,
+        deny: { reason: "burst", tier, limit, count: burst.count, retryAfterSec: BURST_BLOCK_SEC },
+      }
+    }
+  }
+
+  // ④ 全局匿名软/硬熔断（只用**一个** global 桶：count ≤ 软阈值 = 正常；
+  //    软阈值 < count ≤ 硬阈值 = 只给关键词回退；count > 硬阈值 = 匿名一律 429）
+  let softBreak = false
+  if (opts.applyGlobalBreak && !opts.loggedIn) {
+    const soft = anonGlobalLimit(c.env)
+    const hard = anonGlobalHardLimit(c.env)
+    const g = await consumeRateToken(c.env.DB, {
+      scope: "global",
+      hmacKey,
+      windowSec: RATE_WINDOW_SEC,
+      limit: hard,
+      nowMs,
+    })
+    if (!g.degraded && !g.ok) {
+      console.warn(`[ratelimit] 全局硬熔断触发 → 匿名 429 count=${g.count} hard=${hard}`)
+      return {
+        ...base,
+        count: res.count,
+        deny: { reason: "global-hard", tier, limit: hard, count: g.count, retryAfterSec: g.retryAfterSec },
+      }
+    }
+    softBreak = !g.degraded && g.count > soft
+    if (softBreak) console.warn(`[ratelimit] 全局软熔断触发 → 匿名仅关键词回退 count=${g.count} soft=${soft}`)
+  }
+
+  return { ...base, count: res.count, softBreak }
+}
+
+/**
+ * 429 响应（plan §4/§6：`{ error: "rate-limited", tier, retry_after }` + `Retry-After` 头）。
+ * 日志**只含**档位/限额/原因 —— 绝不含 IP、绝不含密钥（plan §5 隐私节）。
+ */
+function rateLimitedResponse(c: Context<{ Bindings: Env }>, deny: RateGateDeny) {
+  console.warn(
+    `[ratelimit] 429 reason=${deny.reason} tier=${deny.tier} limit=${deny.limit} count=${deny.count} retry_after=${deny.retryAfterSec}s`,
+  )
+  return c.json(
+    { error: "rate-limited", tier: deny.tier, scope: deny.reason, retry_after: deny.retryAfterSec },
+    429,
+    {
+      "Retry-After": String(deny.retryAfterSec),
+      "X-RateLimit-Limit": String(deny.limit),
+      "X-RateLimit-Remaining": "0",
+    },
+  )
+}
+
 /** 统一的「关键词回退 + 原因 warning」响应。 */
 function fallbackResponse(
   fb: FallbackResponse,
@@ -307,10 +556,22 @@ api.post("/search", async (c) => {
     return c.json({ error: "rate-limited", retry_after: rl.retryAfterSec }, 429, rateLimitHeaders(rl))
   }
 
-  // ② 未登录：按 plan §2 登录制只走关键词回退（REQUIRE_LOGIN=0 可放开）
-  if (!session && requireLogin(c.env)) {
+  // ①b D1 分档计数（**权威**，plan-ratelimit.md §5）：按真实 country/ASN 定档给额度，
+  //     并发突发与全局匿名熔断也在这里判定。D1 不可用 → fail-open（打 warning）。
+  const gate = await rateGate(c, { loggedIn: Boolean(session), scope: "search", nowMs, applyGlobalBreak: true })
+  if (gate.deny) return rateLimitedResponse(c, gate.deny)
+
+  // ② 未登录：按 plan §2 登录制只走关键词回退（REQUIRE_LOGIN=0 可放开）；
+  //    若全局匿名软熔断生效（§6），**即使放开了登录制也只给关键词回退**（不调 embedding/rerank，成本≈0）。
+  if (!session && (requireLogin(c.env) || gate.softBreak)) {
     const fb = await runFallback(req.query ?? "", corporaList, c.env)
-    return c.json(fallbackResponse(fb, { used_pct: 0, remaining_pct: 100 }, "login-required"))
+    return c.json(
+      fallbackResponse(
+        fb,
+        { used_pct: 0, remaining_pct: 100 },
+        gate.softBreak ? "global-soft-break" : "login-required",
+      ),
+    )
   }
 
   // ③ 登录：先扣配额（D1 原子），超额 → 回退且不扣
@@ -406,6 +667,16 @@ api.get("/me", async (c) => {
 api.post("/search/stream", async (c) => {
   const session = await sessionFromHeader(c.env, c.req.header("Authorization"))
   if (!session) return c.json({ error: "unauthorized" }, 401)
+
+  // LLM 档限流（plan §4.0：限额 = ceil(搜索限额 / RATE_LIMIT_LLM_DIVISOR)，与搜索**分开计数**）。
+  // 放在配额扣减之前：被限流的请求不该消耗用户额度。
+  const gate = await rateGate(c, {
+    loggedIn: true,
+    scope: "llm",
+    nowMs: Date.now(),
+    applyGlobalBreak: false, // 全局熔断只掐匿名，登录用户不受影响（§6）
+  })
+  if (gate.deny) return rateLimitedResponse(c, gate.deny)
 
   let body: Partial<SearchRequest> = {}
   try {
@@ -520,6 +791,15 @@ api.post("/search/stream", async (c) => {
 api.post("/chat", async (c) => {
   const session = await sessionFromHeader(c.env, c.req.header("Authorization"))
   if (!session) return c.json({ error: "unauthorized" }, 401)
+
+  // LLM 档限流（与 /search/stream 同一个 `llm` 桶；与搜索桶分开计数，互不占用额度）
+  const gate = await rateGate(c, {
+    loggedIn: true,
+    scope: "llm",
+    nowMs: Date.now(),
+    applyGlobalBreak: false, // 全局熔断只掐匿名（§6）
+  })
+  if (gate.deny) return rateLimitedResponse(c, gate.deny)
 
   let body: { session_id?: string; question?: string } = {}
   try {
@@ -832,6 +1112,27 @@ api.get("/admin/whoami", async (c) => {
   const proxyTrusted = secret.length > 0 && proxyHeader !== null && timingSafeEqualString(proxyHeader, secret)
   // 后端实际会用于限流的取值（与 /search 走**同一个**函数，保证诊断结论与线上行为一致）
   const resolved = resolveClientIp(h, c.env)
+
+  // ── 分档诊断（plan-ratelimit.md §4/§5/§6 的线上验收关键位）──
+  // 与 /search 走**同一条**信任链与同一个 decideTier，所以这里看到的 tier = 线上实际生效的档位。
+  // 安全：只回档位/限额/计数（**没有密钥、没有 IP 以外的隐私**）；桶名是 HMAC 摘要，**不回显桶 key**。
+  const cfMeta = (c.req.raw as unknown as { cf?: ClientMetaCf }).cf ?? null
+  const meta = resolveClientMeta(h, c.env, cfMeta)
+  // whoami 一般用 ADMIN_API_KEY 调用（无 JWT）→ loggedIn=false，于是 tier 反映的是**匿名**视角的档位，
+  // 正是"我这个 IP 会被怎么限流"的答案；带 Bearer JWT 调时才是登录档。
+  const session = await sessionFromHeader(c.env, c.req.header("Authorization"))
+  const tier = decideTier({ loggedIn: Boolean(session), country: meta.country, asn: meta.asn })
+  const nowMs = Date.now()
+  const hmacKey = await deriveRateLimitHmacKey(c.env)
+  const peek = await peekRateCount(c.env.DB, {
+    scope: "search",
+    tier,
+    hmacKey,
+    ip: meta.ip,
+    windowSec: RATE_WINDOW_SEC,
+    nowMs,
+  })
+
   return c.json({
     ok: true,
     // 只看这些「谁在调用我」相关的头
@@ -858,17 +1159,45 @@ api.get("/admin/whoami", async (c) => {
     "x-prism-country": pick("x-prism-country"),
     "x-prism-asn": pick("x-prism-asn"),
     "x-prism-colo": pick("x-prism-colo"),
+    // ── 分档限流（plan §4）：实际采信的元数据 + 落到的档位 + 该档限额 ──
+    /** 元数据采信来源：proxy-trusted（代理转发）/ cf（直连 request.cf）/ none（取不到） */
+    resolved_meta_by: meta.by,
+    /** 实际用于分档的 country（归一化后；非信任来源的 x-prism-* 不会被采信） */
+    resolved_country: meta.country ?? null,
+    /** 实际用于分档的 ASN（归一化后） */
+    resolved_asn: meta.asn ?? null,
+    /** 该 ASN 是否在「已知境外云/托管」清单里（诊断用，不参与分档） */
+    hosting_asn: isKnownHostingAsn(meta.asn ?? undefined),
+    /** 本次请求的档位（/search 会用的就是它） */
+    tier,
+    /** 该档搜索限额（次/分钟） */
+    limit_per_min: limitForTier(tier, c.env),
+    /** 该档 LLM 限额（次/分钟 = ceil(搜索/除数)） */
+    llm_limit_per_min: llmLimitForTier(tier, c.env),
+    /** 当前窗口（60s）内该桶已计数（**只读，不占名额**） */
+    count_in_window: peek.count,
+    /** 计数窗口长度（秒） */
+    rate_window_sec: RATE_WINDOW_SEC,
+    /** D1 不可用 / 计数不可读 → true（此时限流 fail-open） */
+    rate_count_degraded: peek.degraded,
+    /** 计数桶 HMAC 密钥是否退化为公开常量（= 未配 PROXY_SHARED_SECRET；**只回布尔**） */
+    rate_hmac_degraded: isDegradedHmacKey(hmacKey),
+    /** 熔断阈值（便于线上核对 env 是否生效） */
+    burst_per_10s: burstPer10s(c.env),
+    anon_global_per_min: anonGlobalLimit(c.env),
+    anon_global_hard_per_min: anonGlobalHardLimit(c.env),
     // CF 的网络元数据：用于「按 IP 分档限流」判断家宽 / 机房 / 境外（见 TODO.md P0）
     // 注意：这些字段是 CF 在边缘根据连接判定的，**不可伪造**；我们只用它们做分档，不落库。
+    // ⚠️ 经 Pages 反代时这里是**子请求自己的**元数据（实测 asn=13335 Cloudflare），真实值见上面的 resolved_*。
     cf: (() => {
-      const meta = (c.req.raw as unknown as { cf?: Record<string, unknown> }).cf ?? {}
+      const meta2 = (c.req.raw as unknown as { cf?: Record<string, unknown> }).cf ?? {}
       return {
-        country: meta.country ?? null,
-        asn: meta.asn ?? null,
-        asOrganization: meta.asOrganization ?? null,
-        colo: meta.colo ?? null,
-        city: meta.city ?? null,
-        region: meta.region ?? null,
+        country: meta2.country ?? null,
+        asn: meta2.asn ?? null,
+        asOrganization: meta2.asOrganization ?? null,
+        colo: meta2.colo ?? null,
+        city: meta2.city ?? null,
+        region: meta2.region ?? null,
       }
     })(),
   })

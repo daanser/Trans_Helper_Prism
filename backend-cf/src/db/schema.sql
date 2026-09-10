@@ -220,3 +220,29 @@ CREATE INDEX IF NOT EXISTS idx_custom_models_account
 
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_account
   ON chat_sessions (account_id, updated_at);
+
+-- ─────────────────────────────────────────────
+-- 分档限流计数（plan-ratelimit.md §5）：**跨 colo 的权威计数器**。
+--
+-- 为什么是 D1：KV 无原子自增 + 多边缘最终一致，经 Pages Function 反代实测**完全失效**
+-- （13 秒连打 12 次零 429，见 plan §1 与 history.md §5 坑 23）。D1 单点一致，能真正收敛。
+--
+-- 隐私（**绝不存 IP 明文**）：表里没有 IP 列。`bucket_key` = HMAC_SHA256(key, "scope|tier|ip|windowIndex")
+-- 的十六进制摘要；key 从 PROXY_SHARED_SECRET 派生（不新增 secret）。**必须用 HMAC**，
+-- 裸 sha256(ip) 会被彩虹表穷举反查（IPv4 空间只有 2^32）。窗口过期即无意义，由 purgeExpiredCounters 清理。
+--
+-- 写放大：每次受限请求 1 次条件 UPDATE（各桶一行）；免费版 D1 每天 10 万行写（history.md §5 坑 14）。
+-- 桶用途：scope=search|llm（分档计数）、global（全局匿名熔断）、burst（10 秒突发）、block（封禁到某时刻，
+-- 该行 count 列借用存 block_until 毫秒时间戳）。
+-- ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS rate_counters (
+  bucket_key   TEXT PRIMARY KEY,              -- HMAC 摘要，不含 IP 明文
+  tier         TEXT NOT NULL,                 -- 档位（logged_in/cn_residential/…；global 记为 anon_global）
+  window_start INTEGER NOT NULL,              -- 窗口起点（epoch ms）
+  window_sec   INTEGER NOT NULL,              -- 窗口长度（秒）
+  count        INTEGER NOT NULL DEFAULT 0,    -- 本窗口已占名额（block 行借用存 block_until）
+  updated_at   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rate_counters_window
+  ON rate_counters (window_start);

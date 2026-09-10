@@ -40,6 +40,8 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS custom_models ( id TEXT PRIMARY KEY, account_id TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', base_url TEXT NOT NULL, model TEXT NOT NULL, api_key_enc TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL )`,
   `CREATE INDEX IF NOT EXISTS idx_custom_models_account ON custom_models (account_id, updated_at)`,
   `CREATE INDEX IF NOT EXISTS idx_chat_sessions_account ON chat_sessions (account_id, updated_at)`,
+  `CREATE TABLE IF NOT EXISTS rate_counters ( bucket_key TEXT PRIMARY KEY, tier TEXT NOT NULL, window_start INTEGER NOT NULL, window_sec INTEGER NOT NULL, count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL )`,
+  `CREATE INDEX IF NOT EXISTS idx_rate_counters_window ON rate_counters (window_start)`,
 ]
 
 /**

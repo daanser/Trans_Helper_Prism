@@ -76,6 +76,31 @@ export interface Env {
   /** 单账号限流（次/分钟），默认 60 */
   RATE_LIMIT_ACCOUNT_PER_MIN?: string
 
+  // ── 分档限流（plan-ratelimit.md §4；D1 权威计数，见 src/tiers.ts / src/ratecount.ts）──
+  // 全部可选；缺省用 plan §4 的默认值。**这些是"每分钟次数"的阈值，可随流量调，不含任何密钥。**
+  /** logged_in 档（有效会话）：默认 60 */
+  RATE_LIMIT_LOGGED_IN_PER_MIN?: string
+  /** cn_residential 档（CN 家宽/移动/教育网）：默认 30 */
+  RATE_LIMIT_CN_RESIDENTIAL_PER_MIN?: string
+  /** cn_other 档（CN 其它 ASN）：默认 15 */
+  RATE_LIMIT_CN_OTHER_PER_MIN?: string
+  /** cn_idc 档（CN 云/机房）：默认 6（刻意低于境外） */
+  RATE_LIMIT_CN_IDC_PER_MIN?: string
+  /** overseas 档（非 CN）：默认 10 */
+  RATE_LIMIT_OVERSEAS_PER_MIN?: string
+  /** unknown 档（取不到 country/asn）：默认 5（最保守） */
+  RATE_LIMIT_UNKNOWN_PER_MIN?: string
+  /** LLM 端点限额除数：LLM 限额 = ceil(搜索限额/除数)，默认 5，可改 4；下限恒为 1 */
+  RATE_LIMIT_LLM_DIVISOR?: string
+  /** 单 IP 突发阈值（10 秒窗口内请求数），默认 20；超过 → 429 + 封禁 60s */
+  BURST_PER_10S?: string
+  /** 全局匿名软熔断阈值（次/分钟），默认 600；超过 → 匿名只走关键词回退（不调 embedding/rerank） */
+  ANON_GLOBAL_PER_MIN?: string
+  /** 全局匿名硬熔断阈值（次/分钟），默认 1200；超过 → 匿名一律 429（登录用户不受影响） */
+  ANON_GLOBAL_HARD_PER_MIN?: string
+  /** 过期计数行的清理频率（每 N 次受限请求顺手删一批），默认 200；**不引入定时任务** */
+  RATE_COUNT_PURGE_EVERY?: string
+
   // ── LLM（T3.4 / T3.5）──
   LLM_MODEL?: string
   LLM_ENDPOINT?: string

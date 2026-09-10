@@ -18,9 +18,14 @@ import {
   windowIndexFor,
   windowedKey,
   rateLimitHeaders,
+  resolveClientMeta,
+  PROXY_COUNTRY_HEADER,
+  PROXY_ASN_HEADER,
+  PROXY_COLO_HEADER,
   DEFAULT_RATE_LIMIT_POLICY,
   type RateLimitStore,
 } from "../src/ratelimit"
+import { decideTier, limitForTier } from "../src/tiers"
 
 const T0 = Date.UTC(2026, 8, 9, 12, 0, 0)
 
@@ -479,5 +484,125 @@ describe("timingSafeEqualString（恒时比较边界）", () => {
     const long = "x".repeat(4096)
     expect(timingSafeEqualString(long, long)).toBe(true)
     expect(timingSafeEqualString(long, `${"x".repeat(4095)}y`)).toBe(false)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resolveClientMeta：country / ASN 走**同一道**信任门（plan-ratelimit.md §3/§4）
+// 目的：经 Pages 反代时 Worker 的 request.cf 是子请求自己的（实测 asn=13335 Cloudflare），
+// 真实元数据只能由代理经 `x-prism-country` / `x-prism-asn` 转发；伪造者不知道密钥 → 一律不采信。
+// ─────────────────────────────────────────────────────────────────────────────
+describe("resolveClientMeta 信任链（x-prism-country / x-prism-asn）", () => {
+  const SECRET = "proxy-secret-value"
+  const proxyHeaders = (extra: Record<string, string> = {}) =>
+    new Headers({
+      "cf-connecting-ip": "2a06:98c0:3600::103", // 反代时 CF 注入的内部地址
+      [PROXY_SECRET_HEADER]: SECRET,
+      "x-prism-client-ip": "203.0.113.7",
+      "x-prism-country": "CN",
+      "x-prism-asn": "4134",
+      ...extra,
+    })
+
+  it("代理凭据匹配 → 采信代理转发的 country/asn（并归一化）", () => {
+    const r = resolveClientMeta(proxyHeaders(), { PROXY_SHARED_SECRET: SECRET })
+    expect(r).toEqual({ ip: "203.0.113.7", country: "CN", asn: "4134", by: "proxy-trusted" })
+    // 大小写 / AS 前缀都被归一化
+    const r2 = resolveClientMeta(proxyHeaders({ "x-prism-country": "cn", "x-prism-asn": "AS4134" }), {
+      PROXY_SHARED_SECRET: SECRET,
+    })
+    expect(r2.country).toBe("CN")
+    expect(r2.asn).toBe("4134")
+  })
+
+  it("**未配 PROXY_SHARED_SECRET → 伪造的 x-prism-country/asn 一律不采信**（防伪造回归）", () => {
+    const r = resolveClientMeta(proxyHeaders(), {})
+    // by = **元数据**来源（"none" = 一条都没采信）；IP 仍走老逻辑（cf-connecting-ip）
+    expect(r.by).toBe("none")
+    expect(r.ip).toBe("2a06:98c0:3600::103")
+    expect(r.country).toBeUndefined()
+    expect(r.asn).toBeUndefined()
+  })
+
+  it("**密钥不匹配（错值 / 空值）→ x-prism-country/asn 一律不采信**", () => {
+    for (const wrong of ["wrong-secret", "", "proxy-secret-valu"]) {
+      const r = resolveClientMeta(proxyHeaders({ [PROXY_SECRET_HEADER]: wrong }), { PROXY_SHARED_SECRET: SECRET })
+      expect(r.by).toBe("none")
+      expect(r.country).toBeUndefined()
+      expect(r.asn).toBeUndefined()
+    }
+  })
+
+  it("伪造场景：自带 country/asn + 伪造 XFF，无有效凭据 → 什么都不采信（连 cf 也没有 → none）", () => {
+    const h = new Headers({
+      "x-prism-country": "CN",
+      "x-prism-asn": "4134",
+      "x-forwarded-for": "1.2.3.4",
+    })
+    const r = resolveClientMeta(h, { PROXY_SHARED_SECRET: SECRET })
+    expect(r.by).toBe("none")
+    expect(r.country).toBeUndefined()
+    expect(r.asn).toBeUndefined()
+    expect(r.ip).toBe("1.2.3.4") // IP 仍走老逻辑（XFF 首段）——即"伪造 IP"不影响分档元数据
+  })
+
+  it("代理已验签但**没转发** country/asn → 元数据为空（→ decideTier 落 unknown，最保守）", () => {
+    const h = new Headers({ [PROXY_SECRET_HEADER]: SECRET, "x-prism-client-ip": "203.0.113.7" })
+    const r = resolveClientMeta(h, { PROXY_SHARED_SECRET: SECRET })
+    expect(r.by).toBe("proxy-trusted")
+    expect(r.ip).toBe("203.0.113.7")
+    expect(r.country).toBeUndefined()
+    expect(r.asn).toBeUndefined()
+  })
+
+  it("代理已验签但元数据非法（脏值/超长）→ 视作取不到，**绝不**回落子请求的 cf", () => {
+    const h = proxyHeaders({ "x-prism-country": "CHN", "x-prism-asn": "as-abc" })
+    const cf = { country: "US", asn: 13335 } // 子请求自己的 cf（Cloudflare）——不可信
+    const r = resolveClientMeta(h, { PROXY_SHARED_SECRET: SECRET }, cf)
+    expect(r.by).toBe("proxy-trusted")
+    expect(r.country).toBeUndefined()
+    expect(r.asn).toBeUndefined()
+  })
+
+  it("直连场景（无 x-prism-*）→ 从 request.cf 取真实元数据", () => {
+    const h = new Headers({ "cf-connecting-ip": "203.0.113.7" })
+    const r = resolveClientMeta(h, {}, { country: "CN", asn: 4134, colo: "SIN" })
+    expect(r).toEqual({ ip: "203.0.113.7", country: "CN", asn: "4134", by: "cf" })
+  })
+
+  it("直连但 cf 缺失/字段非法 → by=none（IP 仍照常解析）", () => {
+    const h = new Headers({ "cf-connecting-ip": "203.0.113.7" })
+    expect(resolveClientMeta(h, {}).by).toBe("none")
+    expect(resolveClientMeta(h, {}).country).toBeUndefined()
+    const r = resolveClientMeta(h, {}, { country: 42, asn: "abc" })
+    expect(r.by).toBe("none")
+    expect(r.ip).toBe("203.0.113.7")
+  })
+
+  it("直连且带上伪造的 x-prism-proxy（密钥不对）→ 仍按 cf 走，不采信 x-prism-*", () => {
+    const h = new Headers({
+      "cf-connecting-ip": "203.0.113.7",
+      [PROXY_SECRET_HEADER]: "guessed",
+      "x-prism-country": "CN",
+      "x-prism-asn": "4134",
+    })
+    const r = resolveClientMeta(h, { PROXY_SHARED_SECRET: SECRET }, { country: "US", asn: 16509 })
+    expect(r).toEqual({ ip: "203.0.113.7", country: "US", asn: "16509", by: "cf" })
+  })
+
+  it("元数据头名常量与 Pages Function 的写入端对齐（防两端改名漂移）", () => {
+    expect(PROXY_COUNTRY_HEADER).toBe("x-prism-country")
+    expect(PROXY_ASN_HEADER).toBe("x-prism-asn")
+    expect(PROXY_COLO_HEADER).toBe("x-prism-colo")
+  })
+
+  it("端到端：经代理的 CN 家宽 → cn_residential（30/min）；境外直连 → overseas（10/min）", () => {
+    const proxied = resolveClientMeta(proxyHeaders(), { PROXY_SHARED_SECRET: SECRET })
+    expect(decideTier({ loggedIn: false, country: proxied.country, asn: proxied.asn })).toBe("cn_residential")
+    expect(limitForTier("cn_residential")).toBe(30)
+
+    const direct = resolveClientMeta(new Headers({ "cf-connecting-ip": "1.2.3.4" }), {}, { country: "SG", asn: 16509 })
+    expect(decideTier({ loggedIn: false, country: direct.country, asn: direct.asn })).toBe("overseas")
+    expect(limitForTier("overseas")).toBe(10)
   })
 })
