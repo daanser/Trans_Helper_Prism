@@ -24,6 +24,9 @@ OAUTH_REDIRECT_URI=https://transhelper-prism-backend.transprism.workers.dev/api/
 FRONTEND_BASE_URL=https://search.chengxi.moe
 # 管理员 X 数字 id（逗号分隔），留空则所有人都是普通用户
 ADMIN_X_IDS=
+# X OAuth scope（空格/逗号分隔）。默认仅 users.read（只需 id+username）；
+# 若登录回调报 x-users-me-failed，设为 "users.read tweet.read" 回滚
+X_OAUTH_SCOPES=users.read
 
 
 # ── 配额（T3.2：滚动 5 小时窗口 + 加权 token）──────────────

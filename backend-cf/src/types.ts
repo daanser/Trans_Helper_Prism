@@ -50,6 +50,8 @@ export interface Env {
   JWT_SECRET?: string
   /** 管理员 X 数字 id，逗号分隔 */
   ADMIN_X_IDS?: string
+  /** X OAuth scope（空格/逗号分隔）；缺省 `users.read`。回滚用：`users.read tweet.read` */
+  X_OAUTH_SCOPES?: string
 
   // ── 配额（T3.2：滚动 5 小时窗口 + 加权 token）──
   /** 窗口额度（加权 token），默认 300000 */

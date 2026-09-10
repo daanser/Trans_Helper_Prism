@@ -37,6 +37,8 @@ export function describeAuthError(code: string): string {
     "account-suspended": "该账号已被暂停",
     "state-expired": "授权已超时，请重新登录",
     "invalid-state": "授权校验失败，请重新登录",
+    "x-users-me-failed": "X 未返回账号信息（可能是授权范围不足），请重试；若持续失败请联系维护者",
+    "x-user-id-missing": "X 未返回账号 id，请重试或联系维护者",
   }
   return map[code] ?? `登录失败（${code}）`
 }

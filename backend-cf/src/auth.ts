@@ -47,8 +47,20 @@ interface OAuthState {
 const STATE_TTL = 600
 /** 会话有效期。 */
 const SESSION_TTL = "30d"
-/** 需要的 X scope：读用户信息 + 基础读权限（X 的 /users/me 需要 tweet.read 才稳）。 */
-const X_SCOPES = ["users.read", "tweet.read"]
+/**
+ * X OAuth 2.0 scope。默认只要 `users.read`——代码只调 `/2/users/me` 取 id + username，
+ * 不读帖子/关注关系；少要一个权限，授权页文案也更克制。
+ * 若某天 X 的 /users/me 因 scope 不足被拒（回调会回 `x-users-me-failed`），
+ * 把 env `X_OAUTH_SCOPES` 设回 `"users.read tweet.read"` 即可回滚（无需改代码）。
+ */
+const X_SCOPES_DEFAULT = ["users.read"]
+/** 解析 env 里的 scope（逗号或空格分隔）；空/非法回默认。 */
+export function resolveXScopes(env: { X_OAUTH_SCOPES?: string }): string[] {
+  const raw = (env.X_OAUTH_SCOPES ?? "").trim()
+  if (!raw) return X_SCOPES_DEFAULT
+  const parts = raw.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean)
+  return parts.length > 0 ? parts : X_SCOPES_DEFAULT
+}
 
 export class AuthConfigError extends Error {}
 
@@ -78,7 +90,7 @@ export async function startXLogin(
   const x = provider(env)
   const state = generateState()
   const codeVerifier = generateCodeVerifier()
-  const url = x.createAuthorizationURL(state, codeVerifier, X_SCOPES)
+  const url = x.createAuthorizationURL(state, codeVerifier, resolveXScopes(env))
 
   const after = sanitizeRedirect(env, redirectAfter)
   const payload: OAuthState = { v: codeVerifier, r: after }

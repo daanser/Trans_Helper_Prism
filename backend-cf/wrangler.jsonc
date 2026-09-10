@@ -44,6 +44,8 @@
     // 登录相关（非敏感项写进配置，避免被每次部署覆盖；敏感项 X_CLIENT_ID/X_CLIENT_SECRET/JWT_SECRET 放 Worker Secrets）
     "OAUTH_REDIRECT_URI": "https://transhelper-prism-backend.transprism.workers.dev/api/v1/auth/oauth/x/callback",
     "FRONTEND_BASE_URL": "https://search.chengxi.moe",
+    // X OAuth scope：只取 id/username 够用。若登录报 x-users-me-failed，改成 "users.read tweet.read" 回滚
+    "X_OAUTH_SCOPES": "users.read",
     "QUOTA_WINDOW_TOKENS": "300000",
     "QUOTA_WINDOW_HOURS": "5",
     // 匿名也允许向量检索（仅靠限流挡滥用）；要改成"仅回退"把这里设 "1"
