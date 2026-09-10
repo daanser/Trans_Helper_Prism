@@ -93,7 +93,8 @@ function sanitizeRedirect(env: Env, raw: string | undefined): string {
   const base = frontendBase(env)
   if (!raw) return `${base}/login/` // 带尾斜杠：直击 CF Pages 的 /login/ 静态页，避免多一次 308
   try {
-    const u = new URL(raw)
+    // 相对路径（前端 login("/login") 会传 "/login"）要先按前端基址解析，否则会被当非法直接丢回默认
+    const u = new URL(raw, `${base}/`)
     const allowed = (env.ALLOWED_ORIGINS ?? "")
       .split(",")
       .map((s) => s.trim())

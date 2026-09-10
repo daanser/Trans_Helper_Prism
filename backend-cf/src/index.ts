@@ -339,7 +339,7 @@ api.get("/auth/oauth/x/callback", async (c) => {
   const code = c.req.query("code")
   const state = c.req.query("state")
   const fail = (reason: string) =>
-    c.redirect(`${frontendBase(c.env)}/login#error=${encodeURIComponent(reason)}`, 302)
+    c.redirect(`${frontendBase(c.env)}/login/#error=${encodeURIComponent(reason)}`, 302)
 
   if (!code || !state) return fail("missing-code-or-state")
   if (!c.env.DB) return fail("db-unconfigured")

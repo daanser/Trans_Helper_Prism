@@ -167,7 +167,19 @@ export function useAuth() {
   function consumeHashToken(): HashAuthResult | null {
     if (typeof window === "undefined") return null
     const raw = window.location.hash.replace(/^#/, "")
-    if (!raw) return null
+    if (!raw) {
+      // 兜底：nuxt.config 的启动前内联脚本可能已消费 hash 并把 error 存进 sessionStorage
+      try {
+        const stashed = window.sessionStorage.getItem("prism_auth_error")
+        if (stashed) {
+          window.sessionStorage.removeItem("prism_auth_error")
+          return { error: stashed }
+        }
+      } catch {
+        /* ignore */
+      }
+      return null
+    }
     const params = new URLSearchParams(raw)
     const tokenValue = params.get("token")
     const errorValue = params.get("error")

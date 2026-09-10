@@ -48,6 +48,30 @@ export default defineNuxtConfig({
       // 防止 SSR 首屏深色闪烁（Cookie + localStorage 双查 + 系统偏好探测）
       script: [
         {
+          // 登录回跳兜底：在 Nuxt 启动前把 #token= / #error= 落盘并清 hash。
+          // 不这样做的话，水合/路由初始化可能重写 URL 丢掉 fragment，onMounted 里就读不到（线上踩过）。
+          innerHTML: `
+(function () {
+  try {
+    var raw = (window.location.hash || "").replace(/^#/, "");
+    if (!raw) return;
+    var params = new URLSearchParams(raw);
+    var token = params.get("token");
+    var error = params.get("error");
+    if (!token && !error) return;
+    if (token) {
+      try { window.localStorage.setItem("prism_token", token); } catch (_) {}
+    }
+    if (error) {
+      try { window.sessionStorage.setItem("prism_auth_error", error); } catch (_) {}
+    }
+    window.history.replaceState(window.history.state, "", window.location.pathname + window.location.search);
+  } catch (_) {}
+})();
+          `,
+          type: "text/javascript",
+        },
+        {
           innerHTML: `
 (function () {
   try {

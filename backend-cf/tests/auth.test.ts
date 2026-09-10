@@ -258,6 +258,6 @@ describe("路由接线", () => {
   it("GET /api/v1/auth/oauth/x/callback 缺参 → 302 回前端带 error", async () => {
     const resp = await app.request("/api/v1/auth/oauth/x/callback", {}, makeEnv())
     expect(resp.status).toBe(302)
-    expect(resp.headers.get("location")).toContain("/login#error=")
+    expect(resp.headers.get("location")).toContain("/login/#error=")
   })
 })

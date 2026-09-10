@@ -6,6 +6,8 @@ export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
     environment: "node",
+    // 有些用例用真实计时器模拟超时；并行跑时默认 5s 偶尔不够（曾出现 flake）。放宽到 20s。
+    testTimeout: 20_000,
     // keypool / embeddings 均为纯 TS 逻辑，无需 Workers 运行时
   },
 })
