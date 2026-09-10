@@ -5,7 +5,10 @@
      - 安全：渲染任何后端字段前都过滤 key/secret/token 类字段，绝不显示 key 明文 -->
 <template>
   <div class="mx-auto max-w-5xl px-4 py-8 sm:px-6 sm:py-12">
-    <header class="mb-8">
+    <header class="mb-8 flex flex-col">
+      <!-- 页面级左上角返回（独立一行，与下方标题/徽章不挤） -->
+      <BackButton class="mb-5 self-start" />
+
       <div class="flex flex-wrap items-center gap-3">
         <h1 class="text-2xl font-bold tracking-tight text-ink-title sm:text-3xl">管理后台</h1>
         <span class="rounded-md border border-surface-border bg-canvas-subtle px-2 py-0.5 text-[11px] font-medium text-ink-sub">

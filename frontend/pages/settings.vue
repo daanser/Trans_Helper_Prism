@@ -7,7 +7,10 @@
      - 绝不把 api_key 写进 localStorage、绝不打印、提交后立刻从内存清空 -->
 <template>
   <div class="mx-auto max-w-3xl px-4 py-8 sm:px-6 sm:py-12">
-    <header class="mb-8">
+    <header class="mb-8 flex flex-col">
+      <!-- 页面级左上角返回（独立一行，与下方标题不挤） -->
+      <BackButton class="mb-5 self-start" />
+
       <h1 class="text-2xl font-bold tracking-tight text-ink-title sm:text-3xl">设置</h1>
       <p class="mt-2 text-sm leading-relaxed text-ink-sub">
         这里的偏好只保存在本机浏览器；账号与配额信息来自服务端。

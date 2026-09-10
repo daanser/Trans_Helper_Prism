@@ -4,7 +4,10 @@
      - 本页读 location.hash：拿到 token → 存 localStorage（prism_token）+ 立刻清 hash → 跳首页
      - 无参数时展示登录引导（说明 X 登录只取 id + handle，见 tasks.md T3.1 隐私底线） -->
 <template>
-  <div class="mx-auto flex max-w-2xl flex-col items-center px-4 py-16 sm:py-24">
+  <div class="mx-auto flex max-w-2xl flex-col items-stretch px-4 py-8 sm:py-12">
+    <!-- 页面级左上角返回（在卡片之外；不塞进卡片标题，避免与卡片内容争夺焦点） -->
+    <BackButton class="mb-5 self-start" />
+
     <div class="w-full rounded-2xl border border-surface-border bg-surface p-6 shadow-card sm:p-10">
       <!-- 状态图标 -->
       <div
@@ -67,15 +70,13 @@
           重新登录
         </button>
         <NuxtLink to="/" class="text-xs text-ink-muted transition-colors hover:text-ink-title">
-          先返回首页
+          或直接去检索首页
         </NuxtLink>
       </div>
 
-      <!-- 成功态：自动跳转 -->
+      <!-- 成功态：自动跳转（纯状态文案，不做成链接——左上角已有统一返回按钮） -->
       <div v-else-if="state === 'success'" class="mt-6 text-center">
-        <NuxtLink to="/" class="text-sm font-medium text-primary hover:underline">
-          正在返回首页…
-        </NuxtLink>
+        <p class="text-sm font-medium text-ink-sub">登录成功，正在跳转…</p>
       </div>
 
       <!-- 引导态：登录入口 + 隐私说明 -->
@@ -127,7 +128,7 @@ const heading = computed(() => {
 })
 
 const description = computed(() => {
-  if (state.value === "success") return "正在返回首页，你的会话与剩余配额会显示在顶部导航栏。"
+  if (state.value === "success") return "登录成功，正在跳转到检索首页，你的会话与剩余配额会显示在顶部导航栏。"
   if (state.value === "error") return errorText.value
   return "登录后可解锁 AI 伴读与多轮追问，顶栏会显示本窗口剩余额度百分比，并可在设置页保存个人检索偏好。不登录也能正常搜索。"
 })
