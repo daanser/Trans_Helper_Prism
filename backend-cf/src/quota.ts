@@ -2,12 +2,24 @@
 // TransHelper Prism — backend-cf 配额计量与原子扣减（tasks.md T3.2）
 //
 // ⚠️ 模型已更正（2026-09-09，用户澄清）：**不是「每月 5 小时」，而是「滚动 5 小时窗口 + 固定 token 额度」**
-// （类似 ChatGPT / Gemini 的 5 小时用量窗口）；前端**只显示百分比**，不显示小时/秒/绝对数。
+// （类似 ChatGPT / Gemini 的 5 小时用量窗口）；前端**额度用量只显示百分比**，不显示 token/绝对数。
+// R6 起前端额外显示**重置时刻**（`HH:MM` + "约 x 小时后"，来自下面的 window_end/reset_at/reset_in_sec）：
+// 那是时间信息，不是额度数值，与"只显示百分比"的口径不冲突。
 //
-// ── 窗口（滚动，非自然月）──
+// ── 窗口（滚动 5h，**按注册时间网格锚定**；plan-ratelimit.md §9.2 / R6）──
 // 每账号记 `window_start`(epoch ms) + `used_tokens`。
-// `now - window_start >= window_ms` → 开新窗口：`window_start = now`、`used_tokens = 0`。
+// `window_start = created_at + floor((now - created_at) / window_ms) * window_ms`
+//   → 重置时刻**固定且可预测**（注册于 19:07 的账号永远在 00:07/05:07/10:07/15:07/20:07 重置）；
+//   → 仍然**天然错峰**（注册时间本身分散），且长时间不活跃也**不漂移**。
+// 旧实现（`window_start = now`，见 history §3 的 2026-09-09 版）会漂移、重置时刻不可预测，故已废弃。
 // 窗口长度默认 5h，可用 env `QUOTA_WINDOW_HOURS` 覆盖（缺省/非法 → 5）。
+//
+// **无迁移脚本、零 DDL**：`ensureWindow()` 自我对齐 —— 每次请求算出「当前网格窗口起点」，
+// 与库里 `period_start` 比对：一致则只读（快路径）；落后（网格推进过）→ 清零 `used_cost` 并对齐；
+// 同窗口内错位（老 now 锚定数据 / 管理员重置）→ 只对齐起点、**保留用量**。
+// ⚠️ 代价：ensureWindow / getQuota 各多 1 次 `accounts` 主键读（拿 `created_at` 当锚）。
+// 这是有意的取舍：D1 免费额度 **读 5M 行/天**、写仅 100k 行/天（history §5 坑 14），
+// 多一次读远便宜于多一次写；且**不为此新增列或 DDL**（零 schema 变更）。
 //
 // ── 额度（加权 token）──
 // `limit_tokens` 来自 env `QUOTA_WINDOW_TOKENS`（默认 300000）；**忽略 DB 里的 monthly_limit 列**。
@@ -20,8 +32,9 @@
 // ── 零 DDL（复用现有列）──
 // `quotas.period_start` 改存 `window_start`，`quotas.used_cost` 改存 `used_tokens`；
 // `monthly_limit` 列保留但**不再参与判定**（仅在补行时写入 legacy 默认值 5.0）。
-// 旧数据（自然月 period_start / 小时制 used_cost）可平滑迁移：窗口判定只看 `now - period_start`，
-// 旧的 used_cost 是「小时」小数值，当作 token 近似为 0，最多让首批用户多拿一点额度，无副作用。
+// 旧数据（自然月 period_start / now 锚定的旧窗口 / 小时制 used_cost）可平滑迁移：
+// 第一次请求时 `ensureWindow()` 就会把 `period_start` 对齐到网格起点；
+// 若旧起点落后于当前网格 → 顺带清零 `used_cost`（放大到"多给一点额度"，无副作用）。
 //
 // ── 原子性（关键）──
 // Cloudflare KV **没有原子自增**，所以扣减一律走 D1 的单条条件 UPDATE：
@@ -67,10 +80,12 @@ export interface QuotaEnv {
   QUOTA_WINDOW_HOURS?: string
 }
 
-/** 配额视图（前端只展示百分比）。 */
+/** 配额视图（前端只展示百分比 + 重置时刻；R6 新增 3 个**追加**字段，不改既有字段名）。 */
 export interface QuotaView {
-  /** 当前窗口起点（epoch ms） */
+  /** 当前窗口起点（epoch ms；网格锚定 → 固定可预测） */
   window_start: number
+  /** 窗口结束 = `window_start + window_hours*3600e3`（epoch ms） */
+  window_end: number
   /** 窗口长度（小时） */
   window_hours: number
   /** 窗口额度（加权 token） */
@@ -83,7 +98,14 @@ export interface QuotaView {
   remaining_pct: number
   /** 是否已用尽（used_tokens >= limit_tokens） */
   exceeded: boolean
-  /** D1 缺失/异常 → true（调用方应打 warning；此时按「放行」给默认值） */
+  /**
+   * 下次重置时刻（epoch ms）。与 `window_end` **同一时间点**，
+   * 单独给前端一个语义清晰的名字（避免前端靠 `window_start + window_hours` 手算）。
+   */
+  reset_at: number
+  /** 距下次重置的秒数 = `max(0, ceil((window_end - now) / 1000))`，恒 >= 0 */
+  reset_in_sec: number
+  /** D1 缺失/异常、或 accounts 行缺失（无法取注册时间 → 只能以 now 为锚）→ true */
   degraded: boolean
 }
 
@@ -144,6 +166,25 @@ export function windowHours(env: unknown = {}): number {
 /** 窗口长度（毫秒）。 */
 export function windowMs(env: unknown = {}): number {
   return windowHours(env) * MS_PER_HOUR
+}
+
+/**
+ * **注册时间网格锚定**（R6 核心，plan-ratelimit.md §9.2）：
+ * `createdAt + floor((now - createdAt) / windowMs) * windowMs`。
+ *
+ * 语义与边界：
+ * - 恰落在边界（`now === createdAt + k*windowMs`）→ 返回**该边界**，即"新窗口"起点；
+ * - `windowMs <= 0` / 任一入参非有限值 / `createdAt > now`（时钟回拨、脏数据）→ **回退 `nowMs`**：
+ *   宁可当成"从现在起开一个新窗口"，也**绝不**算出负数或未来的窗口起点（保守）；
+ * - `windowMs` 非整数时按浮点算出结果后再 `Math.floor`，保证返回整数毫秒。
+ */
+export function gridWindowStart(createdAtMs: number, nowMs: number, windowMs: number): number {
+  if (!Number.isFinite(createdAtMs) || !Number.isFinite(nowMs) || !Number.isFinite(windowMs) || windowMs <= 0) {
+    return nowMs
+  }
+  if (createdAtMs > nowMs) return nowMs
+  const elapsed = nowMs - createdAtMs
+  return Math.floor(createdAtMs + Math.floor(elapsed / windowMs) * windowMs)
 }
 
 /** 窗口额度（加权 token）：env `QUOTA_WINDOW_TOKENS`，缺省 300000。 */
@@ -211,17 +252,22 @@ interface QuotaRow {
 function toView(row: QuotaRow | null, nowMs: number, env: unknown, degraded = false): QuotaView {
   const hours = windowHours(env)
   const limit = limitTokens(env)
+  const span = hours * MS_PER_HOUR
   const windowStart = typeof row?.period_start === "number" && Number.isFinite(row.period_start) ? row.period_start : nowMs
   const used = typeof row?.used_cost === "number" && Number.isFinite(row.used_cost) ? Math.max(0, row.used_cost) : 0
   const pct = usedPct(used, limit)
+  const windowEnd = windowStart + span
   return {
     window_start: windowStart,
+    window_end: windowEnd,
     window_hours: hours,
     limit_tokens: limit,
     used_tokens: used,
     used_pct: pct,
     remaining_pct: clampPct(round1(100 - pct)),
     exceeded: used >= limit,
+    reset_at: windowEnd,
+    reset_in_sec: Math.max(0, Math.ceil((windowEnd - nowMs) / 1000)),
     degraded,
   }
 }
@@ -231,9 +277,27 @@ function permissiveView(nowMs: number, env: unknown): QuotaView {
   return toView({ period_start: nowMs, used_cost: 0, monthly_limit: 0 }, nowMs, env, true)
 }
 
-/** 窗口是否已过期（now - start >= window_ms）。 */
-function windowExpired(startMs: number, nowMs: number, env: unknown): boolean {
-  return nowMs - startMs >= windowMs(env)
+/**
+ * 读账号注册时间（网格锚）。
+ * 返回 `null` = `accounts` 行缺失 / `created_at` 非法（理论不该发生）→ 调用方以 `nowMs` 为锚。
+ * 异常 → 向上抛（由调用方 try/catch 降级，绝不静默吞成"以 now 为锚"）。
+ */
+async function readCreatedAt(db: D1Database, accountId: string): Promise<number | null> {
+  const row = await db
+    .prepare("SELECT created_at FROM accounts WHERE id = ?")
+    .bind(accountId)
+    .first<{ created_at: number }>()
+  const v = row?.created_at
+  return typeof v === "number" && Number.isFinite(v) ? v : null
+}
+
+/**
+ * 该账号「当前网格窗口起点」：`anchor === null`（accounts 行缺失）→ 回退 `nowMs` 为锚。
+ * 注意：即使锚回退，也**不抛错**——视图里 `window_start` 即为 now，`degraded=true` 可见。
+ */
+function gridStartFor(anchorMs: number | null, nowMs: number, env: unknown): number {
+  if (anchorMs === null) return nowMs
+  return gridWindowStart(anchorMs, nowMs, windowMs(env))
 }
 
 /** 读 quotas 行；异常 → 抛出（由调用方捕获降级）。 */
@@ -246,13 +310,30 @@ async function readRow(db: D1Database, accountId: string): Promise<QuotaRow | nu
 }
 
 /**
- * 滚动窗口推进 + 保证行存在（幂等、并发安全）。
- * 快路径：行存在且窗口未过期 → 直接返回（**只 1 次 SELECT**，不写库）；
- * 慢路径（首次触达 / 窗口过期）：
- *   - `INSERT OR IGNORE`：补行（auth.ts 建号已插，这里兜底；monthly_limit 写 legacy 默认值）；
- *   - `UPDATE ... WHERE period_start <= ?`：窗口过期则 `used_cost = 0`、`period_start = now`
- *     （条件写，重复执行无副作用）。
- * 返回窗口视图；D1 缺失/异常 → null（调用方按放行处理）。
+ * 网格窗口对齐 + 保证行存在（幂等、并发安全）。R6 核心。
+ *
+ * 1. 读 `quotas` 行 + 读 `accounts.created_at`（锚），算出**当前网格窗口起点** `gridStart`；
+ * 2. **快路径**：`period_start === gridStart` → 直接返回，**不写库**（成本 = 2 次读）；
+ * 3. **慢路径**（首次触达 / 跨窗口 / 同窗口错位）：
+ *    - `INSERT OR IGNORE`：补行，`period_start = gridStart`（**不是 now**）；
+ *    - ① 网格推进：`UPDATE ... SET used_cost = 0, period_start = ? WHERE period_start < ?`
+ *      —— 单条**条件写**，"判-改"在同一语句内原子完成；
+ *    - ② 同窗口错位（老 now 锚定数据 / 旧 admin 重置）：`UPDATE ... SET period_start = ?
+ *      WHERE period_start > ? AND period_start < ?`（上界 = `gridStart + window_ms`）
+ *      —— 只对齐起点、**保留 used_cost**，且不会把"已被并发推进到下一窗口"的行拽回来。
+ * 4. 复读行并返回视图；`accounts` 行缺失 → 以 `now` 为锚（`gridStart = nowMs`）且 `degraded=true`。
+ *
+ * ── 并发安全（关键）──
+ * 两条 UPDATE 都是**条件写**，条件基于**读-写之间未被信任的旧值**：
+ * 假设两个请求同时跨过窗口边界，都看到旧 `period_start`（落后）：
+ *   - A 先执行 ①：`period_start < gridStart` 成立 → 清零并推进到新网格起点；
+ *   - B 再执行 ①：此时库里 `period_start === gridStart`，条件**不再成立** → `meta.changes === 0`，**不重复清零**；
+ * 所以 A 之后扣的 `used_cost` 不会被 B 抹掉（不存在"两个并发各自清零 → 用量丢失"）。
+ * 反向交叉（B 的时间片还停在上一窗口）时，B 的 ① 条件同样不成立，② 又被上界排除 → 不会把窗口拽回去。
+ * 与 `chargeQuota` 一样：**不读-改-写、不做多语句事务**，只靠单条条件 UPDATE 的原子性。
+ * 成本：快路径 0 写（2 读）；慢路径最多 3 条写（1 INSERT + 2 条件 UPDATE），只在**窗口切换 /
+ * 首次触达 / 旧数据首对齐**时发生 —— 即每账号每窗口最多一次，与 D1 的 100k 写/天相比可忽略。
+ * D1 缺失/异常 → null（调用方按放行处理）。
  */
 export async function ensureWindow(
   db: QuotaDb,
@@ -261,32 +342,44 @@ export async function ensureWindow(
   env: unknown = {},
 ): Promise<QuotaView | null> {
   if (!db || !accountId) return null
+  const span = windowMs(env)
   try {
     const existing = await readRow(db, accountId)
-    if (existing && !windowExpired(existing.period_start, nowMs, env)) return toView(existing, nowMs, env)
+    const anchorMs = await readCreatedAt(db, accountId)
+    const gridStart = gridStartFor(anchorMs, nowMs, env)
+    // 行已对齐当前网格窗口 → 快路径（只读，不写库）；accounts 缺失时 degraded 可见。
+    if (existing && existing.period_start === gridStart) return toView(existing, nowMs, env, anchorMs === null)
 
     await db
       .prepare(
         "INSERT OR IGNORE INTO quotas (account_id, period_start, used_cost, monthly_limit, updated_at) VALUES (?, ?, 0, ?, ?)",
       )
-      .bind(accountId, nowMs, 5.0, nowMs)
+      .bind(accountId, gridStart, 5.0, nowMs)
       .run()
-    // 窗口过期才重置：period_start <= now - window_ms（单条条件写，并发安全）
+    // ① 网格推进（旧起点落后于当前网格起点）→ 清零并对齐。单条条件写，并发下只会成功一次。
     await db
-      .prepare("UPDATE quotas SET used_cost = 0, period_start = ?, updated_at = ? WHERE account_id = ? AND period_start <= ?")
-      .bind(nowMs, nowMs, accountId, nowMs - windowMs(env))
+      .prepare("UPDATE quotas SET used_cost = 0, period_start = ?, updated_at = ? WHERE account_id = ? AND period_start < ?")
+      .bind(gridStart, nowMs, accountId, gridStart)
+      .run()
+    // ② 同窗口内错位 → 只对齐起点、不清零；上界排除"已被推进到后面网格"的行（防把窗口拽回）。
+    await db
+      .prepare(
+        "UPDATE quotas SET period_start = ?, updated_at = ? WHERE account_id = ? AND period_start > ? AND period_start < ?",
+      )
+      .bind(gridStart, nowMs, accountId, gridStart, gridStart + span)
       .run()
     const row = await readRow(db, accountId)
-    return toView(row, nowMs, env, row === null)
+    return toView(row, nowMs, env, row === null || anchorMs === null)
   } catch {
     return null
   }
 }
 
 /**
- * 读配额（前端只展示百分比）。
- * **只读**：不改库。窗口过期时视图按「新窗口」返回（used=0、window_start=now），
- * 实际落库推进由 ensureWindow / chargeQuota 完成。
+ * 读配额（前端只展示百分比 + 重置时刻）。
+ * **只读**：不改库。窗口/网格已推进时，视图按「新窗口」返回（`used=0`、`window_start=gridStart`）；
+ * 同窗口内错位时按网格起点返回但**保留**已用量（与 `ensureWindow` 的落库语义一致）。
+ * 实际落库推进由 `ensureWindow` / `chargeQuota` 完成。
  * D1 缺失/异常 → 放行视图（degraded=true）。
  */
 export async function getQuota(
@@ -298,11 +391,20 @@ export async function getQuota(
   if (!db || !accountId) return permissiveView(nowMs, env)
   try {
     const row = await readRow(db, accountId)
-    if (!row) return toView({ period_start: nowMs, used_cost: 0, monthly_limit: 0 }, nowMs, env, true)
-    if (windowExpired(row.period_start, nowMs, env)) {
-      return toView({ ...row, period_start: nowMs, used_cost: 0 }, nowMs, env)
+    const anchorMs = await readCreatedAt(db, accountId)
+    const gridStart = gridStartFor(anchorMs, nowMs, env)
+    if (!row) return toView({ period_start: gridStart, used_cost: 0, monthly_limit: 0 }, nowMs, env, true)
+    if (row.period_start !== gridStart) {
+      // 网格推进过 → 视作新窗口（用量归零）；同窗口内错位 → 保留用量、起点按网格。
+      const rolled = row.period_start < gridStart
+      return toView(
+        { ...row, period_start: gridStart, used_cost: rolled ? 0 : row.used_cost },
+        nowMs,
+        env,
+        anchorMs === null,
+      )
     }
-    return toView(row, nowMs, env)
+    return toView(row, nowMs, env, anchorMs === null)
   } catch {
     return permissiveView(nowMs, env)
   }
@@ -396,7 +498,8 @@ export async function grantQuota(
 }
 
 /**
- * 管理员重置当前窗口（误杀恢复 / 运营活动）：`used_tokens = 0` + `window_start = now`。
+ * 管理员重置当前窗口（误杀恢复 / 运营活动）：`used_tokens = 0`。
+ * **窗口起点固定为当前网格起点**（不是 `now`）——重置不该改变该账号的重置时刻（R6）。
  * 返回重置后的视图；D1 缺失/异常 → null。
  */
 export async function resetQuota(
@@ -406,12 +509,14 @@ export async function resetQuota(
   env: unknown = {},
 ): Promise<QuotaView | null> {
   if (!db || !accountId) return null
-  const window = await ensureWindow(db, accountId, nowMs, env)
-  if (!window) return null
+  const ready = await ensureWindow(db, accountId, nowMs, env)
+  if (!ready) return null
   try {
+    const anchorMs = await readCreatedAt(db, accountId)
+    const gridStart = gridStartFor(anchorMs, nowMs, env)
     await db
       .prepare("UPDATE quotas SET used_cost = 0, period_start = ?, updated_at = ? WHERE account_id = ?")
-      .bind(nowMs, nowMs, accountId)
+      .bind(gridStart, nowMs, accountId)
       .run()
     return await getQuota(db, accountId, nowMs, env)
   } catch {

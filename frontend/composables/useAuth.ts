@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// TransHelper Prism — 账号会话与配额状态（tasks.md T3.6）
+// TransHelper Prism — 账号会话与配额状态（tasks.md T3.6 / plan-ratelimit.md §9.3 R6）
 // - token 只落 localStorage（见 utils/authToken.ts），绝不打印、绝不落 URL 历史
 // - user / quota 用 useState 暴露响应式，顶栏与页面共用同一份
 // - 登录走浏览器顶层跳转（不是 fetch）：GET {apiBase}/v1/auth/oauth/x/start?redirect=<回跳地址>
 // - 后端契约（已上线）：GET /api/v1/me → {user, quota}；无 token → 401 {error:"unauthorized"}
+// - R6 追加：quota 带 `window_end` / `reset_at` / `reset_in_sec`（窗口按注册时间网格锚定 → 重置时刻可预测）
+//   ⚠️ 本地时刻文案（HH:MM）只在**客户端挂载之后**计算：预渲染/SSR 阶段跑在构建机上，
+//   `new Date().toLocaleTimeString` 会得到构建机的时区/时刻 → 水合文本不一致。故统一走 `clientReady` 门控。
 
 import type { MeUser, QuotaState } from "~/composables/useApi"
 import { readAuthToken, writeAuthToken } from "~/utils/authToken"
@@ -12,10 +15,18 @@ import { readAuthToken, writeAuthToken } from "~/utils/authToken"
 export type AuthUser = MeUser
 
 /**
- * 配额（T3.2 新契约）：滚动窗口固定额度，前端只显示百分比。
+ * 配额（T3.2 新契约 + R6 重置字段）：滚动窗口固定额度，前端只显示百分比。
  * 字段全部可选 —— 后端未实现 / 字段缺失时前端降级为「不显示配额块」，绝不报错、绝不阻断检索。
+ * R6 三个追加字段（均为 additive，字段名与后端 `QuotaView` 一致）：
+ *  - `window_end`    窗口结束时刻（epoch ms）
+ *  - `reset_at`      下次重置时刻（epoch ms，= window_end）
+ *  - `reset_in_sec`  距下次重置的秒数（>= 0）
  */
-export type AuthQuota = QuotaState
+export type AuthQuota = QuotaState & {
+  window_end?: number | null
+  reset_at?: number | null
+  reset_in_sec?: number | null
+}
 
 /** 登录回跳 fragment 的解析结果 */
 export interface HashAuthResult {
@@ -53,6 +64,14 @@ export function useAuth() {
   const quota = useState<AuthQuota | null>("prism:auth:quota", () => null)
   const loading = useState<boolean>("prism:auth:loading", () => false)
   const authError = useState<string>("prism:auth:error", () => "")
+  /**
+   * 是否已挂载到浏览器。**预渲染/SSR 阶段恒为 false** → 一切"本地时刻"文案在服务端不渲染，
+   * 避免生成物里烙进构建机的时区/时刻，客户端水合后再出现（水合一致性）。
+   */
+  const clientReady = useState<boolean>("prism:auth:client-ready", () => false)
+  onMounted(() => {
+    clientReady.value = true
+  })
 
   const isLoggedIn = computed(() => !!token.value)
   const isAdmin = computed(() => user.value?.role === "admin")
@@ -88,13 +107,46 @@ export function useAuth() {
     return rem !== null && rem < 10
   })
 
-  /** 窗口恢复所需小时数：ceil((window_start + window_hours*3600e3 - now) / 3600e3)，至少 1 */
-  const resetInHours = computed<number | null>(() => {
+  /** 窗口起点毫秒（后端网格锚定；缺失时按 `window_start + window_hours` 兜底的旧契约也算出来） */
+  const windowStartMs = computed<number | null>(() => {
     const q = quota.value
-    if (!q || typeof q.window_start !== "number" || typeof q.window_hours !== "number") return null
-    const endMs = q.window_start + q.window_hours * 3600e3
-    return Math.max(1, Math.ceil((endMs - Date.now()) / 3600e3))
+    if (!q || typeof q.window_start !== "number" || !Number.isFinite(q.window_start)) return null
+    return q.window_start
   })
+
+  /** 下次重置时刻毫秒：优先用后端 `reset_at`/`window_end`，缺失时退回 `window_start + window_hours` */
+  const resetAtMs = computed<number | null>(() => {
+    const q = quota.value
+    if (!q) return null
+    for (const v of [q.reset_at, q.window_end]) {
+      if (typeof v === "number" && Number.isFinite(v)) return v
+    }
+    const start = windowStartMs.value
+    if (start === null || typeof q.window_hours !== "number" || !Number.isFinite(q.window_hours)) return null
+    return start + q.window_hours * 3600e3
+  })
+
+  /** 距下次重置的秒数（>= 0；优先用后端 `reset_in_sec`，缺失时由 `reset_at` 现算） */
+  const resetInSec = computed<number | null>(() => {
+    const q = quota.value
+    if (q && typeof q.reset_in_sec === "number" && Number.isFinite(q.reset_in_sec)) return Math.max(0, q.reset_in_sec)
+    const at = resetAtMs.value
+    return at === null ? null : Math.max(0, Math.ceil((at - Date.now()) / 1000))
+  })
+
+  /** 距重置的小时数：ceil(reset_in_sec/3600)，至少 1（"约 x 小时后重置"文案用） */
+  const resetInHours = computed<number | null>(() => {
+    const sec = resetInSec.value
+    return sec === null ? null : Math.max(1, Math.ceil(sec / 3600))
+  })
+
+  /** 下次重置时刻的本地文案（HH:MM）；**仅客户端**（`clientReady` 门控），无数据/预渲染时 null */
+  const resetAtLabel = computed<string | null>(() => (clientReady.value ? formatLocalHm(resetAtMs.value) : null))
+
+  /** 窗口起点的本地文案（HH:MM）；同样仅客户端 */
+  const windowStartLabel = computed<string | null>(() =>
+    clientReady.value ? formatLocalHm(windowStartMs.value) : null,
+  )
 
   function getToken(): string | null {
     if (!token.value) token.value = readAuthToken()
@@ -210,7 +262,11 @@ export function useAuth() {
     usedPct,
     isLowQuota,
     isExceeded,
+    resetInSec,
     resetInHours,
+    resetAtMs,
+    resetAtLabel,
+    windowStartLabel,
     getToken,
     setToken,
     init,
@@ -225,4 +281,19 @@ export function useAuth() {
 function clampPct(value: number): number {
   const clamped = Math.max(0, Math.min(100, value))
   return Math.round(clamped * 10) / 10
+}
+
+/**
+ * epoch ms → 本地时区 `HH:MM`（如 `04:07`）。非法/缺失 → null。
+ * 固定 `hour12: false`：保证任何引擎/语言环境下都是 24 小时制 `HH:MM`
+ * （zh-CN 在部分 ICU 数据下会附带"上午/下午"，那会让文案出现「将于 上午04:07 恢复」这类不一致写法）。
+ * ⚠️ 调用方必须先过 `clientReady` 门控（见 useAuth 内注释），否则预渲染会烙进构建机时刻。
+ */
+function formatLocalHm(ms: number | null): string | null {
+  if (ms === null || !Number.isFinite(ms)) return null
+  try {
+    return new Date(ms).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })
+  } catch {
+    return null
+  }
 }

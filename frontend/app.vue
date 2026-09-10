@@ -99,7 +99,8 @@
                 {{ user ? `@${user.handle}` : "已登录" }}
               </NuxtLink>
 
-              <!-- 配额：只显示百分比（滚动窗口固定额度），低于 10% 用警示色，字段缺失则整块隐藏 -->
+              <!-- 配额：百分比 + 距重置时间（滚动窗口按注册时间网格锚定 → 重置时刻可预测）；
+                   低于 10% 用警示色，字段缺失则整块隐藏（重置字段缺失时只少"· x 小时后重置"半句） -->
               <div
                 v-if="hasQuotaInfo"
                 class="hidden flex-col items-end gap-1 sm:flex"
@@ -111,6 +112,7 @@
                     :class="isExceeded || isLowQuota ? 'bg-danger' : 'bg-primary'"
                   ></span>
                   <span>{{ quotaLabel }}</span>
+                  <span v-if="quotaResetHint" class="text-ink-muted">· {{ quotaResetHint }}</span>
                 </div>
                 <div class="h-1 w-24 overflow-hidden rounded-full bg-canvas-subtle">
                   <div
@@ -209,6 +211,7 @@ const {
   isLowQuota,
   isExceeded,
   resetInHours,
+  resetAtLabel,
   init,
   loadMe,
   consumeHashToken,
@@ -217,14 +220,18 @@ const {
 const { pushToast } = useToast()
 const route = useRoute()
 
-/** 顶栏配额文案：只出现百分比，绝不出现小时/秒等绝对数值 */
+/** 顶栏配额文案：只出现百分比（绝不出现绝对 token 数） */
 const quotaLabel = computed(() => {
-  if (isExceeded.value) {
-    const hours = resetInHours.value
-    return hours ? `额度已用尽 · 约 ${hours} 小时后恢复` : "额度已用尽"
-  }
+  if (isExceeded.value) return "额度已用尽"
   const pct = remainingPct.value
   return pct === null ? "" : `剩余 ${pct.toFixed(1)}%`
+})
+
+/** 「· x 小时后重置」半句；后端未给重置字段（旧契约）时为 null，整句不显示 */
+const quotaResetHint = computed(() => {
+  const hours = resetInHours.value
+  if (hours === null) return null
+  return `${hours} 小时后重置`
 })
 
 const quotaToneClass = computed(() => {
@@ -233,15 +240,16 @@ const quotaToneClass = computed(() => {
 })
 
 const quotaTitle = computed(() => {
+  const hours = resetInHours.value
+  const at = resetAtLabel.value // 仅客户端（HH:MM），预渲染阶段为 null
+  const when = hours ? (at ? `将于 ${at}（约 ${hours} 小时后）` : `约 ${hours} 小时后`) : ""
   if (isExceeded.value) {
-    const hours = resetInHours.value
-    return hours
-      ? `本窗口额度已用尽，约 ${hours} 小时后恢复。回退检索不消耗额度。`
-      : "本窗口额度已用尽。回退检索不消耗额度。"
+    return `本窗口额度已用尽，${when ? when + "恢复" : "等待窗口重置"}。回退检索不消耗额度。`
   }
   const pct = remainingPct.value
   if (pct === null) return "尚未读取到配额信息"
-  return `本窗口剩余额度 ${pct.toFixed(1)}%；低于 10% 时提示。回退检索不消耗额度。`
+  const reset = when ? `本窗口${when}重置。` : ""
+  return `本窗口剩余额度 ${pct.toFixed(1)}%；低于 10% 时提示。${reset}回退检索不消耗额度。`
 })
 
 function onLogout() {

@@ -4,6 +4,7 @@
 // 200/422/404 路径与 queue consumer 的 wikiId 分发。绝不调真实上游。
 import { describe, it, expect, vi, beforeEach } from "vitest"
 import { app } from "../src/index"
+import { issueSession } from "../src/auth"
 import type { Env } from "../src/types"
 
 /** 最小 Env（无 DB/queue 也不崩：路由只读 env.QDRANT_* 与 registry）。 */
@@ -107,6 +108,83 @@ describe("GET /api/v1/tree/:wiki_id", () => {
   it("Qdrant 未配置 → 502", async () => {
     const resp = await app.request("/api/v1/tree/mtf-wiki", {}, makeEnv(false))
     expect(resp.status).toBe(502)
+  })
+})
+
+// ── GET /api/v1/me —— R6：quota 带上重置时刻（window_end / reset_at / reset_in_sec）──
+describe("GET /api/v1/me（配额 + 重置时刻）", () => {
+  const HOUR_MS = 3_600_000
+  const WINDOW_MS = 5 * HOUR_MS
+  const JWT_SECRET = "s".repeat(64)
+
+  /** 极简 D1 假表：只实现 /me 走到的 3 条读（accounts 状态 / accounts.created_at / quotas 行）。 */
+  function quotaEnv(createdAt: number, quota: { period_start: number; used_cost: number }) {
+    const db = {
+      prepare(sql: string) {
+        return {
+          bind: () => ({
+            first: async () => {
+              if (sql.includes("SELECT status, created_at FROM accounts")) {
+                return { status: "active", created_at: createdAt }
+              }
+              if (sql.includes("SELECT created_at FROM accounts")) return { created_at: createdAt }
+              if (sql.includes("SELECT period_start")) {
+                return { period_start: quota.period_start, used_cost: quota.used_cost, monthly_limit: 5 }
+              }
+              return null
+            },
+            run: async () => ({ success: true, results: [], meta: { changes: 0 } }),
+          }),
+        }
+      },
+    }
+    return { DB: db as unknown as Env["DB"], JWT_SECRET } as unknown as Env
+  }
+
+  async function callMe(env: Env) {
+    const token = await issueSession(env, { sub: "acc-1", handle: "alice", role: "user" })
+    const resp = await app.request("/api/v1/me", { headers: { Authorization: `Bearer ${token}` } }, env)
+    expect(resp.status).toBe(200)
+    return (await resp.json()) as {
+      user: { account_id: string; created_at: number }
+      quota: Record<string, number | boolean>
+      quota_display: string
+    }
+  }
+
+  it("quota 带 window_end / reset_at / reset_in_sec，且 reset_at === 注册时间 + k×5h（手算网格）", async () => {
+    const now = Date.now()
+    const CREATED = now - 6 * HOUR_MS // 注册 6h 前 → 网格点：CREATED / CREATED+5h / CREATED+10h
+    const GRID_START = CREATED + 5 * HOUR_MS // 当前网格起点（= now - 1h）
+    const body = await callMe(quotaEnv(CREATED, { period_start: GRID_START, used_cost: 60_000 }))
+
+    expect(body.user.created_at).toBe(CREATED)
+    expect(body.quota.window_start).toBe(GRID_START)
+    expect(body.quota.window_end).toBe(GRID_START + WINDOW_MS)
+    expect(body.quota.reset_at).toBe((CREATED + 2 * WINDOW_MS) as number) // 手算：下一个网格点
+    expect(body.quota.reset_in_sec).toBeGreaterThan(4 * 3600 - 60)
+    expect(body.quota.reset_in_sec).toBeLessThanOrEqual(4 * 3600)
+    // 既有百分比口径不变
+    expect(body.quota.used_pct).toBe(20)
+    expect(body.quota.remaining_pct).toBe(80)
+    expect(body.quota_display).toBe("20.0%")
+  })
+
+  it("网格推进后：/me 视图按新窗口（used 归零、reset_at 指向下一网格点）", async () => {
+    const now = Date.now()
+    const CREATED = now - 6 * HOUR_MS
+    const body = await callMe(quotaEnv(CREATED, { period_start: CREATED, used_cost: 300_000 }))
+    expect(body.quota.used_tokens).toBe(0)
+    expect(body.quota.window_start).toBe(CREATED + 5 * HOUR_MS)
+    expect(body.quota.reset_at).toBe(CREATED + 10 * HOUR_MS)
+    expect(body.quota.remaining_pct).toBe(100)
+  })
+
+  it("无 Authorization → 401（不泄漏任何配额信息）", async () => {
+    const env = quotaEnv(Date.now(), { period_start: Date.now(), used_cost: 0 })
+    const resp = await app.request("/api/v1/me", {}, env)
+    expect(resp.status).toBe(401)
+    expect(await resp.json()).toEqual({ error: "unauthorized" })
   })
 })
 

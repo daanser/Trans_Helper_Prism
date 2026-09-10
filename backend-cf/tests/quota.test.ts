@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // TransHelper Prism — 配额计量与原子扣减单测（tasks.md T3.2，滚动 5h 窗口 + 加权 token 模型）
+// R6 追加：窗口改为**按注册时间网格锚定**（plan-ratelimit.md §9.2）—— 重置时刻固定可预测。
 // 全 mock：D1 用内存假表实现「条件 UPDATE + meta.changes」语义，零网络、零真实 key。
 // 重点：① 窗口内累计；② 跨 5h 自动开新窗口；③ 并发不超卖；④ 超额不抛错只回 reason；
-//       ⑤ used_pct 计算与 clamp；⑥ env 缺失/非法回默认值；⑦ 缺 D1 优雅降级。
+//       ⑤ used_pct 计算与 clamp；⑥ env 缺失/非法回默认值；⑦ 缺 D1 优雅降级；
+//       ⑧ **网格锚定**：对齐/清零/同窗口不清零/并发不抹用量/accounts 缺失回退；
+//       ⑨ 视图重置字段 window_end / reset_at / reset_in_sec。
 import { describe, it, expect, vi } from "vitest"
 import {
   QUOTA_COST,
@@ -11,6 +14,7 @@ import {
   LOW_QUOTA_PCT,
   windowHours,
   windowMs,
+  gridWindowStart,
   limitTokens,
   usedPct,
   formatPct,
@@ -40,9 +44,18 @@ interface FakeRow {
 /**
  * 内存 D1 假表：按 SQL 形状识别语句，实现与 quota.ts 完全一致的语义
  * （特别是条件 UPDATE 的 meta.changes 判定）。遇到未识别 SQL 直接抛错，防止实现漂移后测试静默通过。
+ *
+ * `accounts`（网格锚）默认取该账号 quotas 行的 `period_start`：当 `now - created_at < windowMs` 时
+ * 网格起点恰等于 `period_start`，因此既有用例语义不变；显式传 `{ "acc-1": <created_at> }` 可覆盖，
+ * 传 `null` 表示"该账号没有 accounts 行"（测回退到 now 锚）。
  */
-function makeDb(seed: Record<string, Partial<FakeRow>> = {}, failOn?: string) {
+function makeDb(
+  seed: Record<string, Partial<FakeRow>> = {},
+  failOn?: string,
+  accounts?: Record<string, number | null>,
+) {
   const rows = new Map<string, FakeRow>()
+  const accs = new Map<string, number>()
   for (const [id, r] of Object.entries(seed)) {
     rows.set(id, {
       period_start: r.period_start ?? NOW,
@@ -50,6 +63,13 @@ function makeDb(seed: Record<string, Partial<FakeRow>> = {}, failOn?: string) {
       monthly_limit: r.monthly_limit ?? 5,
       updated_at: r.updated_at ?? NOW,
     })
+    accs.set(id, r.period_start ?? NOW)
+  }
+  if (accounts) {
+    for (const [id, created] of Object.entries(accounts)) {
+      if (created === null) accs.delete(id)
+      else accs.set(id, created)
+    }
   }
   const calls: Array<{ sql: string; args: unknown[] }> = []
 
@@ -60,12 +80,21 @@ function makeDb(seed: Record<string, Partial<FakeRow>> = {}, failOn?: string) {
       rows.set(accountId, { period_start: windowStart, used_cost: 0, monthly_limit: legacyLimit, updated_at: updatedAt })
       return 1
     }
-    if (sql.includes("AND period_start <= ?")) {
-      // ensureWindow 窗口推进
+    if (sql.includes("used_cost = 0") && sql.includes("AND period_start < ?")) {
+      // ensureWindow ①：网格推进 → 清零 + 对齐（单条条件写）
       const [windowStart, updatedAt, accountId, threshold] = args as [number, number, string, number]
       const row = rows.get(accountId)
-      if (!row || !(row.period_start <= threshold)) return 0
+      if (!row || !(row.period_start < threshold)) return 0
       row.used_cost = 0
+      row.period_start = windowStart
+      row.updated_at = updatedAt
+      return 1
+    }
+    if (sql.includes("AND period_start > ? AND period_start < ?")) {
+      // ensureWindow ②：同窗口内错位 → 只对齐起点，**不清零**
+      const [windowStart, updatedAt, accountId, lower, upper] = args as [number, number, string, number, number]
+      const row = rows.get(accountId)
+      if (!row || !(row.period_start > lower) || !(row.period_start < upper)) return 0
       row.period_start = windowStart
       row.updated_at = updatedAt
       return 1
@@ -90,7 +119,7 @@ function makeDb(seed: Record<string, Partial<FakeRow>> = {}, failOn?: string) {
       row.updated_at = updatedAt
       return 1
     }
-    if (sql.includes("SET used_cost = 0, period_start = ?")) {
+    if (sql.includes("SET used_cost = 0, period_start = ?") && !sql.includes("period_start < ?")) {
       // resetQuota
       const [windowStart, updatedAt, accountId] = args as [number, number, string]
       const row = rows.get(accountId)
@@ -114,6 +143,10 @@ function makeDb(seed: Record<string, Partial<FakeRow>> = {}, failOn?: string) {
         },
         async first() {
           if (failOn && sql.includes(failOn)) throw new Error("d1-failed")
+          if (sql.includes("SELECT created_at FROM accounts")) {
+            const created = accs.get(String(rec.args[0]))
+            return created === undefined ? null : { created_at: created }
+          }
           if (!sql.includes("SELECT period_start")) return null
           const row = rows.get(String(rec.args[0]))
           return row ? { period_start: row.period_start, used_cost: row.used_cost, monthly_limit: row.monthly_limit } : null
@@ -127,7 +160,7 @@ function makeDb(seed: Record<string, Partial<FakeRow>> = {}, failOn?: string) {
     },
   } as unknown as D1Database
 
-  return { db, rows, calls }
+  return { db, rows, accs, calls }
 }
 
 describe("加权 token 成本表", () => {
@@ -207,20 +240,31 @@ describe("getQuota（只读）", () => {
     const q = await getQuota(db, "acc-1", NOW)
     expect(q).toEqual({
       window_start: NOW - HOUR_MS,
+      window_end: NOW - HOUR_MS + WINDOW_MS,
       window_hours: 5,
       limit_tokens: 300_000,
       used_tokens: 60_000,
       used_pct: 20,
       remaining_pct: 80,
       exceeded: false,
+      reset_at: NOW - HOUR_MS + WINDOW_MS,
+      reset_in_sec: 4 * 3600,
       degraded: false,
     })
   })
 
-  it("窗口过期：视图按新窗口返回（used=0、window_start=now），但**不改库**", async () => {
-    const { db, rows } = makeDb({ "acc-1": { period_start: NOW - 6 * HOUR_MS, used_cost: 300_000 } })
+  it("网格推进后：视图按新窗口返回（used=0、window_start=网格起点），但**不改库**", async () => {
+    // 注册于 NOW-6h → 网格起点 = NOW-6h + floor(6h/5h)*5h = NOW-1h
+    const { db, rows } = makeDb(
+      { "acc-1": { period_start: NOW - 6 * HOUR_MS, used_cost: 300_000 } },
+      undefined,
+      { "acc-1": NOW - 6 * HOUR_MS },
+    )
     const q = await getQuota(db, "acc-1", NOW)
-    expect(q.window_start).toBe(NOW)
+    expect(q.window_start).toBe(NOW - HOUR_MS)
+    expect(q.window_end).toBe(NOW - HOUR_MS + WINDOW_MS)
+    expect(q.reset_at).toBe(NOW - HOUR_MS + WINDOW_MS)
+    expect(q.reset_in_sec).toBe(4 * 3600) // 网格起点 NOW-1h → 距重置 4h
     expect(q.used_tokens).toBe(0)
     expect(q.used_pct).toBe(0)
     expect(q.remaining_pct).toBe(100)
@@ -228,6 +272,19 @@ describe("getQuota（只读）", () => {
     // 库未动
     expect(rows.get("acc-1")!.period_start).toBe(NOW - 6 * HOUR_MS)
     expect(rows.get("acc-1")!.used_cost).toBe(300_000)
+  })
+
+  it("同窗口内错位（老 now 锚定数据）：起点按网格、**用量保留**、不改库", async () => {
+    const { db, rows } = makeDb(
+      { "acc-1": { period_start: NOW - HOUR_MS, used_cost: 60_000 } },
+      undefined,
+      { "acc-1": NOW - 3 * HOUR_MS }, // 网格起点 = NOW-3h，旧起点(NOW-1h)在同一网格窗口内
+    )
+    const q = await getQuota(db, "acc-1", NOW)
+    expect(q.window_start).toBe(NOW - 3 * HOUR_MS)
+    expect(q.used_tokens).toBe(60_000)
+    expect(q.used_pct).toBe(20)
+    expect(rows.get("acc-1")!.period_start).toBe(NOW - HOUR_MS) // 只读：不改库
   })
 
   it("恰好用尽 → exceeded=true、pct 100/0", async () => {
@@ -272,12 +329,15 @@ describe("getQuota（只读）", () => {
   it("isLowQuota：剩余 < 10% 才提示", () => {
     const base: QuotaView = {
       window_start: NOW,
+      window_end: NOW + WINDOW_MS,
       window_hours: 5,
       limit_tokens: 1000,
       used_tokens: 920,
       used_pct: 92,
       remaining_pct: 8,
       exceeded: false,
+      reset_at: NOW + WINDOW_MS,
+      reset_in_sec: 5 * 3600,
       degraded: false,
     }
     expect(isLowQuota(base)).toBe(true)
@@ -288,12 +348,15 @@ describe("getQuota（只读）", () => {
   it("toQuotaResponse 投影给 SearchResponse.quota（只带百分比）", () => {
     const view: QuotaView = {
       window_start: NOW,
+      window_end: NOW + WINDOW_MS,
       window_hours: 5,
       limit_tokens: 1000,
       used_tokens: 234,
       used_pct: 23.4,
       remaining_pct: 76.6,
       exceeded: false,
+      reset_at: NOW + WINDOW_MS,
+      reset_in_sec: 5 * 3600,
       degraded: false,
     }
     expect(toQuotaResponse(view)).toEqual({ used_pct: 23.4, remaining_pct: 76.6, fallback: false })
@@ -301,49 +364,248 @@ describe("getQuota（只读）", () => {
   })
 })
 
-describe("ensureWindow（滚动窗口推进）", () => {
-  it("无行时补行（window_start=now、used=0）", async () => {
-    const { db, rows } = makeDb()
-    const v = await ensureWindow(db, "acc-1", NOW)
-    expect(v).not.toBeNull()
-    expect(rows.get("acc-1")).toEqual({ period_start: NOW, used_cost: 0, monthly_limit: 5, updated_at: NOW })
+describe("gridWindowStart（按注册时间的网格锚定，纯函数）", () => {
+  const CREATED = Date.UTC(2026, 8, 9, 7, 7, 0) // 注册于 07:07（UTC）→ 网格点 02:07/07:07/12:07/17:07/22:07
+
+  it("常规值：窗口内任意时刻 → 同一个网格起点", () => {
+    expect(gridWindowStart(CREATED, CREATED, WINDOW_MS)).toBe(CREATED)
+    expect(gridWindowStart(CREATED, CREATED + 1, WINDOW_MS)).toBe(CREATED)
+    expect(gridWindowStart(CREATED, CREATED + WINDOW_MS - 1, WINDOW_MS)).toBe(CREATED)
+    expect(gridWindowStart(CREATED, CREATED + WINDOW_MS + 1, WINDOW_MS)).toBe(CREATED + WINDOW_MS)
+    // 跨 3 天 2 小时 → 落在第 floor((74h)/5h)=14 个网格点
+    const now = CREATED + 74 * HOUR_MS
+    expect(gridWindowStart(CREATED, now, WINDOW_MS)).toBe(CREATED + 14 * WINDOW_MS)
+    expect(gridWindowStart(CREATED, now, WINDOW_MS)).toBeLessThanOrEqual(now)
+    expect(now - gridWindowStart(CREATED, now, WINDOW_MS)).toBeLessThan(WINDOW_MS)
   })
 
-  it("窗口未过期 → 快路径不写库（只 1 次 SELECT）", async () => {
+  it("恰好落在边界（now === createdAt + k*windowMs）→ **该边界**即新窗口起点", () => {
+    for (const k of [1, 2, 3, 14]) {
+      expect(gridWindowStart(CREATED, CREATED + k * WINDOW_MS, WINDOW_MS)).toBe(CREATED + k * WINDOW_MS)
+    }
+    // 边界前 1ms 仍是旧窗口
+    expect(gridWindowStart(CREATED, CREATED + 2 * WINDOW_MS - 1, WINDOW_MS)).toBe(CREATED + WINDOW_MS)
+  })
+
+  it("createdAt > now（时钟回拨/脏数据）→ 回退 now（绝不产生负数或未来窗口）", () => {
+    expect(gridWindowStart(NOW + HOUR_MS, NOW, WINDOW_MS)).toBe(NOW)
+    expect(gridWindowStart(NOW + 1, NOW, WINDOW_MS)).toBe(NOW)
+  })
+
+  it("非法入参（windowMs<=0 / 非有限值）→ 回退 now", () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(gridWindowStart(CREATED, NOW, bad)).toBe(NOW)
+    }
+    expect(gridWindowStart(Number.NaN, NOW, WINDOW_MS)).toBe(NOW)
+    expect(gridWindowStart(Number.POSITIVE_INFINITY, NOW, WINDOW_MS)).toBe(NOW)
+    expect(gridWindowStart(CREATED, Number.NaN, WINDOW_MS)).toBe(NaN) // now 本身非法 → 原样返回
+  })
+
+  it("自定义窗口（1h）与浮点窗口都稳定：起点 <= now < 起点+window", () => {
+    const oneHour = HOUR_MS
+    expect(gridWindowStart(CREATED, CREATED + 61 * 60_000, oneHour)).toBe(CREATED + oneHour)
+    const floatSpan = 1.5 * HOUR_MS
+    const start = gridWindowStart(CREATED, CREATED + 4 * HOUR_MS, floatSpan)
+    expect(Number.isInteger(start)).toBe(true)
+    expect(start).toBeLessThanOrEqual(CREATED + 4 * HOUR_MS)
+    expect(start + floatSpan).toBeGreaterThan(CREATED + 4 * HOUR_MS)
+  })
+})
+
+describe("ensureWindow（网格对齐 + 保证行存在）", () => {
+  it("无行时补行：window_start = 网格起点（**不是 now**）、used=0", async () => {
+    const { db, rows } = makeDb({}, undefined, { "acc-1": NOW - 6 * HOUR_MS })
+    const v = await ensureWindow(db, "acc-1", NOW)
+    expect(v).not.toBeNull()
+    const gridStart = NOW - HOUR_MS // NOW-6h 的网格起点 = NOW-1h
+    expect(rows.get("acc-1")).toEqual({ period_start: gridStart, used_cost: 0, monthly_limit: 5, updated_at: NOW })
+    expect(v!.window_start).toBe(gridStart)
+    expect(v!.reset_at).toBe(gridStart + WINDOW_MS)
+  })
+
+  it("已对齐网格 → 快路径不写库（2 次读：quotas + accounts）", async () => {
+    // 注册于 NOW-1h → 网格起点 = NOW-1h，与库里 period_start 一致
     const { db, calls } = makeDb({ "acc-1": { period_start: NOW - HOUR_MS, used_cost: 60_000 } })
     const v = await ensureWindow(db, "acc-1", NOW)
     expect(v!.used_tokens).toBe(60_000)
-    expect(calls).toHaveLength(1)
-    expect(calls[0].sql).toContain("SELECT period_start")
+    expect(v!.window_start).toBe(NOW - HOUR_MS)
+    expect(calls).toHaveLength(2)
+    expect(calls.map((c) => c.sql).join("|")).toContain("SELECT created_at FROM accounts")
+    expect(calls.some((c) => c.sql.startsWith("UPDATE") || c.sql.includes("INSERT"))).toBe(false)
   })
 
-  it("窗口过期（>= 5h）→ used 归零、window_start=now", async () => {
-    const { db, rows } = makeDb({ "acc-1": { period_start: NOW - WINDOW_MS, used_cost: 300_000 } })
+  it("网格推进（旧起点落后）→ used 归零、period_start = 网格起点", async () => {
+    const { db, rows } = makeDb(
+      { "acc-1": { period_start: NOW - WINDOW_MS, used_cost: 300_000 } },
+      undefined,
+      { "acc-1": NOW - 6 * HOUR_MS },
+    )
     const v = await ensureWindow(db, "acc-1", NOW)
+    const gridStart = NOW - HOUR_MS
     expect(v!.used_tokens).toBe(0)
-    expect(v!.window_start).toBe(NOW)
+    expect(v!.window_start).toBe(gridStart)
     expect(rows.get("acc-1")!.used_cost).toBe(0)
-    expect(rows.get("acc-1")!.period_start).toBe(NOW)
+    expect(rows.get("acc-1")!.period_start).toBe(gridStart)
   })
 
-  it("差 1ms 未满 5h → 不重置", async () => {
-    const { db, rows } = makeDb({ "acc-1": { period_start: NOW - WINDOW_MS + 1, used_cost: 1234 } })
+  it("同窗口内错位（老 now 锚定数据）→ 对齐起点但**不清零**", async () => {
+    const { db, rows } = makeDb(
+      { "acc-1": { period_start: NOW - HOUR_MS, used_cost: 1234 } },
+      undefined,
+      { "acc-1": NOW - 3 * HOUR_MS }, // 网格起点 NOW-3h，旧起点 NOW-1h 仍在同一网格窗口
+    )
     const v = await ensureWindow(db, "acc-1", NOW)
+    expect(v!.window_start).toBe(NOW - 3 * HOUR_MS)
     expect(v!.used_tokens).toBe(1234)
     expect(rows.get("acc-1")!.used_cost).toBe(1234)
+    expect(rows.get("acc-1")!.period_start).toBe(NOW - 3 * HOUR_MS)
   })
 
-  it("env 自定义窗口（1h）生效", async () => {
+  it("网格窗口内任何时刻都对齐到**同一个**起点（重置时刻固定可预测）", async () => {
+    const created = NOW - 6 * HOUR_MS // 网格点：...,NOW-6h,NOW-1h,NOW+4h
+    const { db, rows } = makeDb({}, undefined, { "acc-1": created })
+    const starts: number[] = []
+    for (const t of [NOW, NOW + 1, NOW + HOUR_MS, NOW + 4 * HOUR_MS - 1]) {
+      const v = await ensureWindow(db, "acc-1", t)
+      starts.push(v!.window_start)
+    }
+    expect(new Set(starts).size).toBe(1)
+    expect(starts[0]).toBe(NOW - HOUR_MS)
+    // 跨过网格边界才推进
+    expect((await ensureWindow(db, "acc-1", NOW + 4 * HOUR_MS))!.window_start).toBe(NOW + 4 * HOUR_MS)
+    expect(rows.get("acc-1")!.used_cost).toBe(0)
+  })
+
+  it("并发 10 个请求跨窗口：只有一次清零，扣减的用量不会被抹掉", async () => {
+    // 未对齐的旧行（落后于网格）：10 个并发 ensureWindow 必须只清一次
+    const { db, rows } = makeDb(
+      { "acc-1": { period_start: NOW - 10 * HOUR_MS, used_cost: 300_000 } },
+      undefined,
+      { "acc-1": NOW - 6 * HOUR_MS },
+    )
+    const views = await Promise.all(Array.from({ length: 10 }, () => ensureWindow(db, "acc-1", NOW)))
+    expect(views.every((v) => v !== null)).toBe(true)
+    expect(views.every((v) => v!.window_start === NOW - HOUR_MS)).toBe(true)
+    expect(views.every((v) => v!.used_tokens === 0)).toBe(true)
+    expect(rows.get("acc-1")!.used_cost).toBe(0)
+
+    // 后到的并发请求（仍带着"旧起点"的时间片）不会二次清零：先扣 200，再并发对齐
+    const charged = await chargeQuota(db, "acc-1", 200, NOW)
+    expect(charged.ok).toBe(true)
+    const late = await Promise.all([ensureWindow(db, "acc-1", NOW), ensureWindow(db, "acc-1", NOW)])
+    expect(late.every((v) => v!.used_tokens === 200)).toBe(true)
+    expect(rows.get("acc-1")!.used_cost).toBe(200)
+  })
+
+  it("并发扣减同窗口累计不丢（20 × 200 → 4000）", async () => {
+    const { db, rows } = makeDb({}, undefined, { "acc-1": NOW - HOUR_MS })
+    const results = await Promise.all(Array.from({ length: 20 }, () => chargeQuota(db, "acc-1", 200, NOW)))
+    expect(results.every((r) => r.ok)).toBe(true)
+    expect(rows.get("acc-1")!.used_cost).toBe(4000)
+  })
+
+  it("accounts 行缺失 → 以 now 为锚（不抛错），视图 degraded=true 可见", async () => {
+    const { db, rows } = makeDb({ "acc-1": { period_start: NOW - 10 * HOUR_MS, used_cost: 500 } }, undefined, {
+      "acc-1": null,
+    })
+    const v = await ensureWindow(db, "acc-1", NOW)
+    expect(v).not.toBeNull()
+    expect(v!.window_start).toBe(NOW) // 回退 now 锚
+    expect(v!.degraded).toBe(true)
+    expect(rows.get("acc-1")!.period_start).toBe(NOW)
+    expect(rows.get("acc-1")!.used_cost).toBe(0) // 回退锚会清零（无法判断是否跨窗口，保守从新窗口起算）
+  })
+
+  it("accounts.created_at 非法（NaN）→ 同样回退 now 锚", async () => {
+    const { db } = makeDb({ "acc-1": { period_start: NOW, used_cost: 100 } }, undefined, { "acc-1": Number.NaN })
+    const v = await ensureWindow(db, "acc-1", NOW)
+    expect(v!.window_start).toBe(NOW)
+    expect(v!.used_tokens).toBe(100) // 同窗口错位（起点相等）→ 快路径，用量保留
+    expect(v!.degraded).toBe(true)
+  })
+
+  it("env 自定义窗口（1h）网格生效", async () => {
     const env = { QUOTA_WINDOW_HOURS: "1" }
+    // 注册于 NOW-30min → 1h 网格起点 = NOW-30min（与库里一致 → 保留用量）
     const fresh = makeDb({ "acc-1": { period_start: NOW - 30 * 60_000, used_cost: 500 } })
     expect((await ensureWindow(fresh.db, "acc-1", NOW, env))!.used_tokens).toBe(500)
-    const stale = makeDb({ "acc-1": { period_start: NOW - 61 * 60_000, used_cost: 500 } })
-    expect((await ensureWindow(stale.db, "acc-1", NOW, env))!.used_tokens).toBe(0)
+    expect((await ensureWindow(fresh.db, "acc-1", NOW, env))!.window_start).toBe(NOW - 30 * 60_000)
+    // 注册于 NOW-90min → 1h 网格起点 = NOW-30min；旧起点 NOW-90min 落后 → 清零
+    const stale = makeDb({ "acc-1": { period_start: NOW - 90 * 60_000, used_cost: 500 } }, undefined, {
+      "acc-1": NOW - 90 * 60_000,
+    })
+    const v = await ensureWindow(stale.db, "acc-1", NOW, env)
+    expect(v!.used_tokens).toBe(0)
+    expect(v!.window_start).toBe(NOW - 30 * 60_000)
+    expect(v!.window_end).toBe(NOW + 30 * 60_000)
   })
 
   it("缺 D1 → null（不抛错）", async () => {
     expect(await ensureWindow(undefined, "acc-1", NOW)).toBeNull()
     expect(await ensureWindow(null, "acc-1", NOW)).toBeNull()
+  })
+
+  it("accounts 读抛错 → null（吞掉异常，绝不让配额读崩掉检索）", async () => {
+    const { db } = makeDb({ "acc-1": {} }, "SELECT created_at FROM accounts")
+    expect(await ensureWindow(db, "acc-1", NOW)).toBeNull()
+  })
+})
+
+describe("配额视图的重置字段（R6：window_end / reset_at / reset_in_sec）", () => {
+  it("三字段数值正确、reset_at === window_end、reset_in_sec 恒 >= 0", async () => {
+    const { db } = makeDb({ "acc-1": { period_start: NOW - HOUR_MS, used_cost: 1000 } })
+    const q = await getQuota(db, "acc-1", NOW)
+    expect(q.window_end).toBe(q.window_start + q.window_hours * HOUR_MS)
+    expect(q.reset_at).toBe(q.window_end)
+    expect(q.reset_in_sec).toBe(Math.max(0, Math.ceil((q.window_end - NOW) / 1000)))
+    expect(q.reset_in_sec).toBeGreaterThanOrEqual(0)
+  })
+
+  it("窗口末尾：reset_in_sec 归 1s、不为负；边界时刻网格推进 → 新窗口从满额起算", async () => {
+    const { db } = makeDb({ "acc-1": { period_start: NOW, used_cost: 1000 } })
+    const end = NOW + WINDOW_MS
+    const before = await getQuota(db, "acc-1", end - 1)
+    expect(before.reset_in_sec).toBe(1)
+    expect(before.used_tokens).toBe(1000)
+    // now 恰在网格边界 → 网格起点 = now（新窗口），reset_in_sec = 整个窗口
+    const atEnd = await getQuota(db, "acc-1", end)
+    expect(atEnd.window_start).toBe(end)
+    expect(atEnd.window_end).toBe(end + WINDOW_MS)
+    expect(atEnd.reset_in_sec).toBe(5 * 3600)
+    expect(atEnd.used_tokens).toBe(0) // 网格推进 → 用量归零
+    // 时钟回拨（now 早于行里的起点）→ reset_in_sec 绝不为负
+    const rewound = await getQuota(db, "acc-1", NOW - 10 * HOUR_MS)
+    expect(rewound.reset_in_sec).toBeGreaterThanOrEqual(0)
+  })
+
+  it("跨窗口后（ensureWindow 落库）视图用量归零、reset 指向下一网格点", async () => {
+    const created = NOW - 6 * HOUR_MS
+    const { db } = makeDb({ "acc-1": { period_start: NOW - HOUR_MS, used_cost: 299_800 } }, undefined, {
+      "acc-1": created,
+    })
+    await chargeQuota(db, "acc-1", 400, NOW) // 窗口内累计到 300200 → 超额
+    const after = await getQuota(db, "acc-1", NOW + 4 * HOUR_MS)
+    expect(after.window_start).toBe(NOW + 4 * HOUR_MS)
+    expect(after.used_tokens).toBe(0)
+    expect(after.reset_at).toBe(NOW + 9 * HOUR_MS)
+    expect(after.reset_in_sec).toBe(5 * 3600)
+    expect(after.remaining_pct).toBe(100)
+  })
+
+  it("env 覆盖窗口长度时 window_end / reset_at 跟着变", async () => {
+    const env = { QUOTA_WINDOW_HOURS: "2" }
+    const { db } = makeDb({ "acc-1": { period_start: NOW - HOUR_MS, used_cost: 0 } })
+    const q = await getQuota(db, "acc-1", NOW, env)
+    expect(q.window_end).toBe(q.window_start + 2 * HOUR_MS)
+    expect(q.reset_in_sec).toBe(3600)
+  })
+
+  it("降级视图也带三字段（不因缺失/异常而 undefined）", async () => {
+    const q = await getQuota(undefined, "acc-1", NOW)
+    expect(q.degraded).toBe(true)
+    expect(q.window_end).toBe(NOW + WINDOW_MS)
+    expect(q.reset_at).toBe(q.window_end)
+    expect(q.reset_in_sec).toBe(5 * 3600)
   })
 })
 
@@ -409,13 +671,18 @@ describe("chargeQuota（原子扣减）", () => {
     expect(rows.get("acc-1")!.used_cost).toBe(1000)
   })
 
-  it("跨窗口：上一窗口已用满，本次自动开新窗口并成功", async () => {
-    const { db, rows } = makeDb({ "acc-1": { period_start: NOW - 6 * HOUR_MS, used_cost: 300_000 } })
+  it("跨窗口：上一窗口已用满，本次自动开新窗口（网格起点）并成功", async () => {
+    const { db, rows } = makeDb(
+      { "acc-1": { period_start: NOW - 6 * HOUR_MS, used_cost: 300_000 } },
+      undefined,
+      { "acc-1": NOW - 6 * HOUR_MS },
+    )
     const res = await chargeQuota(db, "acc-1", 200, NOW)
     expect(res.ok).toBe(true)
     expect(res.used_tokens).toBe(200)
-    expect(rows.get("acc-1")!.period_start).toBe(NOW)
+    expect(rows.get("acc-1")!.period_start).toBe(NOW - HOUR_MS) // 网格起点，不再是 now
     expect(rows.get("acc-1")!.used_cost).toBe(200)
+    expect(res.used_pct).toBe(0.1)
   })
 
   it("env 额度生效：1000 token 额度下第 6 次 200 被拒", async () => {
@@ -497,14 +764,31 @@ describe("管理员加额 / 扣额 / 重置（T3.3 admin）", () => {
     expect(await grantQuota(db, "acc-1", 100, NOW)).toBeNull()
   })
 
-  it("resetQuota 清空当前窗口并重置窗口起点", async () => {
-    const { db, rows } = makeDb({ "acc-1": { period_start: NOW - 2 * HOUR_MS, used_cost: 250_000 } })
+  it("resetQuota 清空当前窗口，窗口起点 = 当前网格起点（不是 now）", async () => {
+    // 注册于 NOW-3h → 网格起点 NOW-3h；旧起点 NOW-2h 在同一网格窗口内 → 对齐到 NOW-3h
+    const { db, rows } = makeDb({ "acc-1": { period_start: NOW - 2 * HOUR_MS, used_cost: 250_000 } }, undefined, {
+      "acc-1": NOW - 3 * HOUR_MS,
+    })
     const v = await resetQuota(db, "acc-1", NOW)
     expect(v!.used_tokens).toBe(0)
-    expect(v!.window_start).toBe(NOW)
+    expect(v!.window_start).toBe(NOW - 3 * HOUR_MS)
     expect(v!.remaining_pct).toBe(100)
     expect(rows.get("acc-1")!.used_cost).toBe(0)
-    expect(rows.get("acc-1")!.period_start).toBe(NOW)
+    expect(rows.get("acc-1")!.period_start).toBe(NOW - 3 * HOUR_MS)
+  })
+
+  it("resetQuota **不改变**重置时刻：重置前后 reset_at 一致（R6 核心不变式）", async () => {
+    const created = NOW - 6 * HOUR_MS // 网格点 ...,NOW-1h,NOW+4h
+    const { db } = makeDb({ "acc-1": { period_start: NOW - HOUR_MS, used_cost: 300_000 } }, undefined, {
+      "acc-1": created,
+    })
+    const before = await getQuota(db, "acc-1", NOW)
+    const after = await resetQuota(db, "acc-1", NOW)
+    expect(before.reset_at).toBe(NOW + 4 * HOUR_MS)
+    expect(after!.reset_at).toBe(before.reset_at)
+    expect(after!.window_start).toBe(before.window_start)
+    expect(after!.used_tokens).toBe(0)
+    expect(after!.exceeded).toBe(false)
   })
 
   it("resetQuota 缺 D1 → null（不抛错）", async () => {

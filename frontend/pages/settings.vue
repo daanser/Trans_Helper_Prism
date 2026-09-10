@@ -71,6 +71,29 @@
           <p v-else-if="isLowQuota" class="mt-1.5 text-xs text-danger">
             剩余额度已低于 10%，超出后将自动切换为回退检索（回退不消耗额度）。
           </p>
+
+          <!-- 窗口起止与下次重置（本地时刻；R6 网格锚定 → 每次重置时刻固定可预测）
+               ⚠️ 这些文案只在客户端挂载后渲染（useAuth 的 clientReady 门控），预渲染阶段为 null -->
+          <dl
+            v-if="windowStartLabel || resetAtLabel"
+            class="mt-3 grid grid-cols-1 gap-x-6 gap-y-2 border-t border-surface-border pt-3 text-xs sm:grid-cols-2"
+          >
+            <div class="flex items-center justify-between gap-3">
+              <dt class="text-ink-muted">本窗口起点</dt>
+              <dd class="tabular-nums text-ink-sub">{{ windowStartLabel || "—" }}</dd>
+            </div>
+            <div class="flex items-center justify-between gap-3">
+              <dt class="text-ink-muted">本窗口结束</dt>
+              <dd class="tabular-nums text-ink-sub">{{ resetAtLabel || "—" }}</dd>
+            </div>
+            <div class="flex items-center justify-between gap-3 sm:col-span-2">
+              <dt class="text-ink-muted">下次重置</dt>
+              <dd class="tabular-nums font-medium text-ink-title">{{ resetText }}</dd>
+            </div>
+          </dl>
+          <p v-if="windowStartLabel || resetAtLabel" class="mt-1.5 text-xs text-ink-muted">
+            时刻按本机时区显示；本窗口长度 {{ windowLengthText }}，重置时刻由账号注册时间锚定，长期不变。
+          </p>
         </div>
 
         <div class="flex flex-wrap items-center gap-2 border-t border-surface-border pt-4">
@@ -377,7 +400,21 @@ type ModelsState = "idle" | "loading" | "ok" | "unimplemented" | "error"
 const { saveModelSettings, listModels, deleteModel } = useApi()
 const { pushToast } = useToast()
 const { prefs, load: loadPrefs, save, reset } = usePrefs()
-const { isLoggedIn, user, hasQuotaInfo, remainingPct, isLowQuota, isExceeded, resetInHours, loadMe, logout, init } = useAuth()
+const {
+  isLoggedIn,
+  user,
+  quota,
+  hasQuotaInfo,
+  remainingPct,
+  isLowQuota,
+  isExceeded,
+  resetInHours,
+  resetAtLabel,
+  windowStartLabel,
+  loadMe,
+  logout,
+  init,
+} = useAuth()
 
 const corporaOptions: CorpusOption[] = DEFAULT_CORPORA_OPTIONS
 
@@ -419,7 +456,26 @@ const quotaText = computed(() => {
 
 const exceededText = computed(() => {
   const hours = resetInHours.value
-  return hours ? `本窗口额度已用尽，约 ${hours} 小时后恢复。` : "本窗口额度已用尽。"
+  const at = resetAtLabel.value
+  if (at && hours) return `本窗口额度已用尽，将于 ${at}（约 ${hours} 小时后）恢复。`
+  if (hours) return `本窗口额度已用尽，约 ${hours} 小时后恢复。`
+  return "本窗口额度已用尽。"
+})
+
+/** 下次重置的中文文案：优先给具体时刻（HH:MM），退化到"约 x 小时后"（仅客户端可得） */
+const resetText = computed(() => {
+  const at = resetAtLabel.value
+  const hours = resetInHours.value
+  if (at && hours) return `${at}（约 ${hours} 小时后）`
+  if (at) return at
+  if (hours) return `约 ${hours} 小时后`
+  return "—"
+})
+
+/** 窗口长度文案（后端 env 可调 → 不写死 5；缺字段时退回中性说法） */
+const windowLengthText = computed(() => {
+  const h = quota.value?.window_hours
+  return typeof h === "number" && Number.isFinite(h) && h > 0 ? `${h} 小时` : "固定长度"
 })
 
 function toggleCorpus(id: string) {

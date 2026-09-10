@@ -175,7 +175,7 @@
             </span>
             <span class="text-xs leading-relaxed text-ink-body">
               <template v-if="quotaExceeded">
-                本窗口额度已用尽<template v-if="quotaResetHours">，约 {{ quotaResetHours }} 小时后恢复</template>。当前检索已切换为回退模式（回退不消耗额度）。
+                本窗口额度已用尽<template v-if="quotaResetAtLabel && quotaResetHours">，将于 {{ quotaResetAtLabel }}（约 {{ quotaResetHours }} 小时后）恢复</template><template v-else-if="quotaResetHours">，约 {{ quotaResetHours }} 小时后恢复</template>。当前检索已切换为回退模式（回退不消耗额度）。
               </template>
               <template v-else>
                 本窗口剩余额度已低于 10%，请注意规划查询频次；超出后将自动切换为回退检索。
@@ -257,7 +257,8 @@ type AiStatus = "idle" | "streaming" | "done" | "unavailable"
 const { search, searchStream, chat } = useApi()
 const { pushToast } = useToast()
 const { prefs, load: loadPrefs, save: savePrefs } = usePrefs()
-const { isLoggedIn, loadMe } = useAuth()
+const { isLoggedIn, loadMe, isExceeded: authQuotaExceeded, resetInHours: authResetInHours, resetAtLabel: authResetAtLabel } =
+  useAuth()
 
 const searchBoxRef = ref<InstanceType<typeof SearchBox> | null>(null)
 const loading = ref(false)
@@ -362,7 +363,10 @@ const resultsTimings = computed<SearchTimings>(() => responseTimings.value ?? {
 })
 
 /** 配额提示（T3.2 新契约：只按百分比判断；字段缺失时不提示、不阻断） */
-const quotaExceeded = computed(() => quota.value?.exceeded === true)
+// 额度耗尽：搜索响应里有就用它；否则用 `GET /me` 的权威视图 —— 搜索响应的 quota 只投影百分比
+// （后端 `toQuotaResponse` 只看 used_pct/remaining_pct），`exceeded` 只在 /me 的完整视图里。
+// 每次检索成功/结束后 index.vue 都会 `loadMe()` 刷新，所以这里的值紧跟当前窗口。
+const quotaExceeded = computed(() => quota.value?.exceeded === true || authQuotaExceeded.value)
 
 const quotaRemainingPct = computed<number | null>(() => {
   const q = quota.value
@@ -378,11 +382,20 @@ const quotaWarning = computed(() => {
   return pct !== null && pct < 10
 })
 
+/**
+ * 距重置的小时数：优先 `/me` 的**网格锚定**值（R6，重置时刻固定可预测）；
+ * 退化路径保留旧契约（搜索响应里若有 window_start + window_hours 就现算）。
+ */
 const quotaResetHours = computed<number | null>(() => {
+  const hours = authResetInHours.value
+  if (hours !== null) return hours
   const q = quota.value
   if (!q || typeof q.window_start !== "number" || typeof q.window_hours !== "number") return null
   return Math.max(1, Math.ceil((q.window_start + q.window_hours * 3600e3 - Date.now()) / 3600e3))
 })
+
+/** 下次重置的本地时刻文案（HH:MM）；来自 /me 且**仅客户端**渲染（预渲染阶段为 null，防水合不一致） */
+const quotaResetAtLabel = computed<string | null>(() => authResetAtLabel.value)
 
 function onQuickSearch(queryText: string) {
   if (searchBoxRef.value) {
