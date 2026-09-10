@@ -104,11 +104,43 @@ export interface CorpusOption {
   desc?: string
 }
 
-/** 自定义模型配置（tasks.md T3.5，后端未定稿；api_key 只在提交瞬间存在内存里） */
+/** 自定义模型配置（tasks.md T3.5；api_key 只在提交瞬间存在内存里，绝不写 localStorage） */
 export interface ModelSettingsRequest {
+  /** 用户可见标签（可选，仅用于列表展示） */
+  name?: string
+  /** 传入已有 id 表示更新该行；缺省为新建 */
+  id?: string
   base_url: string
   model: string
   api_key: string
+}
+
+/**
+ * 自定义模型列表项（GET /api/v1/settings/models，T3.5，已上线）。
+ * ⚠️ 后端**只回元信息**：不含 key 明文，也不含密文；
+ * `key_configured` 仅表示「该行配置过 key」，恒为 true（本表只存密文，读不出明文）。
+ */
+export interface CustomModelListItem {
+  id: string
+  /** 用户可见标签，可能为空串（前端展示「未命名」） */
+  name: string
+  base_url: string
+  model: string
+  key_configured: boolean
+  /** 毫秒时间戳 */
+  created_at: number
+  updated_at: number
+}
+
+/** GET /api/v1/settings/models 返回体 */
+export interface ModelListResponse {
+  models: CustomModelListItem[]
+}
+
+/** DELETE /api/v1/settings/models/:id 返回体（越权/不存在 → 404 {error:"not-found"}） */
+export interface ModelDeleteResponse {
+  ok?: boolean
+  deleted?: number
 }
 
 /** 管理接口的宽松返回体（T3.3/T3.6，后端未定稿，页面按字段存在与否降级渲染） */
@@ -449,7 +481,7 @@ export function useApi() {
   }
 
   /**
-   * 自定义模型配置（POST /api/v1/settings/models，T3.5）。
+   * 自定义模型配置（POST /api/v1/settings/models，T3.5，已上线）。
    * 后端为复数 `models`；若 404 再尝试任务书里的单数 `model`，两者都 404 → 提示「接口未实现」。
    */
   async function saveModelSettings(payload: ModelSettingsRequest): Promise<Record<string, unknown>> {
@@ -467,6 +499,26 @@ export function useApi() {
     }
   }
 
+  /**
+   * 本人已保存的自定义模型列表（GET /api/v1/settings/models，T3.5，需 Bearer）。
+   * 响应只含元信息（id/name/base_url/model/key_configured/created_at/updated_at），**永不含 key**。
+   * 未登录 → 401 {error:"unauthorized"}。
+   */
+  async function listModels(): Promise<ModelListResponse> {
+    return request<ModelListResponse>("/v1/settings/models")
+  }
+
+  /**
+   * 删除本人的某个自定义模型（DELETE /api/v1/settings/models/:id，T3.5，需 Bearer）。
+   * 成功 → `{ok:true, deleted:1}`；越权/不存在 → 404 `{error:"not-found"}`；缺 D1 → 503。
+   * id 来自 listModels()，只做 URL 编码，绝不写进日志。
+   */
+  async function deleteModel(id: string): Promise<ModelDeleteResponse> {
+    return request<ModelDeleteResponse>(`/v1/settings/models/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    })
+  }
+
   return {
     search,
     searchStream,
@@ -478,6 +530,8 @@ export function useApi() {
     adminBan,
     adminQuota,
     saveModelSettings,
+    listModels,
+    deleteModel,
     baseURL,
     /** 是否已持有会话 token（模板里做条件渲染用，不暴露 token 本身） */
     hasToken: () => !!readAuthToken(),

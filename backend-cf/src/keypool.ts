@@ -263,26 +263,50 @@ export function shouldRetryStatus(status: number): boolean {
  * - 换过 key 后仍失败则抛错给上层做最终降级。
  * 只重试一次，避免无限重试拖垮配额。
  */
+/** 一次上游尝试的结果（仅供调用方记账，不参与重试决策）。 */
+export interface KeyAttemptRecord {
+  keyRef: string
+  status: "ok" | "failed"
+  statusCode?: number
+  latencyMs: number
+}
+
+/**
+ * 取一把 key 执行 attempt，失败按 shouldRetryStatus 换 key 重试。
+ * `options.onAttempt` 在**每次尝试结束**时回调一次（成功/失败都回调），供 embeddings/rerank 记账；
+ * 回调内抛错会被吞掉，绝不影响业务链路。
+ */
 export async function withKeyRetry(
   pool: KeyPool,
   poolName: PoolName,
   attempt: (key: PoolKey) => Promise<ResponseLike>,
-  options: { maxRetries?: number } = {},
+  options: { maxRetries?: number; onAttempt?: (rec: KeyAttemptRecord) => void } = {},
 ): Promise<ResponseLike> {
   const maxRetries = options.maxRetries ?? 1
+  const notify = (rec: KeyAttemptRecord): void => {
+    try {
+      options.onAttempt?.(rec)
+    } catch {
+      // 记账回调绝不阻断业务
+    }
+  }
   let key = pool.pickKey(poolName)
   if (!key) throw new Error(`keypool: pool=${poolName} 无可用 key`)
 
   let lastError: Error | null = null
   for (let attemptNo = 0; attemptNo <= maxRetries; attemptNo++) {
+    const t0 = Date.now()
     try {
       const resp = await attempt(key)
+      const latencyMs = Date.now() - t0
       if (resp.ok) {
         pool.releaseKey(poolName, key.ref)
+        notify({ keyRef: key.ref, status: "ok", statusCode: resp.status, latencyMs })
         return resp
       }
       if (shouldRetryStatus(resp.status) && attemptNo < maxRetries) {
         // 换 key：记失败，取下一个，续试
+        notify({ keyRef: key.ref, status: "failed", statusCode: resp.status, latencyMs })
         await pool.reportFailure(poolName, key.ref, `upstream-${resp.status}`)
         const next = pool.pickKey(poolName)
         if (!next) throw new Error(`keypool: pool=${poolName} 换 key 后仍无可用 key（首错 status=${resp.status}）`)
@@ -291,8 +315,10 @@ export async function withKeyRetry(
       }
       // 非可换 key 错误码（如 400 参数错），或已到重试上限：失败并释放
       pool.releaseKey(poolName, key.ref)
+      notify({ keyRef: key.ref, status: "failed", statusCode: resp.status, latencyMs })
       return resp
     } catch (e) {
+      notify({ keyRef: key.ref, status: "failed", latencyMs: Date.now() - t0 })
       lastError = e as Error
       if (attemptNo < maxRetries) {
         await pool.reportFailure(poolName, key.ref, `error:${((e as Error).message ?? "unknown").slice(0, 200)}`)
@@ -307,3 +333,4 @@ export async function withKeyRetry(
   }
   throw lastError ?? new Error(`keypool: pool=${poolName} 重试耗尽`)
 }
+

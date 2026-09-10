@@ -3,13 +3,19 @@
 // 全 mock：D1（记录 SQL+bind）、KV（内存，可注入失败）、JWT（真实签发，无网络）。零网络。
 // 覆盖：
 //   ① /admin/usage 聚合与 limitTokens(env) 一致、封禁状态、窗口过期、缺 D1 → 503；
-//   ② /admin/keys 只出 ref（**响应 JSON 里不得出现 sk- 形状**）、pools 与 env 一致、DB 空 → 空数组；
-//   ③ POST /admin/keys 的 upsert + 审计（key_enable/key_disable、target=key_ref）+ KV 运行时效；
-//   ④ admin 鉴权二选一：ADMIN_API_KEY 或 JWT role=admin（含「未配 key + JWT admin → 放行」）。
+//   ② /admin/usage 的 key_usage 账号维度真值（requests / llm_tokens_in / llm_tokens_out）：
+//      窗口外不计、匿名不计、endpoint!='chat' 不计 token、无数据为 0；
+//   ③ /admin/keys 只出 ref（**响应 JSON 里不得出现 sk- 形状**）、pools 与 env 一致、DB 空 → 空数组；
+//   ④ POST /admin/keys 的 upsert + 审计（key_enable/key_disable、target=key_ref）+ KV 运行时效；
+//   ⑤ POST /admin/db/apply-schema 的迁移容错（duplicate column name / 全新库 no such table → 成功；
+//      其它错误 → failed + 207）；
+//   ⑥ admin 鉴权二选一：ADMIN_API_KEY 或 JWT role=admin（含「未配 key + JWT admin → 放行」）。
 import { describe, it, expect, vi, afterEach } from "vitest"
 import { app } from "../src/index"
 import { issueSession } from "../src/auth"
 import { KEY_DENY_PREFIX } from "../src/keyadmin"
+import { SCHEMA_MIGRATIONS, SCHEMA_STATEMENTS } from "../src/db/schemaStatements"
+import { aggregateKeyUsage, resolveWindowStart } from "../src/adminstats"
 import type { Env } from "../src/types"
 
 afterEach(() => {
@@ -21,14 +27,17 @@ const EMBED_SECRETS = ["sk-fake-embed-0001", "sk-fake-embed-0002"]
 const LLM_SECRETS = ["sk-fake-llm-0001"]
 
 const NOW = Date.now()
+/** 默认 fixture 的窗口起点（= 1 小时前；QUOTA_WINDOW_HOURS=5 → 窗口内）。 */
+const WINDOW_START = NOW - 3_600_000
 
 /** D1 mock：按 SQL 形状返回预置行，并记录每次 bind 的 sql+args。 */
 function makeDb(
   opts: {
     usageRows?: unknown[]
+    keyUsageRows?: unknown[]
     keyRows?: unknown[]
     auditRows?: unknown[]
-    fail?: "usage" | "keys" | "all"
+    fail?: "usage" | "keyusage" | "keys" | "all"
   } = {},
 ) {
   const calls: Array<{ sql: string; args: unknown[]; op: "run" | "all" | "first" }> = []
@@ -47,6 +56,10 @@ function makeDb(
         },
         async all() {
           calls.push({ sql, args: stmt.args, op: "all" })
+          if (/FROM key_usage/i.test(sql)) {
+            if (opts.fail === "keyusage" || opts.fail === "all") throw new Error("d1-failed")
+            return { success: true, results: opts.keyUsageRows ?? [], meta: { changes: 0 } }
+          }
           if (/FROM accounts/i.test(sql)) {
             if (opts.fail === "usage" || opts.fail === "all") throw new Error("d1-failed")
             return { success: true, results: opts.usageRows ?? [], meta: { changes: 0 } }
@@ -122,14 +135,14 @@ function usageRows() {
       account_id: "acc-1",
       status: "active",
       created_at: NOW - 60_000,
-      period_start: NOW - 3_600_000,
+      period_start: WINDOW_START,
       used_cost: 250,
     },
     {
       account_id: "acc-2",
       status: "active",
       created_at: NOW - 50_000,
-      period_start: NOW - 3_600_000,
+      period_start: WINDOW_START,
       used_cost: 1500, // 超限 → used_pct 夹到 100
     },
     {
@@ -139,6 +152,33 @@ function usageRows() {
       period_start: null, // 无 quotas 行（LEFT JOIN → NULL）
       used_cost: null,
     },
+  ]
+}
+
+/**
+ * key_usage 窗口粗筛行（account_id / endpoint / tokens_in / tokens_out / created_at）。
+ * 期望结果：
+ *   acc-1 → requests 4（embeddings + rerank + 2×chat）+ 窗口外/未来行不计
+ *           llm_tokens_in 100 / out 200（只有 chat 累加：100/200 + 0/0）
+ *   acc-2 → requests 1、in 10 / out 20
+ *   acc-3 → 全 0（无 quotas 行 → 窗口起点 = now，任何历史行都不在窗口内）
+ *   匿名（''）与未知账号（acc-gone）不计入任何 item
+ */
+function keyUsageRows() {
+  return [
+    { account_id: "acc-1", endpoint: "embeddings", tokens_in: 7, tokens_out: 0, created_at: WINDOW_START + 1_000 },
+    { account_id: "acc-1", endpoint: "rerank", tokens_in: 5, tokens_out: 0, created_at: WINDOW_START + 2_000 },
+    { account_id: "acc-1", endpoint: "chat", tokens_in: 100, tokens_out: 200, created_at: WINDOW_START + 3_000 },
+    { account_id: "acc-1", endpoint: "chat", tokens_in: 0, tokens_out: 0, created_at: WINDOW_START + 4_000 },
+    // 窗口外（早于 window_start 1ms）→ 不计入
+    { account_id: "acc-1", endpoint: "chat", tokens_in: 999, tokens_out: 999, created_at: WINDOW_START - 1 },
+    // 未来行（时钟回拨/写入异常）→ 不计入
+    { account_id: "acc-1", endpoint: "chat", tokens_in: 888, tokens_out: 888, created_at: NOW + 60_000 },
+    { account_id: "acc-2", endpoint: "chat", tokens_in: 10, tokens_out: 20, created_at: WINDOW_START + 5_000 },
+    // 匿名调用：记了账但不归属账号
+    { account_id: "", endpoint: "chat", tokens_in: 500, tokens_out: 500, created_at: WINDOW_START + 6_000 },
+    // 已不存在的账号（不在本次 items 清单里）
+    { account_id: "acc-gone", endpoint: "chat", tokens_in: 700, tokens_out: 700, created_at: WINDOW_START + 7_000 },
   ]
 }
 
@@ -172,7 +212,7 @@ function keyRows() {
 
 describe("GET /api/v1/admin/usage", () => {
   it("聚合正确：used_pct 与 limitTokens(env) 一致、封禁状态透出、total 汇总", async () => {
-    const { db } = makeDb({ usageRows: usageRows(), keyRows: keyRows() })
+    const { db } = makeDb({ usageRows: usageRows(), keyUsageRows: keyUsageRows(), keyRows: keyRows() })
     const resp = await app.request(
       "/api/v1/admin/usage",
       { headers: { Authorization: "Bearer admin-secret" } },
@@ -197,12 +237,19 @@ describe("GET /api/v1/admin/usage", () => {
     expect(acc1.remaining_pct).toBe(75)
     expect(acc1.exceeded).toBe(false)
     expect(acc1.status).toBe("active")
-    expect(acc1.window_start).toBe(NOW - 3_600_000)
+    expect(acc1.window_start).toBe(WINDOW_START)
+    // 账号维度用量真值（不再是 null）：见 keyUsageRows() 的口径注释
+    expect(acc1.requests).toBe(4)
+    expect(acc1.llm_tokens_in).toBe(100)
+    expect(acc1.llm_tokens_out).toBe(200)
 
     const acc2 = body.items.find((i) => i.account_id === "acc-2")!
     expect(acc2.used_pct).toBe(100) // 150% 夹到 100
     expect(acc2.remaining_pct).toBe(0)
     expect(acc2.exceeded).toBe(true)
+    expect(acc2.requests).toBe(1)
+    expect(acc2.llm_tokens_in).toBe(10)
+    expect(acc2.llm_tokens_out).toBe(20)
 
     // 封禁账号：状态原样透出，且没有 quotas 行 → used 0
     const acc3 = body.items.find((i) => i.account_id === "acc-3")!
@@ -210,10 +257,16 @@ describe("GET /api/v1/admin/usage", () => {
     expect(acc3.used_tokens).toBe(0)
     expect(acc3.used_pct).toBe(0)
     expect(acc3.exceeded).toBe(false)
+    // 无 quotas 行 = 窗口起点是 now → 窗口内用量 0（不是 null）
+    expect(acc3.window_start).toBeGreaterThanOrEqual(NOW)
+    expect(acc3.requests).toBe(0)
+    expect(acc3.llm_tokens_in).toBe(0)
+    expect(acc3.llm_tokens_out).toBe(0)
 
-    // requests / llm_tokens_* 无法从 key_usage 归属到账号 → 如实 null（不编造）
-    expect(body.items.every((i) => i.requests === null)).toBe(true)
-    expect(body.items.every((i) => i.llm_tokens_in === null && i.llm_tokens_out === null)).toBe(true)
+    // 三个数字现在是**真值**（number），不再有 null
+    expect(body.items.every((i) => typeof i.requests === "number")).toBe(true)
+    expect(body.items.every((i) => typeof i.llm_tokens_in === "number")).toBe(true)
+    expect(body.items.every((i) => typeof i.llm_tokens_out === "number")).toBe(true)
 
     // keys[] 是 provider_keys 的脱敏投影
     expect(body.keys).toHaveLength(2)
@@ -292,6 +345,342 @@ describe("GET /api/v1/admin/usage", () => {
     )
     expect(resp.status).toBe(503)
     expect(await resp.json()).toEqual({ error: "db-unavailable" })
+  })
+})
+
+// ────────── key_usage 账号维度聚合：requests / llm_tokens_in / llm_tokens_out ──────────
+
+describe("/admin/usage 的 key_usage 账号维度真值", () => {
+  /** 跑一次 /admin/usage，返回 items（按 account_id 索引）+ D1 调用记录。 */
+  async function fetchItems(opts: Parameters<typeof makeDb>[0], env: Partial<Env> = {}) {
+    const { db, calls } = makeDb(opts)
+    const resp = await app.request(
+      "/api/v1/admin/usage",
+      { headers: { Authorization: "Bearer admin-secret" } },
+      makeEnv({ DB: db, ...env }),
+    )
+    expect(resp.status).toBe(200)
+    const body = (await resp.json()) as {
+      items: Array<{
+        account_id: string
+        requests: number
+        llm_tokens_in: number
+        llm_tokens_out: number
+        window_start: number
+      }>
+    }
+    const byId = new Map(body.items.map((i) => [i.account_id, i]))
+    return { byId, items: body.items, calls }
+  }
+
+  it("窗口内计数；窗口外/未来/匿名/未知账号不计；embed|rerank 只计请求不计 token", async () => {
+    const { byId } = await fetchItems({ usageRows: usageRows(), keyUsageRows: keyUsageRows() })
+
+    expect(byId.get("acc-1")!.requests).toBe(4) // embeddings + rerank + 2×chat（窗口外与未来行被剔除）
+    expect(byId.get("acc-1")!.llm_tokens_in).toBe(100) // 只有 chat 的 100 计入（embeddings 7 / rerank 5 / 999 / 888 都不计）
+    expect(byId.get("acc-1")!.llm_tokens_out).toBe(200)
+
+    expect(byId.get("acc-2")!.requests).toBe(1)
+    expect(byId.get("acc-2")!.llm_tokens_in).toBe(10)
+    expect(byId.get("acc-2")!.llm_tokens_out).toBe(20)
+
+    // 无 quotas 行的账号 = 新窗口（window_start 上移到 now）→ 历史行全在窗口外
+    expect(byId.get("acc-3")!.requests).toBe(0)
+    expect(byId.get("acc-3")!.llm_tokens_in).toBe(0)
+    expect(byId.get("acc-3")!.llm_tokens_out).toBe(0)
+
+    // 匿名（''）与已删除账号（acc-gone）不产生 item
+    expect(byId.has("")).toBe(false)
+    expect(byId.has("acc-gone")).toBe(false)
+    expect(byId.size).toBe(3)
+  })
+
+  it("没有任何 key_usage 行 → 三个数字都是 0（不是 null）", async () => {
+    const { byId } = await fetchItems({ usageRows: usageRows(), keyUsageRows: [] })
+    for (const item of byId.values()) {
+      expect(item.requests).toBe(0)
+      expect(item.llm_tokens_in).toBe(0)
+      expect(item.llm_tokens_out).toBe(0)
+    }
+  })
+
+  it("窗口已过期 → 只统计「新窗口」内的行（旧行归 0）", async () => {
+    const rows = [
+      { account_id: "acc-old", status: "active", created_at: 1, period_start: NOW - 6 * 3_600_000, used_cost: 900 },
+    ]
+    const { byId, calls } = await fetchItems({
+      usageRows: rows,
+      keyUsageRows: [
+        // 1 小时前 = 旧窗口内、新窗口（= now）外 → 不计
+        { account_id: "acc-old", endpoint: "chat", tokens_in: 42, tokens_out: 43, created_at: NOW - 3_600_000 },
+      ],
+    })
+    expect(byId.get("acc-old")!.requests).toBe(0)
+    expect(byId.get("acc-old")!.llm_tokens_in).toBe(0)
+    expect(byId.get("acc-old")!.llm_tokens_out).toBe(0)
+    // 粗筛下界 = 该账号（新窗口）起点；窗口外行由 JS 侧剔除，不依赖 SQL
+    const usageQuery = calls.find((c) => /FROM key_usage/i.test(c.sql))!
+    expect(usageQuery.args[0]).toBeGreaterThan(NOW - 1000)
+  })
+
+  it("无账号（accounts 空）→ 不发 key_usage 查询；有账号时只发一条（无 N+1）", async () => {
+    const empty = await fetchItems({ usageRows: [] })
+    expect(empty.items).toHaveLength(0)
+    expect(empty.calls.some((c) => /FROM key_usage/i.test(c.sql))).toBe(false)
+
+    const full = await fetchItems({ usageRows: usageRows(), keyUsageRows: keyUsageRows() })
+    const usageQueries = full.calls.filter((c) => /FROM key_usage/i.test(c.sql))
+    expect(usageQueries).toHaveLength(1)
+    // SQL 里做了「排除匿名」的粗筛，且带时间下界/上界（窗口并集）
+    expect(usageQueries[0].sql).toContain("account_id <> ''")
+    expect(usageQueries[0].sql).toContain("created_at >= ?")
+    expect(usageQueries[0].sql).toContain("created_at <= ?")
+    expect(usageQueries[0].args).toEqual([WINDOW_START, expect.any(Number)])
+    // 只读：整个请求不产生写语句
+    expect(full.calls.every((c) => c.op === "all")).toBe(true)
+  })
+})
+
+describe("aggregateKeyUsage（纯函数，窗口 / endpoint 口径）", () => {
+  const NOW2 = 1_700_000_000_000
+  const starts = new Map([["acc-1", NOW2 - 1_000]])
+
+  it("窗口内 chat 行累加 token，embed/rerank 只算请求", () => {
+    const agg = aggregateKeyUsage(
+      [
+        { account_id: "acc-1", endpoint: "chat", tokens_in: 10, tokens_out: 20, created_at: NOW2 - 500 },
+        { account_id: "acc-1", endpoint: "embeddings", tokens_in: 999, tokens_out: 999, created_at: NOW2 - 400 },
+        { account_id: "acc-1", endpoint: "rerank", tokens_in: 999, tokens_out: 0, created_at: NOW2 - 300 },
+      ],
+      starts,
+      NOW2,
+    )
+    expect(agg.get("acc-1")).toEqual({ requests: 3, llm_tokens_in: 10, llm_tokens_out: 20 })
+  })
+
+  it("窗口外（早于起点 / 晚于 now）、匿名、未知账号、脏 created_at 均不计入", () => {
+    const agg = aggregateKeyUsage(
+      [
+        { account_id: "acc-1", endpoint: "chat", tokens_in: 1, tokens_out: 1, created_at: NOW2 - 1_001 },
+        { account_id: "acc-1", endpoint: "chat", tokens_in: 1, tokens_out: 1, created_at: NOW2 + 1 },
+        { account_id: "", endpoint: "chat", tokens_in: 1, tokens_out: 1, created_at: NOW2 - 500 },
+        { account_id: "acc-gone", endpoint: "chat", tokens_in: 1, tokens_out: 1, created_at: NOW2 - 500 },
+        { account_id: "acc-1", endpoint: "chat", tokens_in: 1, tokens_out: 1, created_at: null },
+      ],
+      starts,
+      NOW2,
+    )
+    // null 会被 Number(null)=0 视作 0（远早于窗口起点）→ 仍不计入
+    expect(agg.get("acc-1")).toBeUndefined()
+    expect(agg.size).toBe(0)
+  })
+
+  it("负数 / 小数 token 夹到非负整数；边界时刻（= window_start / = now）计入", () => {
+    const agg = aggregateKeyUsage(
+      [
+        { account_id: "acc-1", endpoint: "chat", tokens_in: -5, tokens_out: 2.7, created_at: NOW2 - 1_000 },
+        { account_id: "acc-1", endpoint: "chat", tokens_in: 3, tokens_out: "4", created_at: NOW2 },
+      ],
+      starts,
+      NOW2,
+    )
+    expect(agg.get("acc-1")).toEqual({ requests: 2, llm_tokens_in: 3, llm_tokens_out: 6 })
+  })
+
+  it("resolveWindowStart 与 quota 口径一致：缺失/过期/未来 → now", () => {
+    const env = { QUOTA_WINDOW_HOURS: "5" }
+    const wms = 5 * 3_600_000
+    expect(resolveWindowStart(NOW2 - 1_000, NOW2, env)).toBe(NOW2 - 1_000)
+    expect(resolveWindowStart(NOW2 - wms, NOW2, env)).toBe(NOW2) // 恰好到期 = 新窗口
+    expect(resolveWindowStart(null, NOW2, env)).toBe(NOW2)
+    expect(resolveWindowStart(NOW2 + 1, NOW2, env)).toBe(NOW2) // 时钟回拨
+  })
+})
+
+// ─────────────────────────── POST /admin/db/apply-schema ───────────────────────────
+
+describe("POST /api/v1/admin/db/apply-schema（迁移容错）", () => {
+  /** D1 mock：按语句内容决定抛什么错；`ran` 只记录 DDL 语句（审计 INSERT 不计入）。 */
+  function makeSchemaDb(failFor: (sql: string) => string | null = () => null) {
+    const ran: string[] = []
+    const db = {
+      prepare(sql: string) {
+        const stmt = {
+          args: [] as unknown[],
+          bind(...args: unknown[]) {
+            stmt.args = args
+            return stmt
+          },
+          async run() {
+            if (/^(ALTER|CREATE)/i.test(sql)) ran.push(sql)
+            const msg = failFor(sql)
+            if (msg) throw new Error(msg)
+            return { success: true, results: [], meta: { changes: 1 } }
+          },
+          async all() {
+            return { success: true, results: [], meta: { changes: 0 } }
+          },
+          async first() {
+            return null
+          },
+        }
+        return stmt
+      },
+      async batch(stmts: unknown[]) {
+        return stmts
+      },
+    } as unknown as D1Database
+    return { db, ran }
+  }
+
+  const TOTAL = SCHEMA_STATEMENTS.length + SCHEMA_MIGRATIONS.length
+  const ALTER_ACCOUNT_ID = SCHEMA_MIGRATIONS[0]
+
+  it("顺序：迁移语句先跑（线上老表先补列），随后才是幂等建表", async () => {
+    const { db, ran } = makeSchemaDb()
+    const resp = await app.request(
+      "/api/v1/admin/db/apply-schema",
+      { method: "POST", headers: { Authorization: "Bearer admin-secret" } },
+      makeEnv({ DB: db }),
+    )
+    expect(resp.status).toBe(200)
+    const body = (await resp.json()) as { ok: boolean; applied: number; total: number; tolerated: unknown[]; failed: unknown[] }
+    expect(body.ok).toBe(true)
+    expect(body.total).toBe(TOTAL)
+    expect(body.applied).toBe(TOTAL)
+    expect(body.tolerated).toEqual([])
+    expect(body.failed).toEqual([])
+    expect(ran[0]).toContain("ALTER TABLE key_usage ADD COLUMN account_id")
+    expect(ran[0]).toBe(ALTER_ACCOUNT_ID)
+    // 补列语句后面紧跟的建表/索引语句都在
+    expect(ran.join("\n")).toContain("idx_key_usage_account_created")
+  })
+
+  it("已迁移/新库：ALTER 报 duplicate column name → 视为成功（tolerated，不 failed）", async () => {
+    const { db, ran } = makeSchemaDb((sql) =>
+      sql.startsWith("ALTER TABLE key_usage") ? "SQLITE_ERROR: duplicate column name: account_id" : null,
+    )
+    const resp = await app.request(
+      "/api/v1/admin/db/apply-schema",
+      { method: "POST", headers: { Authorization: "Bearer admin-secret" } },
+      makeEnv({ DB: db }),
+    )
+    expect(resp.status).toBe(200)
+    const body = (await resp.json()) as {
+      ok: boolean
+      applied: number
+      tolerated: Array<{ stmt: string; error: string }>
+      failed: unknown[]
+    }
+    expect(body.ok).toBe(true)
+    expect(body.applied).toBe(TOTAL)
+    expect(body.failed).toEqual([])
+    expect(body.tolerated).toHaveLength(1)
+    expect(body.tolerated[0].error).toContain("duplicate column name")
+    expect(ran.length).toBe(TOTAL) // 容忍 = 继续跑完，不是中断
+  })
+
+  it("全新库：ALTER 报 no such table → 视为成功（随后 CREATE TABLE 自带该列）", async () => {
+    const { db } = makeSchemaDb((sql) =>
+      sql.startsWith("ALTER TABLE key_usage") ? "SQLITE_ERROR: no such table: key_usage" : null,
+    )
+    const resp = await app.request(
+      "/api/v1/admin/db/apply-schema",
+      { method: "POST", headers: { Authorization: "Bearer admin-secret" } },
+      makeEnv({ DB: db }),
+    )
+    expect(resp.status).toBe(200)
+    const body = (await resp.json()) as { ok: boolean; tolerated: unknown[]; failed: unknown[] }
+    expect(body.ok).toBe(true)
+    expect(body.tolerated).toHaveLength(1)
+    expect(body.failed).toEqual([])
+  })
+
+  it("其它错误（如索引缺列）仍计入 failed → 207 ok:false（绝不假绿）", async () => {
+    const { db } = makeSchemaDb((sql) =>
+      sql.includes("idx_key_usage_account_created") ? "SQLITE_ERROR: no such column: account_id" : null,
+    )
+    const resp = await app.request(
+      "/api/v1/admin/db/apply-schema",
+      { method: "POST", headers: { Authorization: "Bearer admin-secret" } },
+      makeEnv({ DB: db }),
+    )
+    expect(resp.status).toBe(207)
+    const body = (await resp.json()) as {
+      ok: boolean
+      applied: number
+      tolerated: unknown[]
+      failed: Array<{ stmt: string; error: string }>
+    }
+    expect(body.ok).toBe(false)
+    expect(body.applied).toBe(TOTAL - 1)
+    expect(body.tolerated).toEqual([])
+    expect(body.failed).toHaveLength(1)
+    expect(body.failed[0].error).toContain("no such column")
+  })
+
+  it("CREATE 语句报 no such table 不算容忍（只有 ALTER 容忍），仍 failed", async () => {
+    const { db } = makeSchemaDb((sql) =>
+      sql.includes("idx_key_usage_account_created") ? "SQLITE_ERROR: no such table: key_usage" : null,
+    )
+    const resp = await app.request(
+      "/api/v1/admin/db/apply-schema",
+      { method: "POST", headers: { Authorization: "Bearer admin-secret" } },
+      makeEnv({ DB: db }),
+    )
+    expect(resp.status).toBe(207)
+    expect(((await resp.json()) as { failed: unknown[] }).failed).toHaveLength(1)
+  })
+
+  it("审计留痕（action=apply_schema，含 tolerated 计数）；缺 D1 → 503", async () => {
+    const { db, ran } = makeSchemaDb()
+    const auditRows: Array<{ sql: string; args: unknown[] }> = []
+    const auditDb = {
+      prepare(sql: string) {
+        const stmt = {
+          args: [] as unknown[],
+          bind(...args: unknown[]) {
+            stmt.args = args
+            return stmt
+          },
+          async run() {
+            if (/INSERT INTO audit_log/i.test(sql)) auditRows.push({ sql, args: stmt.args })
+            if (/^(ALTER|CREATE)/i.test(sql)) ran.push(sql)
+            return { success: true, results: [], meta: { changes: 1 } }
+          },
+          async all() {
+            return { success: true, results: [], meta: { changes: 0 } }
+          },
+          async first() {
+            return null
+          },
+        }
+        return stmt
+      },
+      async batch(stmts: unknown[]) {
+        return stmts
+      },
+    } as unknown as D1Database
+    void db
+
+    const resp = await app.request(
+      "/api/v1/admin/db/apply-schema",
+      { method: "POST", headers: { Authorization: "Bearer admin-secret" } },
+      makeEnv({ DB: auditDb }),
+    )
+    expect(resp.status).toBe(200)
+    expect(auditRows).toHaveLength(1)
+    expect(auditRows[0].args[1]).toBe("admin") // actor（API key 通道）
+    expect(auditRows[0].args[2]).toBe("apply_schema")
+    expect(String(auditRows[0].args[4])).toContain(`tolerated=0 failed=0`)
+
+    const missing = await app.request(
+      "/api/v1/admin/db/apply-schema",
+      { method: "POST", headers: { Authorization: "Bearer admin-secret" } },
+      makeEnv(),
+    )
+    expect(missing.status).toBe(503)
+    expect(await missing.json()).toEqual({ error: "db-unconfigured" })
   })
 })
 

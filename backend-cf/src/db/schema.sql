@@ -69,12 +69,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_keys_pool_ref
   ON provider_keys (pool, key_ref);
 
 -- ─────────────────────────────────────────────
--- Key 用量记账（key_usage）：每次模型调用记录，admin 可查"哪个号烧了多少"。
+-- Key 用量记账（key_usage）：每次模型调用记录，admin 可查"哪个号烧了多少 / 哪个账号用了多少"。
+-- `account_id` 是账号维度归属：发起这次调用的账号（匿名调用记空串 ''，仍照记账）。
+-- ⚠️ 历史表补列（SQLite 没有 ADD COLUMN IF NOT EXISTS，CREATE TABLE IF NOT EXISTS 也不会补列）：
+--    ALTER TABLE key_usage ADD COLUMN account_id TEXT NOT NULL DEFAULT '';
+--    该 ALTER **故意不写在本文件**（会被 schemaStatements 的派生逻辑当成建表语句、破坏"逐条一致"语义），
+--    而是由 src/db/schemaStatements.ts 的 SCHEMA_MIGRATIONS 单独导出，并在
+--    POST /api/v1/admin/db/apply-schema 里把 "duplicate column name" 视为成功（新库/已迁移）后继续。
 -- ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS key_usage (
   id            TEXT PRIMARY KEY,
   pool          TEXT NOT NULL,
   key_ref       TEXT NOT NULL,                  -- 与 provider_keys.key_ref 对应
+  account_id    TEXT NOT NULL DEFAULT '',       -- 归属账号（'' = 匿名调用）
   endpoint      TEXT NOT NULL,                  -- embeddings | rerank | chat
   model         TEXT,
   status        TEXT NOT NULL,                  -- ok | failed
@@ -88,6 +95,10 @@ CREATE TABLE IF NOT EXISTS key_usage (
 
 CREATE INDEX IF NOT EXISTS idx_key_usage_key_created
   ON key_usage (key_ref, created_at);
+
+-- /admin/usage 按「账号 + 窗口」聚合（requests / llm_tokens_in / llm_tokens_out）走这条索引。
+CREATE INDEX IF NOT EXISTS idx_key_usage_account_created
+  ON key_usage (account_id, created_at);
 
 -- ─────────────────────────────────────────────
 -- 导入运行记录（ingest_runs）：每次 ingest 的元数据（M2 起由 cron/consumer 写入）。

@@ -35,7 +35,8 @@
             </button>
             <button
               type="button"
-              class="rounded-lg bg-primary px-4 py-2 text-xs font-medium text-white transition-opacity hover:opacity-90"
+              class="rounded-lg px-4 py-2 text-xs font-medium text-white transition-colors"
+              :class="danger ? 'bg-red-600 hover:bg-red-700' : 'bg-primary hover:opacity-90'"
               @click="$emit('confirm')"
             >
               {{ confirmText }}
@@ -56,8 +57,10 @@ const props = withDefaults(
     title: string
     confirmText?: string
     cancelText?: string
+    /** 破坏性操作（删除等）用红色确认按钮；默认 false，不影响既有调用方 */
+    danger?: boolean
   }>(),
-  { confirmText: "确认", cancelText: "取消" },
+  { confirmText: "确认", cancelText: "取消", danger: false },
 )
 
 const emit = defineEmits<{

@@ -137,13 +137,31 @@ export class SiliconFlowEmbedding implements EmbeddingProvider {
   async embed(text: string, opts?: EmbedOpts): Promise<number[]> {
     const kind = opts?.kind ?? "document"
     const input = this.buildInput(text, kind)
-    const resp = await withKeyRetry(this.pool, "embed", (key) =>
-      this.callEmbedding(key, input, kind).then((r) => ({
-        ok: r.ok,
-        status: r.status,
-        json: () => Promise.resolve(r.data),
-        text: () => Promise.resolve(r.text ?? ""),
-      })),
+    const resp = await withKeyRetry(
+      this.pool,
+      "embed",
+      (key) =>
+        this.callEmbedding(key, input, kind).then((r) => ({
+          ok: r.ok,
+          status: r.status,
+          json: () => Promise.resolve(r.data),
+          text: () => Promise.resolve(r.text ?? ""),
+        })),
+      {
+        // 记账（T3.2/T3.3）：把检索用量的 key/结果/耗时写进 key_usage，便于按账号统计
+        onAttempt: (rec) => {
+          void this.pool.recordUsage({
+            pool: "embed",
+            keyRef: rec.keyRef,
+            endpoint: "embeddings",
+            model: this.model,
+            status: rec.status,
+            statusCode: rec.statusCode,
+            latencyMs: rec.latencyMs,
+            tokensIn: estimateTokens([input]),
+          })
+        },
+      },
     )
     if (!resp.ok) {
       // 换 key 后仍失败：抛错给上层降级（§8.5 池全灭→回退分支）
@@ -207,6 +225,15 @@ export class SiliconFlowEmbedding implements EmbeddingProvider {
             throw new Error(`embedding-dim-mismatch expected=${this.dim}`)
           }
           this.pool.releaseKey("embed", key.ref)
+          void this.pool.recordUsage({
+            pool: "embed",
+            keyRef: key.ref,
+            endpoint: "embeddings",
+            model: this.model,
+            status: "ok",
+            statusCode: resp.status,
+            tokensIn: estimateTokens(texts),
+          })
           return vectors
         }
         status = resp.status
@@ -220,6 +247,15 @@ export class SiliconFlowEmbedding implements EmbeddingProvider {
       this.pool.releaseKey("embed", key.ref)
       const reason = status ? `upstream-${status}` : `error:${(lastError?.message ?? "unknown").slice(0, 200)}`
       await this.pool.reportFailure("embed", key.ref, reason)
+      void this.pool.recordUsage({
+        pool: "embed",
+        keyRef: key.ref,
+        endpoint: "embeddings",
+        model: this.model,
+        status: "failed",
+        statusCode: status || undefined,
+        tokensIn: estimateTokens(texts),
+      })
 
       // 429 / 5xx / 网络错误：退避后重试（换一个 key 或等本 key 冷却）
       const retryable = status === 0 || shouldRetryStatus(status)

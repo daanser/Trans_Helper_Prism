@@ -103,13 +103,30 @@ export class SiliconFlowReranker implements RerankProvider {
     const q = query.trim()
     for (let i = 0; i < docs.length; i += batchSize) {
       const batch = docs.slice(i, i + batchSize)
-      const resp = await withKeyRetry(this.pool, "rerank", (key) =>
-        this.callRerank(key, q, batch, timeoutMs).then((r) => ({
-          ok: r.ok,
-          status: r.status,
-          json: () => Promise.resolve(r.data),
-          text: () => Promise.resolve(r.text ?? ""),
-        })),
+      const resp = await withKeyRetry(
+        this.pool,
+        "rerank",
+        (key) =>
+          this.callRerank(key, q, batch, timeoutMs).then((r) => ({
+            ok: r.ok,
+            status: r.status,
+            json: () => Promise.resolve(r.data),
+            text: () => Promise.resolve(r.text ?? ""),
+          })),
+        {
+          // 记账（T3.2/T3.3）：rerank 用量同样归属账号
+          onAttempt: (rec) => {
+            void this.pool.recordUsage({
+              pool: "rerank",
+              keyRef: rec.keyRef,
+              endpoint: "rerank",
+              model: this.model,
+              status: rec.status,
+              statusCode: rec.statusCode,
+              latencyMs: rec.latencyMs,
+            })
+          },
+        },
       )
       if (!resp.ok) {
         const detail = await resp.text?.().catch(() => "")

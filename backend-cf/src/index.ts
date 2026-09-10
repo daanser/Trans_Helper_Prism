@@ -39,7 +39,7 @@ import {
   rateLimitHeaders,
 } from "./ratelimit"
 import { listAudit, writeAudit } from "./audit"
-import { SCHEMA_STATEMENTS } from "./db/schemaStatements"
+import { SCHEMA_MIGRATIONS, SCHEMA_STATEMENTS, isToleratedSchemaError } from "./db/schemaStatements"
 import { runFallback, type FallbackResponse } from "./fallback"
 import {
   buildPrompt,
@@ -73,18 +73,26 @@ import {
 } from "./keyadmin"
 import { buildAdminUsage } from "./adminstats"
 
-/** Key Pool 记账适配：把用量写进 D1 key_usage（失败不影响业务）。 */
-function makeKeyUsageDb(env: Env): KeyPoolDb {
+/**
+ * Key Pool 记账适配：把用量写进 D1 key_usage（失败不影响业务）。
+ *
+ * `accountId` = 发起这次调用的账号（会话 JWT 的 sub）；**匿名调用传空串**（仍然记账，
+ * 只是不归属任何账号）。`/admin/usage` 的 per-account `requests` / `llm_tokens_*` 就靠这一列
+ * （见 adminstats.ts 的口径说明 + schema.sql 的迁移注释）。
+ */
+export function makeKeyUsageDb(env: Env, accountId?: string): KeyPoolDb {
+  const owner = typeof accountId === "string" ? accountId : ""
   return {
     async recordUsage(rec: UsageRecord) {
       if (!env.DB) return
       try {
         await env.DB.prepare(
-          `INSERT INTO key_usage (id, pool, key_ref, endpoint, model, status, status_code, tokens_in, tokens_out, latency_ms, cost, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO key_usage (id, account_id, pool, key_ref, endpoint, model, status, status_code, tokens_in, tokens_out, latency_ms, cost, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
           .bind(
             crypto.randomUUID(),
+            owner,
             rec.pool,
             rec.keyRef,
             rec.endpoint,
@@ -105,16 +113,22 @@ function makeKeyUsageDb(env: Env): KeyPoolDb {
   }
 }
 
-/** chat provider 单例（保留 key 冷却/剔除状态；多 isolate 各自独立，可接受）。 */
-let chatProvider: ReturnType<typeof createChatProvider> | null = null
-let chatProviderFp = ""
-function getChatProvider(env: Env) {
-  const fp = `${env.LLM_MODEL ?? ""}|${env.LLM_ENDPOINT ?? ""}|${(env.LLM_POOL_KEYS ?? "").length}`
-  if (!chatProvider || chatProviderFp !== fp) {
-    chatProvider = createChatProvider(env, makeKeyUsageDb(env))
-    chatProviderFp = fp
-  }
-  return chatProvider
+/**
+ * 按请求构造 chat provider（**带账号作用域的 usage db**）。
+ *
+ * ── 取舍（为什么不再是跨请求单例）──
+ * 单例的 KeyPool 只有一份 db 引用，无法把「这次调用是谁发起的」传进去 → 账号维度记账不可能准。
+ * 故改成每次请求 `createChatProvider(env, makeKeyUsageDb(env, accountId))`：
+ *   · 收益：每一次 LLM 调用（含换 key 重试产生的失败行）都能归属到账号，/admin/usage 才有真值。
+ *   · 代价：KeyPool 是**内存态**，新建池 = 丢掉跨请求的 key 冷却/剔除记忆。可接受，因为
+ *     ① 失败同样写 key_usage（哪个号挂了在 DB 里看得见，不靠内存态）；
+ *     ② admin 下架 key 走 KV 禁用集（`keydeny:<pool>`，见 keyadmin.ts），**跨请求仍然是硬控制面**；
+ *     ③ 单次请求内 `withKeyRetry` 照常换 key 重试（冷却只在这一次请求内生效，够用）。
+ * 若将来要找回跨请求冷却，可选：把禁用集扩成「冷却集」也放 KV，或在 llm.ts/keypool.ts 里把
+ * usage db 改成按调用传入（都涉及本任务范围外的文件，故此处不做）。
+ */
+function chatProviderFor(env: Env, accountId: string | undefined) {
+  return createChatProvider(env, makeKeyUsageDb(env, accountId))
 }
 
 /**
@@ -310,7 +324,12 @@ api.post("/search", async (c) => {
 
   // ④ 检索（T3.3：先取 admin 下架集合，fail-open 传给工厂）
   try {
-    const result = await runSearch(req, c.env, { denied: await loadDeniedKeys(c.env) })
+    const result = await runSearch(req, c.env, {
+      denied: await loadDeniedKeys(c.env),
+      // 账号作用域的用量记账：embedding / rerank 的每次上游调用都落 key_usage.account_id
+      // （匿名 = 空串，仍记账；只是不归属任何账号）。不改检索语义。
+      db: makeKeyUsageDb(c.env, session?.sub),
+    })
     if (!session) return c.json(result)
     const view = await getQuota(c.env.DB, session.sub, nowMs, c.env)
     const fb = Boolean((result as SearchResponse).fallback)
@@ -407,7 +426,10 @@ api.post("/search/stream", async (c) => {
   // T3.3 运行时效：禁用集合只影响 KeyPool 选 key，不改检索语义（fail-open）
   const denied = await loadDeniedKeys(c.env)
   try {
-    result = (await runSearch({ ...req, use_llm: false }, c.env, { denied })) as SearchResponse
+    result = (await runSearch({ ...req, use_llm: false }, c.env, {
+      denied,
+      db: makeKeyUsageDb(c.env, session.sub),
+    })) as SearchResponse
   } catch (err) {
     if (err instanceof SearchValidationError) return c.json({ error: err.code }, 422)
     throw err
@@ -446,7 +468,7 @@ api.post("/search/stream", async (c) => {
         )
         if (ctx) controller.enqueue(sse("session", { session_id: ctx.id, max_rounds: 10 }))
 
-        const chat = getChatProvider(c.env)
+        const chat = chatProviderFor(c.env, session.sub)
         applyDeniedToPool(chat.pool, denied, "llm")
         const llm = chat.provider.streamSummary(llmHits, question)
         controller.enqueue(sse("citations", { citations: llm.citations, model: llm.model }))
@@ -539,7 +561,7 @@ api.post("/chat", async (c) => {
       })
     }
 
-    const chat = getChatProvider(c.env)
+    const chat = chatProviderFor(c.env, session.sub)
     applyDeniedToPool(chat.pool, await loadDeniedKeys(c.env), "llm")
     const out = await chat.provider.summarize(ctx.initialHits, question, { history })
     await appendRound(c.env.DB, sessionId, "assistant", out.text, Date.now())
@@ -791,31 +813,52 @@ api.post("/admin/accounts/:id/quota", async (c) => {
 
 // POST /admin/db/apply-schema —— 幂等应用 D1 schema
 // 用途：受限环境（wrangler d1 execute 不可用）下，用 Worker 的 D1 binding 完成建表/迁移。
-// 安全性：只执行 src/db/schemaStatements.ts 中固定的 IF NOT EXISTS 语句，不接受任意 SQL；
+// 安全性：只执行 src/db/schemaStatements.ts 中固定的语句（建表 + 迁移），不接受任意 SQL；
 //         鉴权同其它 admin 路由（ADMIN_API_KEY 或 JWT role=admin）。
+// 顺序：**迁移语句（SCHEMA_MIGRATIONS）先跑，再跑幂等建表（SCHEMA_STATEMENTS）**——
+//       线上已存在的 key_usage 需要先补出 account_id 列，后面的
+//       `CREATE INDEX ... idx_key_usage_account_created` 才不会 no such column。
+// 容错：`isToleratedSchemaError()` 把「其实已经是对的状态」的报错视为成功（applied + tolerated）：
+//       · duplicate column name（列已存在：新库/已迁移）
+//       · ALTER TABLE 报 no such table（全新库，随后 CREATE TABLE 自带该列）
+//       其余错误仍进 failed（响应 207），保证「假绿」不会掩盖真正的迁移失败。
 api.post("/admin/db/apply-schema", async (c) => {
   const auth = await adminAuthorize(c)
   if (auth.denied) return auth.denied
   if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
 
+  const statements = [...SCHEMA_MIGRATIONS, ...SCHEMA_STATEMENTS]
   const applied: string[] = []
+  const tolerated: Array<{ stmt: string; error: string }> = []
   const failed: Array<{ stmt: string; error: string }> = []
-  for (const stmt of SCHEMA_STATEMENTS) {
+  for (const stmt of statements) {
     try {
       await c.env.DB.prepare(stmt).run()
       applied.push(stmt.slice(0, 60))
     } catch (e) {
-      failed.push({ stmt: stmt.slice(0, 60), error: (e as Error)?.message?.slice(0, 200) ?? "failed" })
+      const error = (e as Error)?.message?.slice(0, 200) ?? "failed"
+      if (isToleratedSchemaError(stmt, error)) {
+        tolerated.push({ stmt: stmt.slice(0, 60), error })
+        applied.push(stmt.slice(0, 60))
+      } else {
+        failed.push({ stmt: stmt.slice(0, 60), error })
+      }
     }
   }
   await writeAudit(c.env.DB, {
     actorId: auth.actorId,
     action: "apply_schema",
-    detail: `applied=${applied.length} failed=${failed.length}`,
+    detail: `applied=${applied.length} tolerated=${tolerated.length} failed=${failed.length}`,
     nowMs: Date.now(),
   })
   return c.json(
-    { ok: failed.length === 0, applied: applied.length, total: SCHEMA_STATEMENTS.length, failed },
+    {
+      ok: failed.length === 0,
+      applied: applied.length,
+      total: statements.length,
+      tolerated,
+      failed,
+    },
     failed.length === 0 ? 200 : 207,
   )
 })
