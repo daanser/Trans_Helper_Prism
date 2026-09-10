@@ -1189,6 +1189,16 @@ api.get("/admin/whoami", async (c) => {
     // CF 的网络元数据：用于「按 IP 分档限流」判断家宽 / 机房 / 境外（见 TODO.md P0）
     // 注意：这些字段是 CF 在边缘根据连接判定的，**不可伪造**；我们只用它们做分档，不落库。
     // ⚠️ 经 Pages 反代时这里是**子请求自己的**元数据（实测 asn=13335 Cloudflare），真实值见上面的 resolved_*。
+    // 【临时诊断】把 D1 计数的真实报错回出来（rate_count_degraded=true 时用它定位；admin-only）
+    rate_count_diag: await (async () => {
+      if (!c.env.DB) return "no-db-binding"
+      try {
+        const r = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM rate_counters").first<{ n: number }>()
+        return `table-ok rows=${r?.n ?? "?"}`
+      } catch (e) {
+        return `table-error: ${String((e as Error)?.message ?? e).slice(0, 240)}`
+      }
+    })(),
     cf: (() => {
       const meta2 = (c.req.raw as unknown as { cf?: Record<string, unknown> }).cf ?? {}
       return {
