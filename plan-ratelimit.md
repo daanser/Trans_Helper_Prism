@@ -237,6 +237,86 @@ CREATE INDEX IF NOT EXISTS idx_rate_counters_window ON rate_counters (window_sta
 
 > 现状（反代 + `PROXY_SHARED_SECRET` 信任链 + D1 计数）本身是**可用**的，上面属于优化项，不是阻塞项。
 
+### 8.2 子域名 NS 委派 · 操作手册（2026-09-09 实测现状）
+
+**当前真实 DNS 状态**（用 DoH 查的，绕开本机 fake-IP）：
+
+| 名称 | 记录 | 结论 |
+|---|---|---|
+| `chengxi.moe` | NS `colin.ns.cloudflare.com` / `lady.ns.cloudflare.com` | 父域在**另一个 CF 账号** |
+| `transhelper.org` | NS `carlos.ns.cloudflare.com` / `izabella.ns.cloudflare.com` | 又是另一组 NS → **大概率也不在 transprism 账号** |
+| `search.chengxi.moe` | A → `104.21.71.79` / `172.67.143.246`（CF 代理）| 指向 Pages（跨账号 custom domain）|
+| `search.transhelper.org` | **CNAME → `search.chengxi.moe`** | 当前只是个别名 |
+
+**先做一步判断**：登录 CF → 右上角切换账号 → 看 **Websites（域）** 列表里有没有 `chengxi.moe` / `transhelper.org`。
+- **有**（即父域就在 transprism 账号）→ **不用委派**，直接跳到「第 3 步」加自定义域即可。
+- **没有** → 按下面委派。
+
+#### 方案 A（推荐，零停机）：委派 `api.*` 兄弟子域，完全不碰现有 `search.*`
+
+```
+① transprism 账号：添加两个站点（zone）
+     api.chengxi.moe
+     api.transhelper.org
+   → 各记下 CF 分配的**两个 NS 名称**（zone 会先处于 Pending，正常）
+
+② 在 chengxi.moe 所属账号：DNS → 记录 → 新增
+     类型 NS   名称 api   内容 <api.chengxi.moe 的第一个 NS>
+     类型 NS   名称 api   内容 <api.chengxi.moe 的第二个 NS>
+   在 transhelper.org 所属账号：同样给 名称 api 加两条 NS（指向 api.transhelper.org 的 NS）
+   ✅ 这两个名字**原本没有记录**，所以加 NS 不会影响任何现存服务 → 前端零停机
+
+③ 等 zone 变 Active（几分钟；用 `dig NS api.chengxi.moe @1.1.1.1` 验证委派已生效）
+
+④ transprism 账号里加自定义域（zone 已同账号，可直接加）
+     Worker：Workers & Pages → transhelper-prism-backend → Settings → Domains & Routes
+             → Add → Custom Domain → api.chengxi.moe（再重复一次 api.transhelper.org）
+     Pages ：保持现状不动（search.chengxi.moe 仍是跨账号 custom domain，能用就别动）
+
+⑤ 应用侧改动（我来做）
+     NUXT_PUBLIC_API_BASE = https://api.chengxi.moe/api
+     OAUTH_REDIRECT_URI   = https://api.chengxi.moe/api/v1/auth/oauth/x/callback  ← 并去 X 后台登记
+     ALLOWED_ORIGINS      = https://search.chengxi.moe,https://search.transhelper.org
+     删除 frontend/functions/（反代与信任链都不再需要）
+```
+
+#### 方案 B（你原本问的）：委派整个 `search.*` 子域
+
+把 `search.chengxi.moe` / `search.transhelper.org` 各自变成一个 zone，前端与 API **全部**归 transprism 账号（最"干净"，但**有停机**）：
+
+```
+① transprism：添加 zone  search.chengxi.moe 与 search.transhelper.org → 记下各自的 NS 对
+② 父域账号：DNS → 记录
+     · **删除** search 上现有的记录（`search.chengxi.moe` 现在那条 CNAME/A）  ← ⚠️ 从这里开始前端断服
+     · 新增两条 NS：名称 search → 两个 NS 名称
+   （`search.transhelper.org` 同理：它在 transhelper.org 里是 CNAME 到 search.chengxi.moe，也要删掉换成 NS）
+③ 等 zone Active（此时前端可能已经断了）
+④ transprism 里重建：
+     · Pages 自定义域  search.chengxi.moe（同账号，直接加，CF 自动建记录）
+     · Pages 自定义域  search.transhelper.org
+     · Worker 自定义域 api.search.chengxi.moe / api.search.transhelper.org
+⑤ 应用侧：API 基址可用 https://api.search.chengxi.moe/api（更"整齐"），其余同方案 A
+```
+
+**方案 A vs B**
+
+| | A（委派 `api.*`）| B（委派 `search.*`）|
+|---|---|---|
+| 停机 | **无** | 有（NS 生效 + 证书签发，几分钟~几十分钟）|
+| 要动现有 `search.*` 记录 | 不用 | 要删要重建 |
+| 最终域名 | `api.chengxi.moe` + `search.chengxi.moe`（前端不变）| `api.search.chengxi.moe` + `search.chengxi.moe`（同账号）|
+| 风险 | 低 | 中（漏建记录就解析悬空）|
+
+> **两者收益相同**：Worker 拿到真实客户端 IP 与真实 `request.cf`（country/asn），可删掉 Pages Function 反代与共享密钥信任链。
+
+#### ⚠️ 共同注意事项
+1. **删反代后前端与 API 变成跨域**（`search.chengxi.moe` → `api.chengxi.moe`）：CORS 与 OPTIONS 预检回来了，
+   需把 `ALLOWED_ORIGINS` 配好；换来的是 Worker 直连（少一跳、限流天然准确）。
+2. **X 后台的 Redirect URI 必须同步改**，否则登录直接失败。
+3. 子域 zone 需要一个 zone 配额（免费版可加多个 zone，一个账号下多 zone 无额外费用）。
+4. 委派后该子域下**所有**记录都由新 zone 管：父域里为它设的记录一律失效。
+5. 建议低峰期做；做完让我用 `dig` + `curl` 验证委派、证书、前后端连通性。
+
 ---
 
 ## 9. 5h 配额窗口：错峰机制、锚定方式与重置提示
@@ -308,4 +388,4 @@ window_start = registration_time + floor((now - registration_time) / window_ms) 
 
 ---
 
-_最后更新：2026-09-09（CN 机房档 10→6；新增 LLM 除数规则与子域名委派方案）_
+_最后更新：2026-09-09（CN 机房档 10→6；LLM 除数规则；子域名委派操作手册 §8.2：推荐方案 A「委派 api.*，零停机」）_
