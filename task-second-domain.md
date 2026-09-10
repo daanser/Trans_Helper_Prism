@@ -105,6 +105,21 @@ HTTP 403  <title>Just a moment...</title>      cf-mitigated: challenge
 
 ---
 
+## 4.5 已知现象：从「机房 IP」访问会被 CF 挑战（不是故障）
+
+2026-09-10 实测：从 **AWS 新加坡机房出口（ASN 16509）** 访问 `search.transhelper.org` 会拿到
+```
+HTTP 403  <title>Just a moment...</title>   cf-mitigated: challenge
+```
+换成浏览器 UA 也一样；但**同一台机器访问 `search.chengxi.moe` 是 200**，而云端抓取服务（Firecrawl，会执行 JS）
+与用户本机浏览器访问 `search.transhelper.org` **都是 200 + 正常四库 JSON**。
+
+结论：**该 zone 对机房/可疑 ASN 有挑战策略，属预期行为，不影响真实用户**。
+但对维护者的副作用是：**不能用本机 `curl` 验证这个域名**（会被挑战），改用云端抓取或让用户确认。
+若将来真实用户反馈"搜索转圈/失败"，那才需要考虑给 `search.transhelper.org/api/*` 加一条 WAF **Skip** 规则。
+
+---
+
 ## 5. 验证清单
 
 **做完第 3 步后告诉我，我会跑这些**（你也可以自己跑）：
