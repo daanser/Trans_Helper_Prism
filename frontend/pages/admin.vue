@@ -89,6 +89,90 @@
           </table>
         </div>
         <pre v-else-if="usageRaw" class="overflow-x-auto rounded-lg border border-surface-border bg-canvas-subtle p-3 font-mono text-[11px] leading-relaxed text-ink-sub">{{ usageRaw }}</pre>
+
+        <!-- 分档限流观测（plan-ratelimit.md §10 R5）：与用量同一个「各自独立探测」模式 -->
+        <div class="mt-6 border-t border-surface-border pt-4">
+          <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 class="text-sm font-semibold text-ink-title">分档限流观测</h3>
+              <p class="mt-0.5 text-xs text-ink-muted">
+                GET /api/v1/admin/ratelimit · 只读聚合 rate_counters（不产生任何写入，不含 IP 与桶 key）
+              </p>
+            </div>
+            <div class="flex items-center gap-2">
+              <StatusBadge :state="ratelimitState" />
+              <button
+                type="button"
+                class="rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-xs font-medium text-ink-sub transition-colors hover:border-surface-border-hover hover:text-ink-title"
+                @click="loadRatelimit"
+              >
+                刷新
+              </button>
+            </div>
+          </div>
+
+          <p v-if="ratelimitState === 'loading'" class="text-xs text-ink-muted">加载中…</p>
+          <p v-else-if="ratelimitState === 'unimplemented'" class="text-xs leading-relaxed text-ink-sub">
+            接口未实现（后端返回 404/501）。该端点上线后，这里会显示各档位/各作用域的桶数与计数、封禁中的地址数，以及全局匿名熔断状态。
+          </p>
+          <p v-else-if="ratelimitState === 'error'" class="text-xs text-danger">{{ ratelimitMessage }}</p>
+          <template v-else-if="ratelimitData">
+            <div class="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-ink-sub">
+              <span>计数窗口：<b class="font-medium text-ink-title">{{ ratelimitWindowSec }}</b> 秒</span>
+              <span>封禁中：<b class="font-medium text-ink-title">{{ ratelimitBlocked }}</b> 个网络地址</span>
+              <span>
+                全局匿名熔断：<b class="font-medium" :class="ratelimitGlobalTone">{{ ratelimitGlobalText }}</b>
+                <span class="text-ink-muted">（{{ ratelimitGlobalCount }} / 软 {{ ratelimitGlobalSoft }} / 硬 {{ ratelimitGlobalHard }}）</span>
+              </span>
+            </div>
+            <p v-if="ratelimitData.degraded" class="mb-3 rounded-lg border border-amber-200 bg-amber-50 p-2.5 text-xs leading-relaxed text-amber-800 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-200">
+              降级：未配置 PROXY_SHARED_SECRET → 计数桶的匿名化强度下降（桶名可被穷举反查）。请在生产配置该 secret。
+            </p>
+
+            <p class="mb-1.5 text-xs font-medium text-ink-sub">各作用域（当前窗口 + 上一窗口）</p>
+            <div class="mb-4 overflow-x-auto">
+              <table class="w-full border-collapse text-xs">
+                <thead>
+                  <tr class="border-b border-surface-border text-left text-ink-muted">
+                    <th class="py-2 pr-3 font-medium">作用域</th>
+                    <th class="py-2 pr-3 font-medium">桶数</th>
+                    <th class="py-2 font-medium">计数</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in ratelimitScopeRows" :key="row.key" class="border-b border-surface-border/60 text-ink-body">
+                    <td class="py-2 pr-3">{{ row.label }}</td>
+                    <td class="py-2 pr-3 tabular-nums">{{ row.buckets }}</td>
+                    <td class="py-2 tabular-nums">{{ row.counted }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <p class="mb-1.5 text-xs font-medium text-ink-sub">各档位（search + LLM 桶合并）</p>
+            <div v-if="ratelimitTierRows.length" class="overflow-x-auto">
+              <table class="w-full border-collapse text-xs">
+                <thead>
+                  <tr class="border-b border-surface-border text-left text-ink-muted">
+                    <th class="py-2 pr-3 font-medium">档位</th>
+                    <th class="py-2 pr-3 font-medium">桶数</th>
+                    <th class="py-2 pr-3 font-medium">计数</th>
+                    <th class="py-2 font-medium">限额（次/分钟）</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in ratelimitTierRows" :key="row.tier" class="border-b border-surface-border/60 text-ink-body">
+                    <td class="py-2 pr-3">{{ row.label }}</td>
+                    <td class="py-2 pr-3 tabular-nums">{{ row.buckets }}</td>
+                    <td class="py-2 pr-3 tabular-nums">{{ row.counted }}</td>
+                    <td class="py-2 tabular-nums">{{ row.limit }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p v-else class="text-xs text-ink-muted">当前窗口内没有计数行（尚无受限请求，属正常态）。</p>
+          </template>
+        </div>
       </section>
 
       <!-- Key 池 -->
@@ -292,14 +376,14 @@
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue"
-import { useApi, isUnimplemented } from "~/composables/useApi"
+import { useApi, isUnimplemented, type AdminRateLimitResponse } from "~/composables/useApi"
 import { useToast } from "~/composables/useToast"
 
 useHead({ title: "管理后台 · TransHelper Prism" })
 
 type LoadState = "idle" | "loading" | "ok" | "unimplemented" | "error"
 
-const { adminUsage, adminKeys, adminAudit, adminBan, adminQuota } = useApi()
+const { adminUsage, adminRatelimit, adminKeys, adminAudit, adminBan, adminQuota } = useApi()
 const { pushToast } = useToast()
 const { isLoggedIn, isAdmin, user, loadMe, init } = useAuth()
 
@@ -344,6 +428,77 @@ const usageRows = computed<UsageRow[]>(() => {
 })
 
 const usageRaw = computed(() => (usageData.value ? safeJson(usageData.value) : ""))
+
+// ── 分档限流观测（GET /api/v1/admin/ratelimit，plan-ratelimit.md §10 R5）──
+const ratelimitState = ref<LoadState>("idle")
+const ratelimitMessage = ref("")
+const ratelimitData = ref<AdminRateLimitResponse | null>(null)
+
+/** 档位中文名（与后端 src/tiers.ts 的 Tier 一一对应） */
+const TIER_TEXT: Record<string, string> = {
+  logged_in: "已登录用户",
+  cn_residential: "境内家庭宽带",
+  cn_other: "境内其它网络",
+  cn_idc: "境内机房网络",
+  overseas: "境外",
+  unknown: "未识别网络",
+}
+
+/** 整数展示（桶数/计数：后端保证是整数；脏值一律回落「—」） */
+function intText(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "—"
+  const n = typeof value === "number" ? value : Number(value)
+  if (!Number.isFinite(n)) return "—"
+  return String(Math.trunc(n))
+}
+
+const ratelimitTierRows = computed(() => {
+  const list = ratelimitData.value?.tiers
+  if (!Array.isArray(list)) return []
+  return list.map((row) => ({
+    tier: text(row.tier),
+    label: TIER_TEXT[text(row.tier)] ?? text(row.tier),
+    buckets: intText(row.buckets),
+    counted: intText(row.counted),
+    // limit=null 表示非标准档位名（后端不编造限额）→ 显示「—」
+    limit: row.limit === null || row.limit === undefined ? "—" : intText(row.limit),
+  }))
+})
+
+const ratelimitScopeRows = computed(() => {
+  const scopes = ratelimitData.value?.scopes
+  const labels: Array<{ key: string; label: string }> = [
+    { key: "search", label: "搜索（按 IP 分档）" },
+    { key: "llm", label: "LLM 伴读 / 追问" },
+    { key: "burst", label: "突发（10 秒窗口）" },
+    { key: "global", label: "全局匿名熔断（当前窗口）" },
+  ]
+  return labels.map(({ key, label }) => {
+    const agg = (scopes?.[key] ?? {}) as { buckets?: unknown; counted?: unknown }
+    return { key, label, buckets: intText(agg.buckets), counted: intText(agg.counted) }
+  })
+})
+
+const ratelimitWindowSec = computed(() => intText(ratelimitData.value?.window_sec))
+const ratelimitBlocked = computed(() => intText(ratelimitData.value?.blocked_buckets))
+const ratelimitGlobalCount = computed(() => intText(ratelimitData.value?.global?.count))
+const ratelimitGlobalSoft = computed(() => intText(ratelimitData.value?.global?.soft))
+const ratelimitGlobalHard = computed(() => intText(ratelimitData.value?.global?.hard))
+
+const ratelimitGlobalText = computed(() => {
+  const state = ratelimitData.value?.global?.state
+  if (state === "hard") return "硬熔断（匿名一律 429）"
+  if (state === "soft") return "软熔断（匿名仅关键词回退）"
+  if (state === "normal") return "正常"
+  return "—"
+})
+
+const ratelimitGlobalTone = computed(() => {
+  const state = ratelimitData.value?.global?.state
+  if (state === "hard") return "text-danger"
+  if (state === "soft") return "text-amber-600 dark:text-amber-400"
+  return "text-ink-title"
+})
 
 const keyRows = computed<Record<string, unknown>[]>(() => {
   const data = keysData.value
@@ -427,6 +582,23 @@ async function loadUsage() {
     else {
       usageState.value = "error"
       usageMessage.value = (err as Error)?.message || "加载失败"
+    }
+  }
+}
+
+/** 限流观测：与用量块同一套「独立探测」模式（404/501 → 接口未实现；401/403 → 需运维 key） */
+async function loadRatelimit() {
+  ratelimitState.value = "loading"
+  ratelimitMessage.value = ""
+  try {
+    ratelimitData.value = await adminRatelimit()
+    ratelimitState.value = "ok"
+  } catch (err: unknown) {
+    ratelimitData.value = null
+    if (isUnimplemented(err)) ratelimitState.value = "unimplemented"
+    else {
+      ratelimitState.value = "error"
+      ratelimitMessage.value = adminErrorText(err)
     }
   }
 }
@@ -527,6 +699,7 @@ onMounted(async () => {
   if (isLoggedIn.value && !user.value) await loadMe()
   if (isAdmin.value) {
     void loadUsage()
+    void loadRatelimit()
     void loadKeys()
     void loadAudit()
   }

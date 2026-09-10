@@ -29,6 +29,7 @@
           ref="searchBoxRef"
           :loading="loading"
           :use-llm="llmEnabled"
+          :cooldown-sec="cooldownRemaining"
           @submit="doSearch"
           @update:use-llm="onLlmToggle"
         >
@@ -63,6 +64,27 @@
             @cite="onCite"
             @followup="onFollowUp"
           />
+        </div>
+
+        <!-- 429 分档限流提示（**不清空已有结果**；有 retry_after 时做倒计时并禁用提交） -->
+        <div
+          v-if="rateLimit"
+          role="status"
+          class="mt-6 flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-900/40 dark:bg-amber-950/30"
+        >
+          <span class="shrink-0 rounded bg-amber-200 px-1.5 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-900/60 dark:text-amber-200">
+            请求过于频繁
+          </span>
+          <div class="min-w-0 flex-1 space-y-1">
+            <p class="text-xs leading-relaxed text-amber-800 dark:text-amber-200">{{ rateLimitMessage }}</p>
+            <p v-if="showLoginHint" class="text-xs leading-relaxed text-amber-800/90 dark:text-amber-200/90">
+              登录后额度更高（{{ LOGGED_IN_LIMIT_PER_MIN }} 次/分钟），日常使用基本不会碰到这个提示。
+              <NuxtLink to="/login" class="font-medium underline underline-offset-2">去登录</NuxtLink>
+            </p>
+            <p v-else-if="results.length > 0" class="text-xs leading-relaxed text-amber-800/80 dark:text-amber-200/80">
+              下方仍保留上一次的检索结果，可继续查阅。
+            </p>
+          </div>
         </div>
 
         <!-- 检索骨架屏 -->
@@ -111,8 +133,8 @@
             </p>
           </div>
 
-          <!-- 无匹配结果 -->
-          <div v-else-if="results.length === 0" class="mt-8 rounded-2xl border border-dashed border-surface-border p-8 text-center sm:p-12">
+          <!-- 无匹配结果（限流时改由上方提示卡说明，不在这里误报「未发现」） -->
+          <div v-else-if="results.length === 0 && !rateLimit" class="mt-8 rounded-2xl border border-dashed border-surface-border p-8 text-center sm:p-12">
             <p class="text-sm font-semibold text-ink-title">未发现匹配的条目</p>
             <p class="mx-auto mt-2 max-w-md text-xs leading-relaxed text-ink-sub">
               建议缩短搜索词、尝试医学通用词或别名，或勾选全部知识库再次搜索。
@@ -222,7 +244,7 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue"
-import { useApi, isUnimplemented, type SearchHit, type SearchResponse, type SearchRequest, type SearchTimings } from "~/composables/useApi"
+import { useApi, isUnimplemented, isRateLimited, type SearchHit, type SearchResponse, type SearchRequest, type SearchTimings } from "~/composables/useApi"
 import { useToast } from "~/composables/useToast"
 import SearchBox from "~/components/SearchBox.vue"
 import HitCard from "~/components/HitCard.vue"
@@ -250,6 +272,63 @@ const loginRequired = ref(false)
 const quota = ref<SearchResponse["quota"] | null>(null)
 const warnings = ref<string[]>([])
 const highlightedHitId = ref<string | null>(null)
+
+// ── 429 分档限流（plan-ratelimit.md §4/§6 的前端侧）──
+// 后端 429 体：`{error:"rate-limited", tier, scope, retry_after}` + `Retry-After` / `X-RateLimit-Limit` 头。
+// 三条硬要求：① **不清空已有结果**；② 明确提示（档位 + 限额 + 等待秒数）；③ retry_after 有值时倒计时并禁用提交。
+// 注意：**额度耗尽**（`quota-exceeded`）也是 429，但语义完全不同（走回退检索、不封禁），
+// 所以判定必须看 `code === "rate-limited"`（见 useApi.ts 的 `isRateLimited`），不能只看 status。
+interface RateLimitState {
+  /** 档位（overseas / unknown / cn_idc / …；后端可能省略 → 空串） */
+  tier: string
+  /** 作用域 tier-limit | burst | blocked | global-hard（后端可能省略 → 空串） */
+  scope: string
+  /** 本次生效限额（次/窗口；来自 X-RateLimit-Limit，缺失为 null） */
+  limit: number | null
+  /** 冷却截止时刻（epoch ms；0 = 后端没给 retry_after，不做倒计时） */
+  untilMs: number
+}
+
+const rateLimit = ref<RateLimitState | null>(null)
+const cooldownRemaining = ref(0)
+let cooldownTimer: ReturnType<typeof setInterval> | null = null
+let dismissTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 档位中文名（与后端 `src/tiers.ts` 的 Tier 对应；未知档位回落到「当前网络」） */
+const TIER_LABELS: Record<string, string> = {
+  logged_in: "已登录用户",
+  cn_residential: "境内家庭宽带",
+  cn_other: "境内其它网络",
+  cn_idc: "境内机房网络",
+  overseas: "境外访客",
+  unknown: "未识别网络",
+}
+
+/**
+ * 引导登录的档位：额度最低的几档正是产品**有意**引导登录的对象（plan-ratelimit.md §12 风险 3）。
+ * `cn_residential`（30/min）不在此列——对正常用户已经够用，不必打扰。
+ */
+const LOGIN_HINT_TIERS = ["overseas", "unknown", "cn_idc"]
+/** 登录档默认额度（后端 `RATE_LIMIT_LOGGED_IN_PER_MIN` 默认 60 次/分钟） */
+const LOGGED_IN_LIMIT_PER_MIN = 60
+
+/** 限流提示正文：档位 + 限额 + 倒计时（倒计时结束后自动消失） */
+const rateLimitMessage = computed(() => {
+  const st = rateLimit.value
+  if (!st) return ""
+  const wait = cooldownRemaining.value > 0 ? `，请在 ${cooldownRemaining.value} 秒后重试` : "，请稍后重试"
+  if (st.scope === "burst") return `请求过于频繁（短时间内提交过于集中，已触发突发限流）${wait}`
+  if (st.scope === "blocked") return `该网络地址已被临时限制（约 1 分钟）${wait}`
+  if (st.scope === "global-hard") return `服务当前繁忙（匿名访问量过高）${wait}`
+  const label = TIER_LABELS[st.tier] ?? "当前网络"
+  const perMin = st.limit !== null && st.limit > 0 ? `，${st.limit} 次/分钟` : ""
+  return `请求过于频繁（当前档位：${label}${perMin}）${wait}`
+})
+
+/** 是否展示「登录后额度更高」引导（未登录 + 低额度档位；语气是提示不是威胁） */
+const showLoginHint = computed(
+  () => !isLoggedIn.value && !!rateLimit.value && LOGIN_HINT_TIERS.includes(rateLimit.value.tier),
+)
 
 // ── AI 伴读（T3.4 / T3.6）──
 const llmEnabled = ref(false)
@@ -309,6 +388,59 @@ function onQuickSearch(queryText: string) {
   if (searchBoxRef.value) {
     searchBoxRef.value.setQuery(queryText)
     searchBoxRef.value.submit()
+  }
+}
+
+/** 停掉倒计时（冷却结束 / 组件卸载 / 新一轮成功检索时调用） */
+function stopCooldownTicker() {
+  if (cooldownTimer) {
+    clearInterval(cooldownTimer)
+    cooldownTimer = null
+  }
+  if (dismissTimer) {
+    clearTimeout(dismissTimer)
+    dismissTimer = null
+  }
+}
+
+/** 撤掉限流提示（冷却结束即恢复可提交状态；已有结果始终保留） */
+function clearRateLimitNotice() {
+  stopCooldownTicker()
+  rateLimit.value = null
+  cooldownRemaining.value = 0
+}
+
+/**
+ * 收到 429（分档限流）时：记录档位/作用域/限额，按 `retry_after` 起倒计时。
+ * 后端没给 `retry_after`（例如 KV 粗限流路径）时不做倒计时、不禁用提交，只把提示挂 12 秒。
+ */
+function applyRateLimit(err: unknown) {
+  const e = err as { retryAfter?: unknown; tier?: unknown; scope?: unknown; limit?: unknown }
+  const rawRetry = typeof e.retryAfter === "number" && Number.isFinite(e.retryAfter) ? e.retryAfter : 0
+  const retryAfterSec = rawRetry > 0 ? Math.ceil(rawRetry) : 0
+  stopCooldownTicker()
+  rateLimit.value = {
+    tier: typeof e.tier === "string" ? e.tier : "",
+    scope: typeof e.scope === "string" ? e.scope : "",
+    limit: typeof e.limit === "number" && Number.isFinite(e.limit) ? e.limit : null,
+    untilMs: retryAfterSec > 0 ? Date.now() + retryAfterSec * 1000 : 0,
+  }
+  cooldownRemaining.value = retryAfterSec
+  if (retryAfterSec > 0) {
+    pushToast(`请求过于频繁，${retryAfterSec} 秒后可重试`, "warning")
+    cooldownTimer = setInterval(() => {
+      const st = rateLimit.value
+      if (!st || st.untilMs <= 0) {
+        clearRateLimitNotice()
+        return
+      }
+      const remain = Math.max(0, Math.ceil((st.untilMs - Date.now()) / 1000))
+      cooldownRemaining.value = remain
+      if (remain <= 0) clearRateLimitNotice()
+    }, 1000)
+  } else {
+    pushToast("请求过于频繁，请稍后重试", "warning")
+    dismissTimer = setTimeout(clearRateLimitNotice, 12000)
   }
 }
 
@@ -447,6 +579,13 @@ function aiFailureText(err: unknown): string {
   const code = (err as { code?: string })?.code ?? ""
   if (isUnimplemented(err)) return "AI 总结暂不可用：后端流式接口尚未实现。主检索结果不受影响。"
   if (status === 401) return "AI 总结需要登录后使用，请先登录。主检索结果不受影响。"
+  if (isRateLimited(err)) {
+    // 分档限流（llm 桶）：与「额度耗尽」是两回事，别混为一谈
+    const retryAfter = (err as { retryAfter?: number })?.retryAfter
+    const wait =
+      typeof retryAfter === "number" && retryAfter > 0 ? `约 ${Math.ceil(retryAfter)} 秒后重试` : "稍后重试"
+    return `请求过于频繁（AI 伴读按更紧的额度单独计数），${wait}。主检索结果不受影响。`
+  }
   if (status === 429 || code === "quota-exceeded") return "本窗口额度已用尽，AI 总结暂不可用；回退检索不消耗额度。"
   if (code === "llm-unavailable" || code === "llm-upstream" || code === "llm-not-configured") {
     return "AI 总结暂不可用（上游模型不可用）。主检索结果不受影响。"
@@ -493,6 +632,11 @@ async function onFollowUp(question: string) {
 }
 
 async function doSearch(payload: Pick<SearchRequest, "query" | "corpora" | "use_reranker" | "use_llm" | "top_k">) {
+  // 冷却期内直接拦下（SearchBox 的按钮已禁用；这里兜住键盘回车等其它入口）
+  if (cooldownRemaining.value > 0) {
+    pushToast(`请求过于频繁，请在 ${cooldownRemaining.value} 秒后重试`, "warning")
+    return
+  }
   loading.value = true
   error.value = ""
   hasSearched.value = true
@@ -517,6 +661,8 @@ async function doSearch(payload: Pick<SearchRequest, "query" | "corpora" | "use_
     quota.value = res.quota
     warnings.value = res.warnings || []
     loginRequired.value = (res.warnings || []).includes("login-required")
+    // 本轮成功 → 限流提示可以撤了（正常路径下冷却结束时就已清掉）
+    if (rateLimit.value) clearRateLimitNotice()
 
     if (res.warnings?.length) {
       for (const w of res.warnings) {
@@ -530,9 +676,15 @@ async function doSearch(payload: Pick<SearchRequest, "query" | "corpora" | "use_
 
     if (isLoggedIn.value) void loadMe()
   } catch (err: any) {
-    error.value = err?.message || "网络请求异常，请稍后重试"
-    results.value = []
-    pushToast(error.value, "error")
+    if (isRateLimited(err)) {
+      // 429 分档限流：**不清空已有结果**（error 保持空串，结果区继续渲染），只加一条明确提示 + 倒计时。
+      // 额度耗尽（quota-exceeded）不走这里 —— 它由后端的回退分支返回，属于另一套语义。
+      applyRateLimit(err)
+    } else {
+      error.value = err?.message || "网络请求异常，请稍后重试"
+      results.value = []
+      pushToast(error.value, "error")
+    }
   } finally {
     loading.value = false
   }
@@ -550,6 +702,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   cancelAiStream()
+  stopCooldownTicker()
 })
 
 // 偏好变更后同步（设置页可能在同一 SPA 会话里改过）

@@ -45,7 +45,7 @@
       <!-- 搜索操作按钮：视觉焦点，群青蓝 -->
       <button
         type="button"
-        :disabled="loading || !query.trim()"
+        :disabled="loading || cooling || !query.trim()"
         class="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-blue-600 px-7 py-3.5 text-sm font-medium text-white shadow-sm transition-all hover:bg-blue-700 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40 dark:bg-blue-500 dark:hover:bg-blue-600"
         @click="submit"
       >
@@ -53,7 +53,7 @@
           <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" />
           <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
         </svg>
-        <span>{{ loading ? "检索中…" : "搜索文献" }}</span>
+        <span>{{ loading ? "检索中…" : cooling ? `${cooldownSec} 秒后可重试` : "搜索文献" }}</span>
       </button>
     </div>
 
@@ -110,7 +110,7 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, onMounted, ref } from "vue"
+import { computed, nextTick, onMounted, ref } from "vue"
 import { DEFAULT_CORPORA_OPTIONS, type CorpusOption, type SearchRequest } from "~/composables/useApi"
 import { useToast } from "~/composables/useToast"
 import ToggleMini from "./ToggleMini.vue"
@@ -118,8 +118,14 @@ import ToggleMini from "./ToggleMini.vue"
 /**
  * `useLlm` 由父组件受控：开关只是「请求开启」，真正的开启要等父组件完成二次确认弹窗，
  * 避免用户误触后直接产生配额消耗（tasks.md T3.6）。
+ *
+ * `cooldownSec`（可选，缺省 0 = 行为与以前完全一致）：被后端分档限流（429）后的冷却剩余秒数。
+ * > 0 时禁用提交按钮并把按钮文案换成「N 秒后可重试」——输入框**保持可编辑**，
+ * 用户仍可改词/换库，只是不能提交（提交的硬拦截在 pages/index.vue 的 doSearch 里还有一道）。
  */
-const props = defineProps<{ loading: boolean; useLlm: boolean }>()
+const props = withDefaults(defineProps<{ loading: boolean; useLlm: boolean; cooldownSec?: number }>(), {
+  cooldownSec: 0,
+})
 const emit = defineEmits<{
   (e: "submit", p: Pick<SearchRequest, "query" | "corpora" | "use_reranker" | "use_llm" | "top_k">): void
   (e: "update:useLlm", v: boolean): void
@@ -132,6 +138,9 @@ const searchInput = ref<HTMLInputElement | null>(null)
 const selectedCorpora = ref<string[]>(["mtf-wiki", "ftm-wiki", "rle-wiki", "miomtfwiki"])
 const useReranker = ref(true)
 const corporaOptions: CorpusOption[] = DEFAULT_CORPORA_OPTIONS
+
+/** 限流冷却中（父组件传下来的剩余秒数 > 0） */
+const cooling = computed(() => (props.cooldownSec ?? 0) > 0)
 
 function toggleCorpus(id: string) {
   if (selectedCorpora.value.includes(id)) {
@@ -156,7 +165,7 @@ function clear() {
 
 function submit() {
   const q = query.value.trim()
-  if (!q || props.loading) return
+  if (!q || props.loading || cooling.value) return
   emit("submit", {
     query: q,
     corpora: [...selectedCorpora.value],

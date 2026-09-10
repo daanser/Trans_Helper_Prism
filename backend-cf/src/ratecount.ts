@@ -30,9 +30,31 @@
 //   约等于「每天 10 万次匿名检索」的上限，与 plan §5「默认先上：每次匿名 /search 写 1 行」一致。
 // 突发桶（10s）**只在计数已经很高时才写**（见 index.ts 的 rateGate），避免给正常流量翻倍写。
 // 过期行由 `purgeExpiredCounters()` 顺手清理（不引入定时任务，plan §5 / §10）。
+import {
+  anonGlobalHardLimit,
+  anonGlobalLimit,
+  llmDivisor,
+  limitForTier,
+  RATE_WINDOW_SEC,
+  TIERS,
+  type Tier,
+} from "./tiers"
 
-/** 计数作用域：搜索、LLM、全局匿名、突发、封禁各占一个桶。 */
+/**
+ * 计数作用域：搜索、LLM、全局匿名、突发、封禁各占一个桶。
+ * ⚠️ 每个 scope 在 `tier` 列里的写法见 `tierColumnValue`（search=裸档位、llm=`llm:` 前缀、
+ * burst=`burst:` 前缀、block=`block:` 前缀、global=`anon_global`）——只读聚合靠它还原 scope。
+ */
 export type RateScope = "search" | "llm" | "global" | "burst" | "block"
+
+/** 全局匿名熔断桶在 `tier` 列里的值（一个桶，与 IP 无关）。 */
+export const GLOBAL_TIER_VALUE = "anon_global"
+/** LLM 桶在 `tier` 列里的前缀（**只在 tier 列里**；桶 key 的 HMAC 输入不含前缀）。 */
+export const LLM_TIER_PREFIX = "llm:"
+/** 突发桶在 `tier` 列里的前缀。 */
+export const BURST_TIER_PREFIX = "burst:"
+/** 封禁行在 `tier` 列里的前缀（该行 `count` 列借存 `block_until`）。 */
+export const BLOCK_TIER_PREFIX = "block:"
 
 /** `consumeRateToken` 入参。 */
 export interface ConsumeRateTokenArgs {
@@ -176,9 +198,15 @@ export async function bucketKeyFor(args: {
 
 /** 写库用的 `tier` 列值（保留可读性，便于人工排查；不是隐私字段）。 */
 function tierColumnValue(scope: RateScope, tier: string | undefined): string {
-  if (scope === "global") return "anon_global"
-  if (scope === "burst") return `burst:${tier ?? "unknown"}`
-  if (scope === "block") return `block:${tier ?? "unknown"}`
+  if (scope === "global") return GLOBAL_TIER_VALUE
+  if (scope === "burst") return `${BURST_TIER_PREFIX}${tier ?? "unknown"}`
+  if (scope === "block") return `${BLOCK_TIER_PREFIX}${tier ?? "unknown"}`
+  // ⚠️ `llm` 桶带 `llm:` 前缀（2026-09-10 起）：`tier` 列是**观测列**，而桶 key 的 HMAC 输入是
+  //    `scope|tier|ip|windowIndex`（见 bucketKeyFor），**不含**本列的字符串 —— 所以这里加前缀
+  //    **不改变任何桶身份**（计数器不会重置、判定顺序/阈值不变），只是让 `tier` 列能区分
+  //    search 桶与 llm 桶（否则 /admin/ratelimit 无法分别报出两者的 buckets/counted）。
+  //    部署前写入的 llm 行仍是裸档位名，最多 1 个窗口（60s）内会被并入 search 统计，之后自愈。
+  if (scope === "llm") return `${LLM_TIER_PREFIX}${tier ?? "unknown"}`
   return tier ?? "unknown"
 }
 
@@ -372,4 +400,253 @@ export async function purgeExpiredCounters(
   } catch {
     return 0
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 只读聚合：GET /api/v1/admin/ratelimit 的数据面（plan-ratelimit.md §10 R5 观测 / §11 验收）
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ── 硬要求：不得新增任何**每请求写入** ──
+// 匿名搜索现在已经是 3 行写/请求（分档桶 + 突发桶 + 全局桶，history.md §5 坑 38），再往上加写入会直接
+// 抬高 D1 成本。所以本段**只有两条 SELECT**，全部从 `rate_counters` 现有行聚合出来：
+//   ① 按 `(tier, window_start)` 分组的 buckets/counted（含 current 与 previous 两个窗口）；
+//   ② 封禁行数（`tier LIKE 'block:%' AND count > now`，`count` 列借存 block_until）。
+// **绝不写库**：单测用「任何 `run()` 被调用即失败」的 mock 把这条锁死（见 tests/ratelimitStats.test.ts）。
+//
+// ── 时间范围口径（写清，别猜）──
+// 固定窗口按 epoch 对齐（`windowIndex`），窗口长 60s。聚合范围 = **当前窗口 + 上一个窗口**：
+//   `range_start = windowStart(now) - (STATS_WINDOWS-1)*60s`，SQL 条件 `window_start >= range_start`。
+// 于是：搜索/LLM 桶 = 最近 2 个 60s 桶之和（能看到窗口滚动前后的量级，不会因为刚跨窗口就显示空的 0）；
+// 突发桶（window_sec=10）落在最近 2 分钟内 → 全部计入；全局熔断桶**只取当前窗口**（熔断看的是"这一分钟"）；
+// 封禁行只要 `block_until > now` 就算（封禁时长恒 60s，必然落在范围内）。
+//
+// ── 为什么用 `window_start >= ?` ──
+// 走 `idx_rate_counters_window`（range scan），**不是全表扫描**；再往上按 `tier` 分组，返回行数 ≤ 档位数×2。
+//
+// ── 隐私 ──
+// 返回值只有聚合数（buckets/counted/……），**没有任何 bucket_key、没有任何 IP**（表里本来就没有 IP 列）。
+
+/** 聚合覆盖的窗口数（当前窗口 + 上一个窗口；见上方时间范围口径）。 */
+export const STATS_WINDOWS = 2
+
+/** 单作用域聚合（buckets = 行数，counted = SUM(count)）。 */
+export interface RateLimitScopeAgg {
+  buckets: number
+  counted: number
+}
+
+/** 单档位聚合（`limit` = 该档**搜索**限额；非标准档位名 → null，绝不编造数字）。 */
+export interface RateLimitTierAgg {
+  tier: string
+  buckets: number
+  counted: number
+  limit: number | null
+}
+
+/** `GET /api/v1/admin/ratelimit` 响应体（全部为只读聚合，无 IP、无桶 key）。 */
+export interface RateLimitStats {
+  /** 本响应生成时刻（epoch ms） */
+  now: number
+  /** 计数窗口长度（秒） */
+  window_sec: number
+  /** 当前窗口起点（epoch ms） */
+  window_start: number
+  /** 聚合范围起点（epoch ms；= 上一个窗口起点） */
+  range_start: number
+  /** 各档位的桶数与计数（search + llm 桶合并按档位呈现；按 TIERS 顺序，只列有行的档位） */
+  tiers: RateLimitTierAgg[]
+  /** 各作用域的桶数与计数（与 tiers 同一时间范围；global 只取当前窗口） */
+  scopes: { search: RateLimitScopeAgg; llm: RateLimitScopeAgg; burst: RateLimitScopeAgg; global: RateLimitScopeAgg }
+  /** 处于封禁状态的行数（`tier LIKE 'block:%' AND count > now`） */
+  blocked_buckets: number
+  /** 全局匿名熔断：当前窗口计数 + 软/硬阈值 + 状态 */
+  global: { count: number; soft: number; hard: number; state: "normal" | "soft" | "hard" }
+  /** 当前生效的限额（来自 env，与 rateGate 同源） */
+  limits: {
+    logged_in: number
+    cn_residential: number
+    cn_other: number
+    cn_idc: number
+    overseas: number
+    unknown: number
+    llm_divisor: number
+  }
+  /**
+   * 计数子系统是否处于降级状态。**当前唯一的降级源**：HMAC 密钥退化（未配 `PROXY_SHARED_SECRET`）
+   * → 桶名的匿名化强度下降（等于裸哈希，IPv4 可被穷举反查）。
+   * D1 缺失 / 读失败**不**在这里表达（那两种走 503，见路由）。
+   */
+  degraded: boolean
+}
+
+/** 分组查询的行形状（`SELECT tier, window_start, COUNT(*), SUM(count) ... GROUP BY tier, window_start`）。 */
+export interface RateCounterAggRow {
+  tier: unknown
+  window_start: unknown
+  buckets: unknown
+  counted: unknown
+}
+
+function finiteNumber(v: unknown, fallback: number): number {
+  const n = typeof v === "number" ? v : Number(v)
+  return Number.isFinite(n) ? n : fallback
+}
+
+/** 非负整数（脏数据兜底）。 */
+function nonNegInt(v: unknown): number {
+  return Math.max(0, Math.trunc(finiteNumber(v, 0)))
+}
+
+function emptyScopeAgg(): RateLimitScopeAgg {
+  return { buckets: 0, counted: 0 }
+}
+
+/** 档位名 → 中文/标准名之外的兜底：只接受字符串，其它一律空串。 */
+function tierNameOf(v: unknown): string {
+  return typeof v === "string" ? v : ""
+}
+
+/**
+ * 纯函数：把 `rate_counters` 的聚合行 + 封禁行数折叠成 `/admin/ratelimit` 响应体。
+ * 零 IO，便于单测穷举（给定行 → 断言 buckets/counted/by tier）。
+ *
+ * @param rows           `buildRateLimitStats` 的分组行（`tier`/`window_start`/`buckets`/`counted`）
+ * @param blockedBuckets 封禁行数（`count > now` 的 block 行）
+ * @param opts.nowMs     当前时刻（注入便于单测）
+ * @param opts.env       env（限额/阈值同源，与 rateGate 完全一致）
+ * @param opts.hmacDegraded HMAC 密钥是否退化（见 `isDegradedHmacKey`）→ 响应里的 `degraded`
+ */
+export function aggregateRateLimitRows(
+  rows: readonly RateCounterAggRow[],
+  blockedBuckets: number,
+  opts: { nowMs: number; env?: unknown; hmacDegraded?: boolean },
+): RateLimitStats {
+  const env = opts.env ?? {}
+  const windowSec = RATE_WINDOW_SEC
+  const currentStart = windowStart(opts.nowMs, windowSec)
+  const rangeStart = currentStart - (STATS_WINDOWS - 1) * windowSec * 1000
+
+  const scopes = {
+    search: emptyScopeAgg(),
+    llm: emptyScopeAgg(),
+    burst: emptyScopeAgg(),
+    global: emptyScopeAgg(),
+  }
+  const byTier = new Map<string, RateLimitScopeAgg>()
+
+  for (const row of rows) {
+    const buckets = nonNegInt(row.buckets)
+    const counted = nonNegInt(row.counted)
+    const rawTier = tierNameOf(row.tier)
+    const rowWindowStart = finiteNumber(row.window_start, Number.NaN)
+    if (buckets <= 0 || rawTier === "" || !Number.isFinite(rowWindowStart)) continue
+
+    if (rawTier === GLOBAL_TIER_VALUE) {
+      // 全局熔断桶：只看**当前窗口**（跨窗口的残留行不是"这一分钟熔断到哪"的答案）
+      if (rowWindowStart < currentStart) continue
+      scopes.global.buckets += buckets
+      scopes.global.counted += counted
+      continue
+    }
+    if (rawTier.startsWith(BLOCK_TIER_PREFIX)) {
+      // 封禁行由 blocked_buckets 单独表达（`count` 列是 block_until，不是计数，**不能**求和）
+      continue
+    }
+    if (rawTier.startsWith(BURST_TIER_PREFIX)) {
+      scopes.burst.buckets += buckets
+      scopes.burst.counted += counted
+      continue
+    }
+
+    const isLlm = rawTier.startsWith(LLM_TIER_PREFIX)
+    const tier = isLlm ? rawTier.slice(LLM_TIER_PREFIX.length) : rawTier
+    const scope = isLlm ? scopes.llm : scopes.search
+    scope.buckets += buckets
+    scope.counted += counted
+
+    const cur = byTier.get(tier) ?? emptyScopeAgg()
+    cur.buckets += buckets
+    cur.counted += counted
+    byTier.set(tier, cur)
+  }
+
+  // 档位呈现顺序：先按 TIERS（判定顺序），再把非标准档位名（理论上不该出现）按字典序附在后面
+  const known = TIERS as readonly string[]
+  const tiers: RateLimitTierAgg[] = []
+  for (const tier of known) {
+    const agg = byTier.get(tier)
+    if (!agg) continue
+    tiers.push({ tier, buckets: agg.buckets, counted: agg.counted, limit: limitForTier(tier as Tier, env) })
+  }
+  for (const tier of [...byTier.keys()].filter((t) => !known.includes(t)).sort()) {
+    const agg = byTier.get(tier)!
+    // 非标准档位名没有对应的限额来源 → null（**不编造**数字）
+    tiers.push({ tier, buckets: agg.buckets, counted: agg.counted, limit: null })
+  }
+
+  const soft = anonGlobalLimit(env)
+  const hard = anonGlobalHardLimit(env)
+  const globalCount = scopes.global.counted
+  // 与 rateGate 的判定**逐字对应**：`count > soft` 走软熔断（只给关键词回退）；
+  // 硬熔断在 `count == hard` 时开始生效（原子「判-占」的 `WHERE count < hard` 不再命中）。
+  const state: RateLimitStats["global"]["state"] = globalCount >= hard ? "hard" : globalCount > soft ? "soft" : "normal"
+
+  return {
+    now: opts.nowMs,
+    window_sec: windowSec,
+    window_start: currentStart,
+    range_start: rangeStart,
+    tiers,
+    scopes,
+    blocked_buckets: nonNegInt(blockedBuckets),
+    global: { count: globalCount, soft, hard, state },
+    limits: {
+      logged_in: limitForTier("logged_in", env),
+      cn_residential: limitForTier("cn_residential", env),
+      cn_other: limitForTier("cn_other", env),
+      cn_idc: limitForTier("cn_idc", env),
+      overseas: limitForTier("overseas", env),
+      unknown: limitForTier("unknown", env),
+      llm_divisor: llmDivisor(env),
+    },
+    degraded: opts.hmacDegraded === true,
+  }
+}
+
+/**
+ * 读 `rate_counters` 并聚合出 `/admin/ratelimit` 响应体（**只读**，见本段文件头）。
+ * D1 异常一律向上抛（路由回 503 `db-unavailable`），绝不返回编造的数字。
+ */
+export async function buildRateLimitStats(
+  db: D1Database,
+  env: unknown = {},
+  nowMs: number = Date.now(),
+  opts: { hmacDegraded?: boolean } = {},
+): Promise<RateLimitStats> {
+  const windowSec = RATE_WINDOW_SEC
+  const currentStart = windowStart(nowMs, windowSec)
+  const rangeStart = currentStart - (STATS_WINDOWS - 1) * windowSec * 1000
+
+  // ① 分档/突发/全局桶：按 (tier, window_start) 分组（返回行数 ≤ 档位数 × 窗口数）
+  const grouped = await db
+    .prepare(
+      `SELECT tier AS tier, window_start AS window_start, COUNT(*) AS buckets, SUM(count) AS counted
+         FROM rate_counters
+        WHERE window_start >= ? AND tier NOT LIKE ?
+        GROUP BY tier, window_start`,
+    )
+    .bind(rangeStart, `${BLOCK_TIER_PREFIX}%`)
+    .all<RateCounterAggRow>()
+
+  // ② 封禁行数：`count` 列借存 block_until → 只有"还没过期"的才算（正在被封的 IP 数）
+  const blockedRow = await db
+    .prepare("SELECT COUNT(*) AS blocked FROM rate_counters WHERE window_start >= ? AND tier LIKE ? AND count > ?")
+    .bind(rangeStart, `${BLOCK_TIER_PREFIX}%`, nowMs)
+    .first<{ blocked: unknown }>()
+
+  return aggregateRateLimitRows(grouped?.results ?? [], nonNegInt(blockedRow?.blocked), {
+    nowMs,
+    env,
+    hmacDegraded: opts.hmacDegraded,
+  })
 }

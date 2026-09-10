@@ -59,6 +59,7 @@ import {
   type Tier,
 } from "./tiers"
 import {
+  buildRateLimitStats,
   consumeRateToken,
   deriveRateLimitHmacKey,
   isDegradedHmacKey,
@@ -276,15 +277,18 @@ function maybePurgeCounters(c: Context<{ Bindings: Env }>, nowMs: number): void 
 /**
  * 分档闸门（plan §4/§5/§6 的接线点）：解析真实元数据 → 定档 → D1 原子计数 → 突发/熔断判定。
  *
- * 顺序（每一层都比下一层便宜，先便宜后贵）：
+ * 顺序（**不要改动，除②③之间已明确记录的那次修复**）：
  *   ① 封禁检查（`block_until`，只读一行）—— 突发封禁期内一律 429（**先于计数**，被拒不再占名额）；
- *   ② 分档计数（search 或 llm 桶，互不占用额度）—— 超限直接 429；
- *   ③ 突发（10 秒窗口 ≥ `BURST_PER_10S`）—— 429 并封禁 60s（`block_until`）；
+ *   ② 突发（10 秒窗口 ≥ `BURST_PER_10S`）—— 429 并封禁 60s（`block_until`）；
+ *   ③ 分档计数（search 或 llm 桶，互不占用额度）—— 超限直接 429；
  *   ④ 全局匿名软/硬熔断 —— 只掐匿名，登录用户不受影响。
+ * ⚠️ ② 必须在 ③ 之前：突发阈值高于所有档位上限，若放在 ③ 之后，被档位拒绝的请求就**永远进不到**突发层，
+ *    突发层 = 死代码（线上实测 40 并发：scope 全为 tier-limit、burst 出现 0 次）。详见 ② 处的长注释。
  *
  * ── 写放大（诚实版，history.md §5 坑 14：D1 免费版 10 万行写/天）──
- * 每条被闸门处理的请求 = 1 次只读（封禁行）+ 2 次原子计数（分档桶 + 突发桶）；
+ * 每条被闸门处理的请求 = 1 次只读（封禁行）+ 2 次原子计数（突发桶 + 分档桶）；
  * 匿名 `/search` 再多 1 次（全局熔断桶）。即：登录 2 写/请求、匿名搜索 3 写/请求。
+ * 与 ②③ 交换前相比：**正常流量写入行数完全一致**；只有"档位已耗尽仍在刷"的攻击流量会多写 1 行 burst。
  * 为什么不让突发桶"热了才写"（更省写的做法）：**那样会漏计**——闸门只能在"已经计数很高"时才打开，
  * 而突发桶从 0 开始数，于是突发阈值永远追不上（例如 cn_residential 上限 30/min 时根本触发不了 20/10s）。
  * 正确性优先于省写：突发是"大流量直接崩"这条硬需求的实现（plan §6）。R7 的混合计数（KV 近似 + D1 精确）
@@ -332,28 +336,20 @@ async function rateGate(
     }
   }
 
-  // ② 分档计数（D1 原子「判-占」）
-  const res = await consumeRateToken(c.env.DB, {
-    scope: opts.scope,
-    tier,
-    hmacKey,
-    ip: meta.ip,
-    windowSec: RATE_WINDOW_SEC,
-    limit,
-    nowMs,
-  })
-  maybePurgeCounters(c, nowMs)
-  if (res.degraded) console.warn(`[ratelimit] D1 异常 → fail-open scope=${opts.scope} tier=${tier}`)
-  if (!res.ok) {
-    return {
-      ...base,
-      count: res.count,
-      degraded: res.degraded,
-      deny: { reason: "tier-limit", tier, limit, count: res.count, retryAfterSec: res.retryAfterSec },
-    }
-  }
-
-  // ③ 突发（10 秒窗口；每次请求都计入，见上方"写放大"说明）
+  // ② 突发（10 秒窗口）——**必须排在分档计数之前**（2026-09-10 修：原先排在后面 = 死代码）
+  //
+  // ── 为什么顺序不能反（线上实测 + 代码推理）──
+  // 原顺序是「分档计数 → 突发」：② 一旦拒绝就 `return`，被拒的请求**永远进不到**突发层。
+  // 而突发阈值 `BURST_PER_10S=20`（=120 次/分钟）高于**所有**档位上限（最高 `logged_in` 60/分钟 = 10 次/10 秒），
+  // 也就是说：能进入突发层的请求，其上限已经被档位卡在 10 次/10 秒以下 → 20/10s 永远达不到 → 突发与封禁形同不存在。
+  // 线上实测（境外档 10/min）：40 并发 → 10×200 + 30×429，429 的 scope **全部是 tier-limit，burst 出现 0 次**。
+  // 修法：把突发计数提到分档之前 → **每一个到达闸门的请求都计入突发桶**（含已被档位拒绝的），
+  //       脚本刷量在 20 次/10 秒时触发 → 429(scope=burst) + 封禁 60 秒 → 后续一律 429(scope=blocked)。
+  //
+  // ── 写放大（诚实版，history.md §5 坑 14）──
+  // 这次改动只在「档位已耗尽但仍在刷」的攻击场景下多写 1 行 burst（被拒请求现在也计入突发桶）。
+  // 正常流量写入行数与之前**完全一致**（分档桶 + 突发桶 + 匿名全局桶 = 3 行/匿名请求）。
+  // **不要**为了省这 1 行而把顺序退回去：那样突发层就是死代码，省下的是攻击者的成本，付掉的是整站的可用性。
   const burstLimit = burstPer10s(c.env)
   if (meta.ip) {
     const burst = await consumeRateToken(c.env.DB, {
@@ -377,9 +373,31 @@ async function rateGate(
       console.warn(`[ratelimit] 突发触发 → 封禁 ${BURST_BLOCK_SEC}s tier=${tier} burst=${burst.count}/${burstLimit}`)
       return {
         ...base,
-        count: res.count,
+        // 分档计数尚未发生 → 这里回显突发桶计数（该字段仅诊断用，不进 429 响应体）
+        count: burst.count,
         deny: { reason: "burst", tier, limit, count: burst.count, retryAfterSec: BURST_BLOCK_SEC },
       }
+    }
+  }
+
+  // ③ 分档计数（D1 原子「判-占」）
+  const res = await consumeRateToken(c.env.DB, {
+    scope: opts.scope,
+    tier,
+    hmacKey,
+    ip: meta.ip,
+    windowSec: RATE_WINDOW_SEC,
+    limit,
+    nowMs,
+  })
+  maybePurgeCounters(c, nowMs)
+  if (res.degraded) console.warn(`[ratelimit] D1 异常 → fail-open scope=${opts.scope} tier=${tier}`)
+  if (!res.ok) {
+    return {
+      ...base,
+      count: res.count,
+      degraded: res.degraded,
+      deny: { reason: "tier-limit", tier, limit, count: res.count, retryAfterSec: res.retryAfterSec },
     }
   }
 
@@ -957,6 +975,28 @@ api.get("/admin/usage", async (c) => {
   } catch {
     // 不把 SQL 细节回显给客户端；日志只留泛化信息。
     console.warn("[admin] usage aggregation failed")
+    return c.json({ error: "db-unavailable" }, 503)
+  }
+})
+
+// ── GET /admin/ratelimit —— 分档限流观测（plan-ratelimit.md §10 R5 / §11 验收）──
+//   数据面：**只读聚合** `rate_counters` 现有行（见 src/ratecount.ts 的只读聚合段），
+//   口径 = 当前窗口 + 上一个窗口（`window_start >= range_start` 走 idx_rate_counters_window，非全表扫描）。
+//   ⚠️ 本路由**绝不写库**（匿名搜索已是 3 行写/请求，不能再加）：只有两条 SELECT。
+//   隐私：只回聚合数，**没有 IP、没有 bucket_key**（表里本来就没有 IP 列）。
+//   失败语义：缺 D1 → 503 db-unconfigured；读失败 → 503 db-unavailable（与 /admin/usage 同款）。
+api.get("/admin/ratelimit", async (c) => {
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
+  if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
+  try {
+    // 与 rateGate 同一个派生函数 → 面板显示的就是线上实际生效的降级状态（只回布尔，绝不回密钥）
+    const hmacKey = await deriveRateLimitHmacKey(c.env)
+    return c.json(
+      await buildRateLimitStats(c.env.DB, c.env, Date.now(), { hmacDegraded: isDegradedHmacKey(hmacKey) }),
+    )
+  } catch {
+    console.warn("[admin] ratelimit aggregation failed")
     return c.json({ error: "db-unavailable" }, 503)
   }
 })

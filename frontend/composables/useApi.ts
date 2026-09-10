@@ -157,6 +157,25 @@ export interface AdminKeysResponse {
   [key: string]: unknown
 }
 
+/**
+ * 管理端分档限流观测（GET /api/v1/admin/ratelimit）的宽松返回体。
+ * 真实形状见 backend-cf/src/ratecount.ts 的 `RateLimitStats`；前端只按「字段在不在」渲染，
+ * 因此全部可选 + 索引签名（后端加字段不会让前端炸）。
+ */
+export interface AdminRateLimitResponse {
+  now?: number
+  window_sec?: number
+  window_start?: number
+  range_start?: number
+  tiers?: Array<{ tier?: unknown; buckets?: unknown; counted?: unknown; limit?: unknown }>
+  scopes?: Record<string, { buckets?: unknown; counted?: unknown } | undefined>
+  blocked_buckets?: number
+  global?: { count?: unknown; soft?: unknown; hard?: unknown; state?: unknown }
+  limits?: Record<string, unknown>
+  degraded?: boolean
+  [key: string]: unknown
+}
+
 export interface AdminBanRequest {
   account_id: string
   banned: boolean
@@ -172,16 +191,73 @@ export interface AdminQuotaRequest {
   reason?: string
 }
 
+/**
+ * 429 分档限流的附加字段（后端 `rateLimitedResponse`：`{error:"rate-limited", tier, scope, retry_after}`
+ * + `Retry-After` / `X-RateLimit-Limit` 头，见 plan-ratelimit.md §4/§6）。
+ * 全部可选：老部署 / KV 粗限流路径不带这些字段时，字段为 undefined，调用方按缺省文案降级。
+ */
+export interface ApiErrorDetails {
+  /** 建议等待秒数（体里的 `retry_after` 优先，其次 `Retry-After` 头） */
+  retryAfter?: number
+  /** 档位：logged_in / cn_residential / cn_other / cn_idc / overseas / unknown */
+  tier?: string
+  /** 限流作用域：tier-limit / burst / blocked / global-hard */
+  scope?: string
+  /** 本次生效限额（次/窗口；来自 `X-RateLimit-Limit` 头） */
+  limit?: number
+}
+
 /** 带 HTTP 状态码的错误，便于区分「接口未实现（404/501）」与真实故障 */
 export class ApiError extends Error {
   status: number
   code: string
+  /** 429 分档限流的字段（非 429 时全部为 undefined） */
+  retryAfter?: number
+  tier?: string
+  scope?: string
+  limit?: number
 
-  constructor(message: string, status: number, code = "") {
+  constructor(message: string, status: number, code = "", details: ApiErrorDetails = {}) {
     super(message)
     this.name = "ApiError"
     this.status = status
     this.code = code
+    this.retryAfter = details.retryAfter
+    this.tier = details.tier
+    this.scope = details.scope
+    this.limit = details.limit
+  }
+
+  /**
+   * 是否「按 IP 分档限流」的 429。
+   * ⚠️ 必须同时看 `code === "rate-limited"`：**额度耗尽**（`quota-exceeded`）也是 429，
+   * 但语义完全不同（走回退检索、不封禁），前端不能混为一谈（见 index.vue 的提示分支）。
+   */
+  get rateLimited(): boolean {
+    return this.status === 429 && this.code === "rate-limited"
+  }
+}
+
+/** 从任意值里取有限正数（用于 header/body 的宽松解析）。 */
+function positiveNumber(value: unknown): number | undefined {
+  if (value === null || value === undefined || value === "") return undefined
+  const n = typeof value === "number" ? value : Number(value)
+  return Number.isFinite(n) && n >= 0 ? n : undefined
+}
+
+/**
+ * 429（或任意错误）响应的限流附加信息：体里的字段优先，头作兜底。
+ * 绝不解析/记录 Authorization 等任何秘密（只读 Retry-After / X-RateLimit-* 与已知体字段）。
+ */
+function rateLimitDetails(res: Response, data: Record<string, unknown>): ApiErrorDetails {
+  const fromBody = positiveNumber(data?.retry_after)
+  const fromHeader = positiveNumber(res.headers.get("Retry-After"))
+  const limit = positiveNumber(res.headers.get("X-RateLimit-Limit"))
+  return {
+    retryAfter: fromBody ?? fromHeader,
+    tier: typeof data?.tier === "string" && data.tier ? data.tier : undefined,
+    scope: typeof data?.scope === "string" && data.scope ? data.scope : undefined,
+    limit,
   }
 }
 
@@ -189,6 +265,14 @@ export class ApiError extends Error {
 export function isUnimplemented(err: unknown): boolean {
   const status = (err as { status?: number })?.status
   return status === 404 || status === 501
+}
+
+/** 是否「分档限流」的 429（额度过尽的 429 `quota-exceeded` **不算**）。 */
+export function isRateLimited(err: unknown): boolean {
+  const e = err as ApiError | undefined
+  if (e?.rateLimited === true) return true
+  // 兜底：非 ApiError（例如被序列化过）时只看 status+code
+  return (e as { status?: number })?.status === 429 && (e as { code?: string })?.code === "rate-limited"
 }
 
 /** SSE 流式回调（POST /api/v1/search/stream）
@@ -279,7 +363,8 @@ export function useApi() {
       const message = Array.isArray(detail)
         ? detail.join("；")
         : detail?.toString() || code || `HTTP ${res.status}`
-      throw new ApiError(message, res.status, code)
+      // 429：把 retry_after / tier / scope / limit 一并带出（前端据此做倒计时与档位提示）
+      throw new ApiError(message, res.status, code, rateLimitDetails(res, data as Record<string, unknown>))
     }
     return data as T
   }
@@ -324,7 +409,8 @@ export function useApi() {
       const code = typeof data?.error === "string" ? data.error : ""
       const detail = data?.detail
       const message = Array.isArray(detail) ? detail.join("；") : detail?.toString() || code || `HTTP ${res.status}`
-      throw new ApiError(message, res.status, code)
+      // SSE 路径的 429 同样带出限流字段（/search/stream 用的是 llm 桶，限额更紧）
+      throw new ApiError(message, res.status, code, rateLimitDetails(res, data as Record<string, unknown>))
     }
 
     const contentType = res.headers.get("content-type") ?? ""
@@ -428,6 +514,16 @@ export function useApi() {
     return request<AdminUsageResponse>("/v1/admin/usage")
   }
 
+  /**
+   * 管理端：分档限流观测（GET /api/v1/admin/ratelimit，plan-ratelimit.md §10 R5）。
+   * 只读聚合 `rate_counters`：各档/各作用域的桶数与计数、封禁行数、全局熔断状态、当前限额。
+   * 缺 D1 → 503；读失败 → 503；老部署没有该路由 → 404（页面显示「接口未实现」）。
+   * 字段可缺（页面按存在与否降级渲染），因此用宽松类型。
+   */
+  async function adminRatelimit(): Promise<AdminRateLimitResponse> {
+    return request<AdminRateLimitResponse>("/v1/admin/ratelimit")
+  }
+
   /** 管理端：审计日志（GET /api/v1/admin/audit，已实现；需 ADMIN_API_KEY） */
   async function adminAudit(limit = 30): Promise<Record<string, unknown>> {
     return request<Record<string, unknown>>("/v1/admin/audit", { params: { limit } })
@@ -525,6 +621,7 @@ export function useApi() {
     chat,
     me,
     adminUsage,
+    adminRatelimit,
     adminAudit,
     adminKeys,
     adminBan,
