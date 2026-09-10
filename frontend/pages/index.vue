@@ -205,7 +205,7 @@
       </div>
 
       <!-- 桌面右侧：AI 伴读与引用视窗 -->
-      <aside class="hidden w-80 shrink-0 lg:block">
+      <aside class="hidden w-80 shrink-0 lg:block xl:w-96">
         <AiCompanionCard
           :answer="aiAnswer"
           :citations="aiCitations"

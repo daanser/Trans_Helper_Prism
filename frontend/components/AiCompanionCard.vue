@@ -41,7 +41,7 @@
     <div
       v-if="answer"
       ref="scrollEl"
-      class="ai-answer max-h-[58vh] overflow-y-auto overscroll-contain pr-1 text-xs leading-relaxed text-ink-body lg:max-h-[calc(100vh-26rem)]"
+      class="ai-answer max-h-[58vh] overflow-y-auto overscroll-contain pl-1 pr-3 text-xs leading-relaxed text-ink-body lg:max-h-[calc(100vh-26rem)]"
       @click="onAnswerClick"
       @scroll.passive="onAnswerScroll"
     >
@@ -214,6 +214,30 @@ function send() {
 /* Markdown 正文样式。
    注意：tailwind.config 的 content globs 不含 utils/，所以渲染器字符串里**不能**写工具类
    （会被 purge 掉）—— 这里用语义 token 对应的 CSS 变量，浅色/深色自动跟随。 */
+/* 滚动条：细、低调、不压字。
+   `scrollbar-gutter: stable` 让滚动槽**始终预留**，出现/消失时文字不会左右跳动。 */
+.ai-answer {
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-color-hover) transparent;
+}
+.ai-answer::-webkit-scrollbar {
+  width: 10px;
+}
+.ai-answer::-webkit-scrollbar-track {
+  background: transparent;
+}
+.ai-answer::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 9999px;
+  background: var(--border-color);
+  background-clip: content-box;
+}
+.ai-answer::-webkit-scrollbar-thumb:hover {
+  background: var(--border-color-hover);
+  background-clip: content-box;
+}
+
 .ai-answer :deep(.md > *:first-child) {
   margin-top: 0;
 }
@@ -221,7 +245,7 @@ function send() {
   margin-bottom: 0;
 }
 .ai-answer :deep(.md p) {
-  margin: 0.5em 0;
+  margin: 0.65em 0;
 }
 .ai-answer :deep(.md h1),
 .ai-answer :deep(.md h2),
@@ -241,17 +265,17 @@ function send() {
   font-size: 0.875rem;
 }
 .ai-answer :deep(.md ul) {
-  margin: 0.5em 0;
-  padding-left: 1.25em;
+  margin: 0.65em 0;
+  padding-left: 1.4em;
   list-style: disc;
 }
 .ai-answer :deep(.md ol) {
-  margin: 0.5em 0;
-  padding-left: 1.25em;
+  margin: 0.65em 0;
+  padding-left: 1.4em;
   list-style: decimal;
 }
 .ai-answer :deep(.md li) {
-  margin: 0.2em 0;
+  margin: 0.3em 0;
 }
 .ai-answer :deep(.md li > p) {
   margin: 0;
