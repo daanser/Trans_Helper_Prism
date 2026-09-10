@@ -93,7 +93,9 @@ function sanitizeRedirect(env: Env, raw: string | undefined): string {
   const base = frontendBase(env)
   if (!raw) return `${base}/login/` // 带尾斜杠：直击 CF Pages 的 /login/ 静态页，避免多一次 308
   try {
-    // 相对路径（前端 login("/login") 会传 "/login"）要先按前端基址解析，否则会被当非法直接丢回默认
+    // 相对路径（前端 login("/login") 会传 "/login"）按前端基址解析成**绝对 URL**。
+    // ⚠️ 必须返回绝对 URL：返回相对路径会被浏览器按「当前域」解析——回调发生在 Worker 域，
+    // 于是跳到 https://<worker>/login#token=… → 404，登录态也就不生效（线上踩过）。
     const u = new URL(raw, `${base}/`)
     const allowed = (env.ALLOWED_ORIGINS ?? "")
       .split(",")
@@ -101,7 +103,9 @@ function sanitizeRedirect(env: Env, raw: string | undefined): string {
       .filter(Boolean)
     const origin = `${u.protocol}//${u.host}`
     if (allowed.includes("*") || allowed.includes(origin) || origin === new URL(base).origin) {
-      return raw
+      // 去掉 hash（token 由 loginRedirectUrl 统一拼），确保是绝对地址
+      u.hash = ""
+      return u.toString()
     }
   } catch {
     // 非法 URL：退回默认
@@ -252,7 +256,8 @@ export async function sessionFromHeader(env: Env, header: string | undefined): P
 
 /** 拼登录成功后的前端回跳地址（token 放 fragment，不进服务端日志）。 */
 export function loginRedirectUrl(env: Env, redirectAfter: string, token: string): string {
-  const base = redirectAfter || `${frontendBase(env)}/login`
+  // 双保险：只接受绝对 http(s) 地址，否则一律回到前端默认登录页（绝不发相对 Location）
+  const base = /^https?:\/\//i.test(redirectAfter) ? redirectAfter : `${frontendBase(env)}/login/`
   const sep = base.includes("#") ? "&" : "#"
   return `${base}${sep}token=${encodeURIComponent(token)}`
 }

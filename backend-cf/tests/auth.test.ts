@@ -144,6 +144,19 @@ describe("startXLogin", () => {
 
     const good = await startXLogin(env, "https://search.example/settings")
     expect(JSON.parse(store.get(`oauth:${good.state}`)!).r).toBe("https://search.example/settings")
+
+    // 回归：相对路径必须被解析成**绝对 URL**。若原样返回 "/login"，浏览器会按当前域解析——
+    // 回调发生在 Worker 域，于是跳到 https://<worker>/login#token=… → 404（线上踩过）。
+    const rel = await startXLogin(env, "/login")
+    expect(JSON.parse(store.get(`oauth:${rel.state}`)!).r).toBe("https://search.example/login")
+  })
+
+  it("回归：loginRedirectUrl 只发绝对地址（相对输入一律回前端默认登录页）", () => {
+    const env = makeEnv()
+    expect(loginRedirectUrl(env, "/login", "tok")).toBe("https://search.example/login/#token=tok")
+    expect(loginRedirectUrl(env, "https://search.example/login/", "tok")).toBe(
+      "https://search.example/login/#token=tok",
+    )
   })
 })
 
