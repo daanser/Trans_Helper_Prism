@@ -218,6 +218,23 @@ function forwardedRequestHeaders(request: Request, env?: Env): Headers {
   const secret = typeof env?.PROXY_SHARED_SECRET === "string" ? env.PROXY_SHARED_SECRET : ""
   if (secret) headers.set("x-prism-proxy", secret)
 
+  // ── 真实客户端的网络元数据（分档限流用：CN 家宽放宽 / 机房与境外收紧）──
+  // 为什么必须在这里取：Worker 收到的 `request.cf` 描述的是 **CF 内部子请求**
+  // （线上实测 asn=13335 / org=Cloudflare，而不是用户），
+  // 而本 Function 的入站请求 `request.cf` 才是**真实客户端连接**的元数据。
+  // 值由 CF 边缘按真实连接写入，浏览器伪造不了；后端只在 `x-prism-proxy` 密钥匹配时才采信。
+  headers.delete("x-prism-country")
+  headers.delete("x-prism-asn")
+  headers.delete("x-prism-colo")
+  const meta = (request as unknown as { cf?: Record<string, unknown> }).cf ?? {}
+  const country = typeof meta.country === "string" ? meta.country : ""
+  const asn = typeof meta.asn === "number" || typeof meta.asn === "string" ? String(meta.asn) : ""
+  const colo = typeof meta.colo === "string" ? meta.colo : ""
+  // 头值必须是 ISO-8859-1 安全字符：只放两位国家码 / 纯数字 ASN / 三字母 colo
+  if (/^[A-Za-z]{2}$/.test(country)) headers.set("x-prism-country", country.toUpperCase())
+  if (/^[0-9]{1,10}$/.test(asn)) headers.set("x-prism-asn", asn)
+  if (/^[A-Za-z]{3}$/.test(colo)) headers.set("x-prism-colo", colo.toUpperCase())
+
   return headers
 }
 
