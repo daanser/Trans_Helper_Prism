@@ -45,6 +45,22 @@ X OAuth 的回调地址是 `https://transhelper-prism-backend.transprism.workers
 
 ---
 
+## 🔴 P0.5：按 IP 分档限流 + 配额重置展示（设计稿已完成，待实施）
+
+**设计稿见 [`plan-ratelimit.md`](./plan-ratelimit.md)**（含分档阈值、ASN 清单维护方式、D1 计数表、熔断、隐私与验收标准）。
+
+实施顺序（详见该文档 §10）：
+1. **R1**（你，5 分钟）：CF 边缘限流规则 —— zone `chengxi.moe` → Security → WAF → Rate limiting rules
+   → `/api/v1/search` + 按 IP + 10 秒窗口 / 20 次 → Block 10 秒。**这层在边缘拦，连 Worker 成本都省。**
+2. **R2**（你 + 我）：`PROXY_SHARED_SECRET` 在 **Pages env** 与 **Worker Secret** 两处设成同一个值（代码已就绪）。
+3. **R3–R5**（我/subagent）：D1 计数 + 分档（CN 家宽 30 / 其余 10 / 登录 60 次每分钟）+ 熔断 + 观测。
+4. **R6（本条是你单独点名的 TODO）**：**5h 额度重置时间的展示与锚定方式**
+   - 现状：窗口起点 = 每个用户**自己首次请求的时刻**（天然错峰，不存在全局统一重置挤爆）；
+     但**会漂移**（过期后从"下次请求时刻"重算）→ 重置时刻不可预测，无法展示"还有多久重置"。
+   - 计划：改为**按注册时间的网格锚定**（`window_start = 注册时间 + k×5h`），重置时刻固定可预测且仍错峰；
+   - `/api/v1/me` 增加 `window_end` / `reset_at` / `reset_in_sec`；
+   - 前端顶栏显示「x 小时后重置」，额度耗尽时提示「将于 x 小时后（HH:MM）恢复」。
+
 ## 🟡 P1：其它已知缺口
 
 1. ~~**`/admin/usage` 的每账号 `requests` / `llm_tokens_*`**：需要 `key_usage` 加 `account_id` 列并接线~~ → **已完成（2026-09-09）**：`key_usage` 加 `account_id`、检索链路（embed/rerank）与 chat 都记账，线上实测 `requests=4 / llm_in=2281 / llm_out=491`。
