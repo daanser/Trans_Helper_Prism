@@ -98,9 +98,14 @@ export async function loadIngestFiles(db: D1Database | undefined, wikiId: string
 async function upsertIngestFile(db: D1Database | undefined, wikiId: string, path: string, hash: string): Promise<void> {
   if (!db) return
   try {
+    // ⚠️ 用 `ON CONFLICT DO UPDATE` 而**不是** `INSERT OR REPLACE`：后者语义是 DELETE + INSERT，
+    // 未列出的列会被重置为默认值 —— 会把 Actions 侧写在 `blob_sha` 的"零 chunk 集合"记录抹成 NULL
+    // （技术债 #5，见 src/ingestfiles.ts 文件头）。本语句只覆盖自己那两列，两套判据互不干扰。
+    // 对 Worker 侧自身语义无变化：PK 不变，content_hash/updated_at 的赋值与原来完全一致。
     await db
       .prepare(
-        "INSERT OR REPLACE INTO ingest_files (wiki_id, path, content_hash, updated_at) VALUES (?, ?, ?, ?)",
+        `INSERT INTO ingest_files (wiki_id, path, content_hash, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(wiki_id, path) DO UPDATE SET content_hash = excluded.content_hash, updated_at = excluded.updated_at`,
       )
       .bind(wikiId, path, hash, Date.now())
       .run()

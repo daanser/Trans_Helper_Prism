@@ -152,11 +152,26 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
 -- 每次 ingest 记录 content_dir 下每个入库文件的路径 + 内容 hash，
 -- 下次跑时只对 hash 变化的文件重新 embed/upsert，消失的文件删除（Qdrant points）。
 -- 无此表时退化全量重嵌（幂等覆盖），不破坏旧行为。
+--
+-- ⚠️ 历史表补列（SQLite 没有 ADD COLUMN IF NOT EXISTS）：
+--    ALTER TABLE ingest_files ADD COLUMN blob_sha TEXT;
+--    同 key_usage.account_id / quotas.requests：**故意不写在本文件**，由 SCHEMA_MIGRATIONS
+--    单独导出 + apply-schema 容忍 duplicate column name / ALTER 的 no such table。
+--
+-- ── 两列 sha 的分工（技术债 #5，别混用）──
+--   · `content_hash` = **Worker 内摄取**的判据：sha1(原始文件内容) hex（ingest/incremental.ts 自己写自己读）。
+--   · `blob_sha`     = **GitHub Actions 摄取**的判据：git blob sha（`scripts/ingest-incremental.ts`
+--                      从 trees API 拿到，与 Qdrant payload.blob_sha 同一个值）。
+--   为什么需要 blob_sha：产出 0 chunk 的极短文件没有 Qdrant point → 没有 payload 可存 blob_sha
+--   → 每轮增量都被当成"新文件"重新解析（history.md §8.2 第 5 条，永远空转）。
+--   现在由 `/admin/ingest/files` 把这类文件的 blob_sha 记在这一列（"零 chunk 集合"），
+--   下一轮 sha 未变即跳过。**只有 blob_sha 非空的行**才属于该集合，两条链路互不干扰。
 -- ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS ingest_files (
   wiki_id      TEXT NOT NULL,
   path         TEXT NOT NULL,                  -- repo-root 相对路径（与 Qdrant payload.path 一致）
-  content_hash TEXT NOT NULL,                  -- sha1(原始文件内容) hex
+  content_hash TEXT NOT NULL,                  -- sha1(原始文件内容) hex（Worker 侧判据）
+  blob_sha     TEXT,                           -- git blob sha（Actions 侧判据；NULL = 未登记为零 chunk 文件）
   updated_at   INTEGER NOT NULL,               -- epoch ms
   PRIMARY KEY (wiki_id, path)
 );

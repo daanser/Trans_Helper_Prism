@@ -16,6 +16,13 @@
 //   QDRANT_URL=... QDRANT_API_KEY=... EMBED_POOL_KEYS=... GITHUB_TOKEN=... \
 //     npx tsx scripts/ingest-incremental.ts [--only=mtf-wiki] [--full] [--dry-run]
 //
+// 可选（技术债 #5，见 src/ingestfiles.ts 文件头）：`ADMIN_API_KEY` + `API_BASE` 同时存在时，
+// 本脚本会向 Worker 取/回报"**零 chunk 文件集合**"（D1 `ingest_files.blob_sha`）：
+//   · 跑之前 GET  /api/v1/admin/ingest/files?wiki_id=…  → path→git blob sha
+//   · 跑之后 POST /api/v1/admin/ingest/files            → 登记本轮的 0 chunk 文件 / 移除已产出 chunk 的
+// 目的：极短文件解析后产出 0 chunk → 没有 Qdrant payload 可存 blob_sha → 每轮都被当"新文件"复核（空转）。
+// 取/报失败**一律只警告**：退化成"照旧复核"（今天的行为），绝不影响摄取。
+//
 // 可选：INGEST_SUMMARY_PATH=/path/summary.json —— 把本次每个 wiki 的结果写成**机器可读**摘要，
 // 供 `.github/workflows/ingest.yml` 的"上报摄取摘要"步骤 POST 到
 // `POST /api/v1/admin/ingest/runs`（Worker 代笔写 D1 `ingest_runs`；本脚本没有 D1 绑定，也不该有）。
@@ -37,6 +44,7 @@ import {
 } from "../src/ingest/parser"
 import { createEmbeddingProvider } from "../src/embeddings"
 import { ensureCollection, upsertPoints, type QdrantPoint } from "./one-shot-import"
+import { shouldProcessFile } from "../src/ingestfiles"
 import type { KeyPoolDb } from "../src/keypool"
 
 // ── CLI ──
@@ -51,6 +59,10 @@ const QDRANT_API_KEY = (process.env.QDRANT_API_KEY ?? "").trim()
 const EMBED_POOL_KEYS = (process.env.EMBED_POOL_KEYS ?? "").trim()
 const GITHUB_TOKEN = (process.env.GITHUB_TOKEN ?? "").trim()
 const EMBEDDING_DIM = parseInt(process.env.EMBEDDING_DIM ?? "1024", 10)
+// 零 chunk 集合（技术债 #5）：两个都配了才启用；任一缺失 → 静默退化为"照旧复核"
+const ADMIN_API_KEY = (process.env.ADMIN_API_KEY ?? "").trim()
+const API_BASE = (process.env.API_BASE ?? "").trim().replace(/\/+$/, "")
+const ZERO_CHUNK_ENABLED = ADMIN_API_KEY !== "" && API_BASE !== ""
 
 if (!QDRANT_URL) throw new Error("缺少 QDRANT_URL")
 if (!EMBED_POOL_KEYS) throw new Error("缺少 EMBED_POOL_KEYS")
@@ -183,6 +195,63 @@ async function deleteByIds(collection: string, ids: Array<string | number>): Pro
   }
 }
 
+// ── 零 chunk 文件集合（技术债 #5；详见 src/ingestfiles.ts 文件头）──
+
+/**
+ * 取该 wiki 的"零 chunk 集合"（path → git blob sha）。
+ * 未配置 ADMIN_API_KEY/API_BASE、或任何网络/协议错误 → 返回空 Map（= 今天的行为：全部照旧复核）。
+ */
+async function fetchZeroChunkSet(wikiId: string): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  if (!ZERO_CHUNK_ENABLED) return out
+  try {
+    const resp = await fetch(`${API_BASE}/api/v1/admin/ingest/files?wiki_id=${encodeURIComponent(wikiId)}`, {
+      headers: { authorization: `Bearer ${ADMIN_API_KEY}` },
+    })
+    if (!resp.ok) {
+      console.warn(`  [${wikiId}] 取零 chunk 集合失败 HTTP ${resp.status} → 本轮照旧复核`)
+      return out
+    }
+    const j = (await resp.json()) as { files?: Array<{ path?: unknown; blob_sha?: unknown }> }
+    for (const f of j.files ?? []) {
+      const path = typeof f.path === "string" ? f.path : ""
+      const sha = typeof f.blob_sha === "string" ? f.blob_sha : ""
+      if (path && sha) out.set(path, sha)
+    }
+  } catch (e) {
+    console.warn(`  [${wikiId}] 取零 chunk 集合异常（不影响摄取）：${(e as Error)?.message ?? String(e)}`)
+  }
+  return out
+}
+
+/**
+ * 回报本轮结果：`zero_chunk` = 本轮"产出 0 chunk"的文件（登记进集合），`drop` = 不再属于集合的 path
+ * （本轮产出了 chunk，或文件已从仓库消失）。
+ * 失败只警告（集合没更新 → 下一轮继续复核，正确性不受影响）。
+ */
+async function reportZeroChunkSet(
+  wikiId: string,
+  zeroChunk: Array<{ path: string; blob_sha: string }>,
+  drop: string[],
+): Promise<void> {
+  if (!ZERO_CHUNK_ENABLED) return
+  if (zeroChunk.length === 0 && drop.length === 0) return
+  try {
+    const resp = await fetch(`${API_BASE}/api/v1/admin/ingest/files`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN_API_KEY}` },
+      body: JSON.stringify({ wiki_id: wikiId, zero_chunk: zeroChunk, drop }),
+    })
+    if (!resp.ok) {
+      console.warn(`  [${wikiId}] 回报零 chunk 集合失败 HTTP ${resp.status} → 下一轮会再复核一次`)
+      return
+    }
+    console.log(`  [${wikiId}] 零 chunk 集合已更新：登记 ${zeroChunk.length} 条、移除 ${drop.length} 条`)
+  } catch (e) {
+    console.warn(`  [${wikiId}] 回报零 chunk 集合异常（不影响摄取）：${(e as Error)?.message ?? String(e)}`)
+  }
+}
+
 // ── 主流程 ──
 interface WikiSummary {
   wiki_id: string
@@ -207,11 +276,20 @@ async function runWiki(wikiId: string): Promise<WikiSummary> {
   const mdSet = new Set(md.map((e) => e.path))
 
   const existing = DRY ? new Map<string, ExistingPath>() : await readExisting(collection)
-  const changed = md.filter((e) => FULL || existing.get(e.path)?.blobSha !== e.sha)
+  // 零 chunk 文件集合（技术债 #5）：`path → git blob sha`。有 payload 的文件仍只看 Qdrant 的 blob_sha，
+  // 这里是**额外**的跳过条件（逻辑与），所以对"已有 payload 的文件"行为逐字节不变。
+  const zeroChunk = DRY ? new Map<string, string>() : await fetchZeroChunkSet(wiki.id)
+  const changed = md.filter((e) =>
+    // 判据实现见 src/ingestfiles.ts 的 shouldProcessFile()（有 payload → Qdrant 裁决；无 payload → 零 chunk 集合）
+    shouldProcessFile({ full: FULL, treeSha: e.sha, payloadSha: existing.get(e.path)?.blobSha, zeroChunkSha: zeroChunk.get(e.path) }),
+  )
   const removed = [...existing.keys()].filter((p) => !mdSet.has(p))
+  // 集合里已从仓库消失的 path（0 chunk 文件不会被 Qdrant 记录，所以不在 removed 里）→ 顺手清掉
+  const staleZeroChunk = [...zeroChunk.keys()].filter((p) => !mdSet.has(p))
 
   if (changed.length === 0 && removed.length === 0) {
-    console.log(`  [${wiki.id}] 无变更（${md.length} 个 .md），跳过`)
+    console.log(`  [${wiki.id}] 无变更（${md.length} 个 .md${zeroChunk.size > 0 ? `，其中 ${zeroChunk.size} 个零 chunk 文件已登记` : ""}），跳过`)
+    await reportZeroChunkSet(wiki.id, [], staleZeroChunk)
     return { wiki_id: wiki.id, files_total: md.length, changed: 0, removed: 0, chunks: 0, points_upserted: 0, seconds: (Date.now() - started) / 1000, skipped: true }
   }
 
@@ -258,6 +336,7 @@ async function runWiki(wikiId: string): Promise<WikiSummary> {
     `  [${wiki.id}] .md=${md.length} changed=${targets.length} removed=${removed.length} chunks=${chunks.length}${DRY ? " (dry-run)" : ""}`,
   )
   if (DRY) {
+    // dry-run 零副作用：不写 Qdrant，也不动零 chunk 集合
     return { wiki_id: wiki.id, files_total: md.length, changed: targets.length, removed: removed.length, chunks: chunks.length, points_upserted: 0, seconds: (Date.now() - started) / 1000 }
   }
 
@@ -303,6 +382,19 @@ async function runWiki(wikiId: string): Promise<WikiSummary> {
       upserted += points.length
     }
   }
+
+  // 零 chunk 集合回报（技术债 #5）：**按 changed（含 _index.md）而不是 targets** 统计，
+  // 因为 `_index.md` 只作目录元数据、永远产出 0 chunk —— 把它也登记进集合，下一轮它的 sha 未变时
+  // 连"拉取 _index.md"这一步都省掉（否则 changed 永远非空，早退分支永不触发）。
+  const chunkCountByPath = new Map<string, number>()
+  for (const c of chunks) chunkCountByPath.set(c.record.path, (chunkCountByPath.get(c.record.path) ?? 0) + 1)
+  const zeroChunkNow: Array<{ path: string; blob_sha: string }> = []
+  const nowHasChunks: string[] = []
+  for (const e of changed) {
+    if ((chunkCountByPath.get(e.path) ?? 0) === 0) zeroChunkNow.push({ path: e.path, blob_sha: e.sha })
+    else nowHasChunks.push(e.path)
+  }
+  await reportZeroChunkSet(wiki.id, zeroChunkNow, [...nowHasChunks, ...staleZeroChunk])
 
   return {
     wiki_id: wiki.id,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // TransHelper Prism — incremental.ts 单测 (tasks.md T2.2 真增量版)
-// 全 mock：GitHub tarball/commit、Qdrant scroll/upsert/delete、D1（ingest_runs、ingest_files、bigram）。
+// 全 mock：GitHub tarball/commit、Qdrant scroll/upsert/delete、D1（ingest_runs、ingest_files）。
+// D1 mock **严格**：未识别的语句一律抛错（防止实现漂移后测试静默通过，同 quota.test.ts 的 mock 哲学）。
 // 覆盖：commit 相同 skip；真·文件级增量（hash 未变不重嵌、只 upsert changed）；新增/修改/删除文件；
 //       记账；无 D1/Qdrant 降级。注意：contentHash 用 WebCrypto，vitest(node) 环境原生支持。
 import { describe, it, expect, vi, beforeEach } from "vitest"
@@ -27,15 +28,16 @@ function buildTarball(repo: string, branch: string, files: Record<string, string
   return Buffer.concat([...entries, Buffer.alloc(512), Buffer.alloc(512)])
 }
 
-/** 内存 D1 mock：ingest_files 表（wiki → Map<path, hash>）、ingest_runs 写入、bigram 写入计数。 */
+/** 内存 D1 mock：ingest_files 表（wiki → Map<path, hash>）、ingest_runs 写入、全部语句记录。 */
 function makeDbMock(opts: { lastCommit?: string; ingestFiles?: Map<string, string> } = {}): {
   db: D1Database
   ingestRuns: IngestResult[]
-  bigramWrites: number
+  /** 所有被 prepare 的 SQL（用于断言"语句形状"与"不再有 bigram 写入"） */
+  sqls: string[]
   filesTable: Map<string, string> // path → hash（最近一次 ingest 后）
 } {
   const ingestRuns: IngestResult[] = []
-  let bigramWrites = 0
+  const sqls: string[] = []
   const filesTable = opts.ingestFiles ?? new Map<string, string>()
   const stmt = {
     bind(..._args: unknown[]) {
@@ -48,14 +50,15 @@ function makeDbMock(opts: { lastCommit?: string; ingestFiles?: Map<string, strin
           return (opts.lastCommit ? { commit_sha: opts.lastCommit } : null) as T | null
         },
         run: async () => {
-          bigramWrites++
-          return { success: true, meta: { changes: 1 } }
+          // 未识别的写入语句 → 直接抛错（严格 mock：读/写语句都在下面显式列出）
+          throw new Error(`unexpected-sql: ${sqls[sqls.length - 1]}`)
         },
       }
     },
   }
   const db = {
     prepare: (sql: string) => {
+      sqls.push(sql)
       if (sql.startsWith("INSERT INTO ingest_runs")) {
         return {
           bind() {
@@ -63,7 +66,7 @@ function makeDbMock(opts: { lastCommit?: string; ingestFiles?: Map<string, strin
           },
         }
       }
-      if (sql.includes("INSERT OR REPLACE INTO ingest_files")) {
+      if (sql.includes("INSERT INTO ingest_files")) {
         return {
           bind(...args: unknown[]) {
             return {
@@ -92,7 +95,7 @@ function makeDbMock(opts: { lastCommit?: string; ingestFiles?: Map<string, strin
       return stmt
     },
   } as unknown as D1Database
-  return { db, ingestRuns, bigramWrites, filesTable }
+  return { db, ingestRuns, sqls, filesTable }
 }
 
 /** 构造 fetch mock：GitHub tarball / commit / Qdrant scroll / upsert / delete / embedding。 */
@@ -161,16 +164,17 @@ describe("ingestWiki 真·文件级增量", () => {
     vi.restoreAllMocks()
   })
 
-  it("commit 与上次相同 → skipped，0 upsert、0 bigram 写入", async () => {
-    const { db } = makeDbMock({ lastCommit: "abc123" })
+  it("commit 与上次相同 → skipped，0 upsert、0 ingest_files 写入", async () => {
+    const { db, sqls } = makeDbMock({ lastCommit: "abc123" })
     const { fetchImpl, upserts } = makeFetchMock({ ...WIKI, files: FILES_ALL, commitSha: "abc123" })
     const res = await ingestWiki(makeEnv(db), "mtf-wiki", { fetchImpl })
     expect(res.status).toBe("skipped")
     expect(res.points_upserted).toBe(0)
     expect(upserts).toHaveLength(0)
+    expect(sqls.some((q) => q.includes("INSERT INTO ingest_files"))).toBe(false)
   })
 
-  it("首次 ingest：全部文件都 upsert + bigram + 记账 + ingest_files 记录", async () => {
+  it("首次 ingest：全部文件都 upsert + 记账 + ingest_files 记录", async () => {
     const { db, ingestRuns, filesTable } = makeDbMock({ lastCommit: "old-sha" })
     const { fetchImpl, upserts } = makeFetchMock({ ...WIKI, files: FILES_ALL, commitSha: "new-sha" })
     const res = await ingestWiki(makeEnv(db), "mtf-wiki", { fetchImpl })
@@ -245,6 +249,21 @@ describe("ingestWiki 真·文件级增量", () => {
     const res = await ingestWiki(makeEnv(db, false), "mtf-wiki", { fetchImpl })
     expect(res.status).toBe("success")
     expect(res.points_upserted).toBe(0)
+  })
+
+  it("ingest_files 的写入用 ON CONFLICT DO UPDATE（不用 INSERT OR REPLACE）——保住 blob_sha 零 chunk 集合", async () => {
+    const { db, sqls } = makeDbMock({ lastCommit: "old-sha" })
+    const { fetchImpl } = makeFetchMock({ ...WIKI, files: FILES_ALL, commitSha: "new-sha-x" })
+    await ingestWiki(makeEnv(db), "mtf-wiki", { fetchImpl })
+    const writes = sqls.filter((q) => q.includes("INSERT INTO ingest_files"))
+    expect(writes.length).toBeGreaterThan(0)
+    for (const w of writes) {
+      expect(w).toContain("ON CONFLICT(wiki_id, path) DO UPDATE SET content_hash = excluded.content_hash")
+      // REPLACE = DELETE+INSERT，会把 Actions 侧写的 blob_sha 抹成 NULL（技术债 #5 的坑）
+      expect(w).not.toContain("INSERT OR REPLACE")
+    }
+    // 全部语句里都不该再出现 bigram（技术债 #2 已删表；回归即失败）
+    expect(sqls.some((q) => q.includes("bigram"))).toBe(false)
   })
 
   it("无 D1（undefined）→ 退化：全部当 changed 处理", async () => {

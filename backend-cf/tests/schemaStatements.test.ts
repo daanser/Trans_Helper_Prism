@@ -48,6 +48,7 @@ describe("key_usage.account_id：新库建表 + 历史表补列迁移", () => {
     expect(SCHEMA_MIGRATIONS).toEqual([
       `ALTER TABLE key_usage ADD COLUMN account_id TEXT NOT NULL DEFAULT ''`,
       `ALTER TABLE quotas ADD COLUMN requests INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE ingest_files ADD COLUMN blob_sha TEXT`,
       `DROP TABLE IF EXISTS bigram_index`,
       `DROP INDEX IF EXISTS idx_bigram_gram_wiki`,
       `DROP INDEX IF EXISTS idx_bigram_path_wiki`,
@@ -57,15 +58,18 @@ describe("key_usage.account_id：新库建表 + 历史表补列迁移", () => {
     // 列可空性/默认值正确：历史行补列后 account_id=''（匿名归属）、requests=0，不会因 NOT NULL 失败
     expect(SCHEMA_MIGRATIONS[0]).toMatch(/^ALTER TABLE key_usage ADD COLUMN account_id TEXT NOT NULL DEFAULT ''$/)
     expect(SCHEMA_MIGRATIONS[1]).toMatch(/^ALTER TABLE quotas ADD COLUMN requests INTEGER NOT NULL DEFAULT 0$/)
+    expect(SCHEMA_MIGRATIONS[2]).toMatch(/^ALTER TABLE ingest_files ADD COLUMN blob_sha TEXT$/)
   })
 
   it("容忍的报错：duplicate column name（任意语句）、ALTER 的 no such table", () => {
     const alter = SCHEMA_MIGRATIONS[0]
-    // 两条 ALTER 走同一套容忍规则（quotas.requests 与 key_usage.account_id 语义一致）
+    // 三条 ALTER 走同一套容忍规则（key_usage.account_id / quotas.requests / ingest_files.blob_sha 语义一致）
     expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[1], "D1_ERROR: duplicate column name: requests")).toBe(true)
     expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[1], "SQLITE_ERROR: no such table: quotas")).toBe(true)
+    expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[2], "D1_ERROR: duplicate column name: blob_sha")).toBe(true)
+    expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[2], "SQLITE_ERROR: no such table: ingest_files")).toBe(true)
     // DROP 不需要容忍规则：它本身幂等；真报错（库不可用）必须算 failed
-    expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[2], "D1_ERROR: network connection lost")).toBe(false)
+    expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[3], "D1_ERROR: network connection lost")).toBe(false)
     // 已迁移过 / 新库建表时已带该列
     expect(isToleratedSchemaError(alter, "SQLITE_ERROR: duplicate column name: account_id")).toBe(true)
     expect(isToleratedSchemaError(alter, "D1_ERROR: duplicate column name: account_id")).toBe(true)

@@ -10,7 +10,8 @@
 #   QDRANT_API_KEY    Qdrant API key
 #   EMBED_POOL_KEYS   硅基流动 embedding key（可逗号分隔多个）
 #   ADMIN_API_KEY     可选：摄取跑完把摘要上报给 Worker（它代笔写 D1 ingest_runs，
-#                     后台 /admin 才看得见摄取历史）；未配置则该步自动跳过，摄取不受影响
+#                     后台 /admin 才看得见摄取历史），并读写"零 chunk 文件集合"
+#                     （/admin/ingest/files，技术债 #5）；未配置则这两件事自动跳过，摄取不受影响
 #   （GITHUB_TOKEN 由 Actions 自动提供，用于 GitHub API 提高限额）
 
 name: ingest
@@ -67,6 +68,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # 让脚本把每个 wiki 的结果写成机器可读摘要，供下一步上报（见 scripts/ingest-incremental.ts 文件头）
           INGEST_SUMMARY_PATH: ${{ runner.temp }}/ingest-summary.json
+          # 零 chunk 文件集合（技术债 #5）：脚本跑前 GET / 跑后 POST /api/v1/admin/ingest/files，
+          # 让"解析后产出 0 chunk 的极短文件"在 sha 未变时被跳过（否则每轮都空转复核）。
+          # 两个都配了才启用；未配则退化为"照旧复核"，绝不影响摄取。
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          API_BASE: https://transhelper-prism-backend.transprism.workers.dev
         run: |
           ARGS=""
           if [ "${{ inputs.full }}" = "true" ]; then ARGS="$ARGS --full"; fi

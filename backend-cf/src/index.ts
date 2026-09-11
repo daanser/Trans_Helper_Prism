@@ -71,6 +71,7 @@ import {
 import { listAudit, writeAudit } from "./audit"
 import { SCHEMA_MIGRATIONS, SCHEMA_STATEMENTS, isToleratedSchemaError } from "./db/schemaStatements"
 import { clampIngestRunsLimit, insertIngestRun, listIngestRuns, parseIngestRunInput } from "./ingestruns"
+import { applyIngestFilesPlan, listZeroChunkFiles, parseIngestFilesInput } from "./ingestfiles"
 import { runFallback, type FallbackResponse } from "./fallback"
 import {
   buildPrompt,
@@ -1356,6 +1357,69 @@ api.get("/admin/ingest/runs", async (c) => {
   } catch {
     return c.json({ error: "db-unavailable" }, 503)
   }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// "零 chunk 文件集合"（技术债 #5：极短文件每轮增量都被复核）
+// 复用 `ingest_files` 表的新列 `blob_sha`（只有它非空的行属于本集合）：
+//   · GET  取集合（path → git blob sha），Actions 侧据此跳过"sha 未变的 0-chunk 文件"；
+//   · POST 批量登记/移除（一轮一次往返，不 N 次请求）。
+// 鉴权：adminAuthorize；只处理 path + sha + 计数，不收也不回显任何密钥（详见 src/ingestfiles.ts 文件头）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /admin/ingest/files?wiki_id=<id> —— 该 wiki 的"零 chunk 集合"
+// 返回：{ ok:true, wiki_id, files:[{path, blob_sha}], count, truncated }
+// 只返回 blob_sha 非空的行：Worker 侧摄取写的行（只有 content_hash）不会出现在这里。
+api.get("/admin/ingest/files", async (c) => {
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
+  if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
+
+  const wikiId = (c.req.query("wiki_id") ?? "").trim()
+  if (!wikiId) return c.json({ error: "wiki_id-required" }, 422)
+
+  try {
+    const { files, truncated } = await listZeroChunkFiles(c.env.DB, wikiId)
+    return c.json({ ok: true, wiki_id: wikiId, files, count: files.length, truncated })
+  } catch {
+    return c.json({ error: "db-unavailable" }, 503)
+  }
+})
+
+// POST /admin/ingest/files —— 批量登记"0 chunk 文件"、批量移除不再属于集合的 path
+//   body: { wiki_id, zero_chunk?: [{path, blob_sha}], drop?: [path] }
+//   · zero_chunk → upsert（ON CONFLICT DO UPDATE，只改 blob_sha/updated_at，不动 content_hash）
+//   · drop       → DELETE（文件本轮产出了 chunk，或已从仓库消失）
+// 单请求上限 2000 条（超出截断并在响应里标 truncated）；单条非法只跳过并计数（不 422）。
+// 返回：{ ok:true, wiki_id, zero_chunk, dropped, skipped, truncated }
+api.post("/admin/ingest/files", async (c) => {
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
+  if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
+
+  let body: unknown = {}
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: "invalid-body" }, 422)
+  }
+  const parsed = parseIngestFilesInput(body)
+  if (!parsed.ok) return c.json({ error: parsed.error }, 422)
+
+  try {
+    await applyIngestFilesPlan(c.env.DB, parsed.plan, Date.now())
+  } catch {
+    // 失败必须可见（Actions 侧会软失败：本轮照旧复核，不影响摄取）
+    return c.json({ error: "db-unavailable" }, 503)
+  }
+  return c.json({
+    ok: true,
+    wiki_id: parsed.plan.wiki_id,
+    zero_chunk: parsed.plan.zero_chunk.length,
+    dropped: parsed.plan.drop.length,
+    skipped: parsed.plan.skipped,
+    truncated: parsed.plan.truncated,
+  })
 })
 
 // POST /api/v1/admin/ingest/trigger —— 手动触发 ingest（T2.2 运维入口，受 ADMIN_API_KEY 保护）

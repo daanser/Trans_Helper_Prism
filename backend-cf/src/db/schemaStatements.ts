@@ -29,7 +29,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS idx_key_usage_account_created ON key_usage (account_id, created_at)`,
   `CREATE TABLE IF NOT EXISTS ingest_runs ( id TEXT PRIMARY KEY, wiki_id TEXT NOT NULL, commit_sha TEXT, status TEXT NOT NULL, files_added INTEGER NOT NULL DEFAULT 0, files_updated INTEGER NOT NULL DEFAULT 0, files_deleted INTEGER NOT NULL DEFAULT 0, points_upserted INTEGER NOT NULL DEFAULT 0, points_deleted INTEGER NOT NULL DEFAULT 0, tokens_used INTEGER NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0, key_ref TEXT, duration_ms INTEGER, error TEXT, started_at INTEGER NOT NULL, finished_at INTEGER )`,
   `CREATE TABLE IF NOT EXISTS chat_sessions ( id TEXT PRIMARY KEY, account_id TEXT NOT NULL, model_id TEXT NOT NULL, corpora TEXT NOT NULL DEFAULT '[]', round_count INTEGER NOT NULL DEFAULT 0, initial_hits TEXT NOT NULL DEFAULT '[]', history TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL )`,
-  `CREATE TABLE IF NOT EXISTS ingest_files ( wiki_id TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (wiki_id, path) )`,
+  `CREATE TABLE IF NOT EXISTS ingest_files ( wiki_id TEXT NOT NULL, path TEXT NOT NULL, content_hash TEXT NOT NULL, blob_sha TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY (wiki_id, path) )`,
   `CREATE INDEX IF NOT EXISTS idx_ingest_files_wiki ON ingest_files (wiki_id)`,
   `CREATE TABLE IF NOT EXISTS audit_log ( id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL )`,
   `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log (created_at)`,
@@ -56,7 +56,9 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
  *      · 已迁移过：报 `duplicate column name`（**容忍**，视为成功）。
  *   ② `ALTER TABLE quotas ADD COLUMN requests`（2026-09-11 技术债 D：真实用户请求数）
  *      · 同样的三种情形由同一套 `isToleratedSchemaError()` 兜住（duplicate column / ALTER 的 no such table）。
- *   ③ `DROP TABLE IF EXISTS bigram_index`（+ 两条 `DROP INDEX IF EXISTS`）
+ *   ③ `ALTER TABLE ingest_files ADD COLUMN blob_sha`（2026-09-11 技术债 #5：零 chunk 文件的 sha 来源）
+ *      · 与 ①② 同一套容忍规则；**只有 blob_sha 非空的行**属于"零 chunk 集合"，Worker 侧摄取不受影响。
+ *   ④ `DROP TABLE IF EXISTS bigram_index`（+ 两条 `DROP INDEX IF EXISTS`）
  *      · **天然幂等**：表/索引不存在时 SQLite 不报错，所以不需要容忍规则；
  *        显式删索引是为了"表被人为重建过、索引还在"这种中间态也干净。
  *      · 顺序安全：本数组**先于** SCHEMA_STATEMENTS 执行，而后者已不再创建 bigram_index，
@@ -65,6 +67,7 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
 export const SCHEMA_MIGRATIONS: readonly string[] = [
   `ALTER TABLE key_usage ADD COLUMN account_id TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE quotas ADD COLUMN requests INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE ingest_files ADD COLUMN blob_sha TEXT`,
   `DROP TABLE IF EXISTS bigram_index`,
   `DROP INDEX IF EXISTS idx_bigram_gram_wiki`,
   `DROP INDEX IF EXISTS idx_bigram_path_wiki`,
