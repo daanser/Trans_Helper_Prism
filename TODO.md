@@ -137,11 +137,12 @@ _最后更新：2026-09-09_
 - **D ✅** `quotas.requests` 列 + 在 `chargeQuota` 同一条原子 UPDATE 里自增 → `/admin/usage.requests` 变真实用户请求数
 - 验证：`tsc --noEmit` 0 错、`vitest run` **537 全绿**（基线 529 + 8）
 
-### ⚠️ 明天推送时的**硬顺序**（不遵守会出故障）
-1. `git push`（Worker 会随 GitHub 集成重部署）
-2. **立刻** `POST /api/v1/admin/db/apply-schema`（建 `quotas.requests` 列 + `DROP bigram_index`）
-   —— 因为 D 项的 `chargeQuota` 已经引用新列，**迁移跑完前配额扣费会 fail-open 失效**（可用性不受影响，但不计费）
-3. 验收：`/admin/usage` 的 `requests` 是否随搜索增长；`POST /admin/ingest/runs` + `GET /admin/ingest/runs` 各来一条
+### 推送与迁移（2026-09-11 复核后修正）
+1. `git push`（Worker 随 GitHub 集成重部署）
+2. 随后 `POST /api/v1/admin/db/apply-schema`（建 `quotas.requests` 列 + `DROP TABLE bigram_index`）
+   - ✅ **不再有"顺序错了就坏"的风险**：`chargeQuota` 用 `try { 带 requests } catch { 不带 requests }` 兜底
+     （见 `src/quota.ts`），缺列时只扣 `used_cost`、不计数，配额扣费照常工作。所以迁移只是为了**启用计数**与**回收旧表**。
+3. 验收：`/admin/usage` 的 `requests` 是否随登录搜索增长；`POST /admin/ingest/runs` + `GET /admin/ingest/runs` 各来一条
 4. 补 C 的 workflow 步骤 + 你加 `ADMIN_API_KEY` 到 GitHub Secrets
 
 ### 其余待办
