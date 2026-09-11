@@ -125,27 +125,20 @@ _最后更新：2026-09-09_
 
 ---
 
-## ⏸ 明天从这里继续（2026-09-10 收工时的状态）
+## ✅ 技术债 1–4 已清除（2026-09-11）
 
-### 已本地提交、**故意未推送**的一批：技术债 A/B/D + C 的端点
-提交信息：`wip(tech-debt): 清 bigram_index / 删 listActiveKeys / ingest_runs 端点 / quotas.requests 真值`
-（工作区干净；`git log origin/main..HEAD` 可看到）
+| # | 项 | 状态 |
+|---|---|---|
+| 1 | `ingest_runs` 记账接上（Worker 代笔 + Actions 上报）| ✅ 线上验证：手动触发一轮，4 个 wiki 全部 `HTTP 200` 并落 D1 |
+| 2 | 清掉死掉的 `bigram_index`（表 + 写入路径；**保留 `splitBigrams`**）| ✅ `DROP TABLE` 已在线执行 |
+| 3 | 删掉从未被消费的 `KeyPoolDb.listActiveKeys?` | ✅ |
+| 4 | `/admin/usage.requests` 改真实用户请求数（同条原子 UPDATE 自增）| ✅ 实测 0→1 |
 
-- **A ✅** 移除死亡 bigram 写入路径 + schema 去表 + 幂等迁移 `DROP TABLE IF EXISTS bigram_index`（**保留 `splitBigrams`**，`fallback.ts` 还在用）
-- **B ✅** 删掉从未被消费的 `KeyPoolDb.listActiveKeys?`
-- **C ◐** `POST/GET /api/v1/admin/ingest/runs` 端点已完成；**`.github/workflows/ingest.yml` 的回传步骤还没加**（subagent 被中断）；仓库 Secrets 也还没加 `ADMIN_API_KEY`
-- **D ✅** `quotas.requests` 列 + 在 `chargeQuota` 同一条原子 UPDATE 里自增 → `/admin/usage.requests` 变真实用户请求数
-- 验证：`tsc --noEmit` 0 错、`vitest run` **537 全绿**（基线 529 + 8）
+- 迁移：`apply-schema` 26 条语句（`tolerated` 仅预期的重复列、`failed` 空）
+- GitHub Secret `ADMIN_API_KEY` 已配置
+- 线上遗留一条**测试记录**：`ingest_runs` 里 `commit_sha=test0001` 那行（手工验证端点时写的，无删除端点，忽略即可）
 
-### 推送与迁移（2026-09-11 复核后修正）
-1. `git push`（Worker 随 GitHub 集成重部署）
-2. 随后 `POST /api/v1/admin/db/apply-schema`（建 `quotas.requests` 列 + `DROP TABLE bigram_index`）
-   - ✅ **不再有"顺序错了就坏"的风险**：`chargeQuota` 用 `try { 带 requests } catch { 不带 requests }` 兜底
-     （见 `src/quota.ts`），缺列时只扣 `used_cost`、不计数，配额扣费照常工作。所以迁移只是为了**启用计数**与**回收旧表**。
-3. 验收：`/admin/usage` 的 `requests` 是否随登录搜索增长；`POST /admin/ingest/runs` + `GET /admin/ingest/runs` 各来一条
-4. 补 C 的 workflow 步骤 + 你加 `ADMIN_API_KEY` 到 GitHub Secrets
-
-### 其余待办
-- 技术债 #5（0-chunk 短文件每次复核）—— C 的通道打通后可解
-- M4（灰度运营）：内测反馈、压测复跑、月账、运营面板
+### 下一步候选
+- **技术债 #5**：极短文件每轮复核 —— 现在已能观测到（`rle-wiki files=3 points=0`），修法是把这类文件的 sha 记进 `ingest_files`
+- **M4（灰度运营）**：内测反馈、压测复跑、月账、运营面板
 - 技术债 #7（ASN 清单按真实流量校准）—— 等有量再说

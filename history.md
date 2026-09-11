@@ -157,12 +157,28 @@
 | **运营面板** | `/admin` 的封禁/加额/审计目前是"可看不可点"（需 admin 会话或运维 `ADMIN_API_KEY`）；`/admin/ratelimit` 已有观测 |
 | **域名冗余** | `task-second-domain.md`（等 `transhelper.org` 账号权限）|
 
-### 8.2 技术债（按建议优先级）
-1. **`ingest_runs` 记账未接**：摄取跑在 GitHub Actions、没有 D1 访问权 → 后台看不到摄取历史。接法：给 Actions 配一个最小权限的 CF API Token，或让 Actions 调 `POST /admin/db/apply-schema` 之外的记账端点（需新端点）。
-2. **`bigram_index` 表已废弃**：回退检索早已改用 Qdrant 全文索引，表还占着 D1 空间 → 可直接 `DROP TABLE`（记得同步 `schema.sql`/`schemaStatements.ts`）。
-3. **`KeyPoolDb.listActiveKeys` 从未被消费**：跨 isolate 的 key 剔除不落库；当前真相源是 KV 禁用集（无 TTL，清空即回到全可用）。
-4. **`/admin/usage` 的 `requests` 口径**：现为「上游调用次数」（含换 key 重试），不是「用户请求数」；要后者需另加计数列。
-5. **产出 0 chunk 的极短文件**：每次增量都被复核（无 payload 可存 `blob_sha`），影响可忽略。
+### 8.2 技术债（按建议优先级）—— **2026-09-11：1/2/3/4 已清除**
+> 清除批次：本地提交 `3743c2c` + `b93a3ad`（已推送）。验证：tsc 0 错、**537 用例全绿**；
+> 线上 `apply-schema` 26 条语句（`tolerated` 仅预期的重复列、`failed` 空）；
+> `/admin/usage.requests` 实测随登录搜索 0→1；`POST/GET /api/v1/admin/ingest/runs` 实测可用；
+> GitHub Actions 手动触发一轮，4 个 wiki 全部上报 `HTTP 200` 并落进 D1。
+
+1. **✅ `ingest_runs` 记账已接**（原：Actions 无 D1 绑定 → 后台看不到摄取历史）
+   - 新增 `POST/GET /api/v1/admin/ingest/runs`（admin 鉴权）→ **由 Worker 代笔写 D1**，Actions 不持有 D1 凭据；
+   - `scripts/ingest-incremental.ts` 支持 `INGEST_SUMMARY_PATH` 写机器可读摘要；`.github/workflows/ingest.yml` 末步
+     `if: always() && env.ADMIN_API_KEY != ''` + `continue-on-error: true` 上报（未配 secret 自动跳过、失败不阻断）；
+   - 需要在仓库 Secrets 配 `ADMIN_API_KEY`（已配）。
+   - **副产品**：这套观测立刻量化了下面的 #5 —— 实测 `rle-wiki files=3 points=0`，即"极短文件每轮被复核"确实在发生。：摄取跑在 GitHub Actions、没有 D1 访问权 → 后台看不到摄取历史。接法：给 Actions 配一个最小权限的 CF API Token，或让 Actions 调 `POST /admin/db/apply-schema` 之外的记账端点（需新端点）。
+2. **✅ `bigram_index` 已清除**：注意 **`src/bigram.ts` 本身没死**（`fallback.ts` 用它的 `splitBigrams` 做本地重排打分，**已保留**）；
+   死的是**表 + 写入路径**：移除了摄取里的 `writeBigramRow` 与 `DELETE FROM bigram_index`，schema 去掉建表，
+   并加幂等迁移 `DROP TABLE IF EXISTS bigram_index`（已在线执行）。
+3. **✅ `KeyPoolDb.listActiveKeys` 已删除**（从未被任何代码消费）。key 的跨请求禁用**以 KV 禁用集 `keydeny:<pool>` 为唯一真相源**；
+   `provider_keys.enabled` 仅供管理端展示与审计。
+4. **✅ `/admin/usage.requests` 已是真实用户请求数**：`quotas` 增列 `requests`，在 `chargeQuota` 的**同一条原子 UPDATE**
+   里 `requests = requests + 1`（零额外写）；并有 `try { 带 requests } catch { 不带 requests }` 兜底 —— **迁移前也不会坏**。
+   口径：额度耗尽走回退的请求不扣费、因而不计入该列。
+5. **产出 0 chunk 的极短文件**：每次增量都被复核（无 payload 可存 `blob_sha`）。**现已可量化**（见 #1 的观测：
+   实测 `rle-wiki files=3 points=0`）。修法：借 #1 打开的通道把这类文件的 sha 记进 `ingest_files`（待做）。
 6. **配额窗口无主动清理任务**：靠"读取时判断"，够用；若将来要清理历史行再另加 cron。
 7. **`ASN` 清单是初始值**：需按真实流量校准（`plan-ratelimit.md` §4.1 有方法：APNIC/iptoasn + `asOrganization` 关键词筛选）。
 8. **前端可选**：自定义模型「设为默认」；LLM 回答的轻量 markdown 渲染（用户已否决引 md 库，可自研极简版）；i18n。
