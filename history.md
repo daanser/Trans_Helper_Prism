@@ -136,6 +136,17 @@
    - 已知取舍：本地 ack 是**设备级**（不带账号标识）→ 同一浏览器换账号登录不会再弹；且**有意不**把本地 ack 反推给服务端
      （否则共享电脑上 A 的确认会静默代表 B 同意）。
 
+43. **`/search` 的端到端延迟主要是 D1 往返次数，不是检索本身**（2026-09-11 压测复跑发现）：
+   检索管线自身很快（`embed 243ms + Qdrant 466ms + rerank 704ms`，Worker 自报 `total_ms` P50 = 860ms/1208ms），
+   但**端到端 TTFB 是 4.9–5.0s** —— 差的 3.5–4.5s 花在**限流闸门 + 配额路径约 15 次顺序 D1 往返**上
+   （实测单次 D1 读/写 0.1–0.2s：`/healthz` 0.16s、`/me` 0.45s、`POST /me/disclaimer` 0.3s，而 `POST /search` 3.6–5.4s）。
+   **注意 Worker 的 `timings.total_ms` 不包含闸门与配额的开销** —— 排查延迟时别只看这个数字。
+   优化方向：把闸门/配额里的多条语句合并成 `db.batch([...])`（一次往返跑多条），预计可把端到端压回 ~1.5–2s。
+44. **压测要防三个坑**：① 同一 query 第二次会被 **KV 向量阶段缓存**命中（key 里**不带 rerank 开关**），
+   所以"rerank 关→开"两次跑同一 query 时，第二次的 `cached=true` 是正常的、数值仍可比；
+   ② 用**匿名**身份跑基准会被分档限流掐（我方出口是境外档 10/min）→ 用**登录 token**（60/min）跑；
+   ③ 每次 `curl` 都新建连接会把 TLS 握手算进墙钟 → 测端到端要用 `--next` 复用连接，或分开看 TTFB。
+
 ## 6. 前端现状（2026-09-08 全量重写 UI/UX；2026-09-09 已上线 Pages）
 - **设计语言已彻底换掉**：不再是照搬 `vitepress-theme-project-trans` 的 indigo 色板。现为自定「温润学术检索」风——浅底 `#F8FAFC` / 深底 `#0B1120`，品牌蓝 `#2563EB`（深 `#3B82F6`），token 全走 `assets/css/main.css` 的 CSS 变量（`--bg-canvas/--bg-surface/--text-*/--primary*`），`tailwind.config.ts` 只做语义映射（`canvas/surface/primary/ink`）。
 - **用户明确否决过的方向（别再走回头路）**：① 高饱和四色彩虹 wiki 徽章（粉/天蓝/紫/翠绿）——太 AI 味；② 纯黑 `bg-slate-900` 实色选中块——太凝重死寂；③ 全大写英文终端风标签（`ARCHIVE RETRIEVAL //`、`SEARCH`、`PERF //`）——读不懂。现方案：四库**统一中性**选中态（淡蓝底 `bg-blue-50/80` + 勾选 `✓`，无彩色区分），中文标签，`max-w-7xl` 宽屏。
