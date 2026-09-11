@@ -32,13 +32,8 @@ import {
   toQuotaResponse,
 } from "./quota"
 import {
-  checkSubjectRateLimit,
-  clientIpFromHeaders,
-  kvRateLimitStore,
   PROXY_CLIENT_IP_HEADER,
   PROXY_SECRET_HEADER,
-  type RateLimitPolicy,
-  rateLimitHeaders,
   resolveClientIp,
   resolveClientMeta,
   timingSafeEqualString,
@@ -98,7 +93,7 @@ import {
   isSafeKeyRef,
   kvDenyStore,
   poolRefsFromEnv,
-  readDeniedPools,
+  readDeniedPoolsCached,
   setKeyDenied,
   upsertProviderKey,
   type DeniedPools,
@@ -166,10 +161,15 @@ function chatProviderFor(env: Env, accountId: string | undefined) {
 /**
  * T3.3 运行时效：读 KV 的「admin 下架 key」集合（fail-open）。
  * 读 KV / 解析 / 任何异常 → 空集合（视为无禁用），**绝不影响检索与 LLM**。
+ *
+ * ── 性能优化第二轮 B：进程内缓存（TTL 默认 30s，env `KEY_DENY_CACHE_TTL_SEC`）──
+ * 线上实测 KV 未命中 get = 260–496ms，而"没有任何 key 被禁用"是常态 → 每个请求白等 0.3–0.5s。
+ * 缓存后 TTL 内 **0 次 KV 读**；代价是管理端下架 key 后本 isolate 最多 30s 才生效
+ * （多 isolate 各自缓存；禁用集是"硬控制面"而非安全边界，这个取舍见 keyadmin.readDeniedPoolsCached 的注释）。
  */
 async function loadDeniedKeys(env: Env): Promise<DeniedPools> {
   try {
-    return await readDeniedPools(kvDenyStore(env.SEARCH_CACHE), env)
+    return await readDeniedPoolsCached(kvDenyStore(env.SEARCH_CACHE), env)
   } catch {
     return { embed: [], llm: [], rerank: [] }
   }
@@ -189,21 +189,6 @@ function toLlmHits(hits: SearchResponse["hits"]): LlmHit[] {
   return hits.map((h) => ({ id: h.id, title: h.title, url: h.url, source: h.source, text: h.snippet }))
 }
 
-/**
- * 限流策略（env 可调）。匿名放开向量检索后，IP 维度是唯一的成本闸门，故默认收紧到 20 次/分钟；
- * 登录账号 60 次/分钟（另有配额计量兜底）。
- */
-function rateLimitPolicy(env: Env): RateLimitPolicy {
-  const parse = (raw: string | undefined, fallback: number): number => {
-    const n = Number(raw)
-    return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
-  }
-  return {
-    account: { limit: parse(env.RATE_LIMIT_ACCOUNT_PER_MIN, 60), windowSec: 60 },
-    ip: { limit: parse(env.RATE_LIMIT_IP_PER_MIN, 20), windowSec: 60 },
-  }
-}
-
 /** 未登录是否强制只走关键词回退（plan §2 登录制；REQUIRE_LOGIN=0 可关闭）。 */
 function requireLogin(env: Env): boolean {
   return (env.REQUIRE_LOGIN ?? "1") !== "0"
@@ -214,9 +199,10 @@ function requireLogin(env: Env): boolean {
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // ── 与既有 KV 限流的关系 ──
-// KV 那段（checkSubjectRateLimit）**原样保留**：它仍是「同一 colo 内的廉价近似闸门」，
-// 直连流量还在用它。本段是**权威判定**：跨 colo 收敛（D1 单点一致），按档位给额度。
-// 两者串联：先 KV（便宜、可能失准），再 D1（准、但每条请求 1 写 + 1 读）。
+// **2026-09-11 起 KV 限流器已从请求路径摘除**（此前是"先 KV 再 D1"串联）：
+// `checkSubjectRateLimit` 对 account 与 ip 各 get+put，实测 put 635–653ms → 每请求白付 ~1.3s，
+// 而它既不准（KV 无原子自增 + 跨 colo 不收敛，history.md 坑 23/35）又功能冗余（D1 分档才是权威）。
+// 现在只跑 D1 分档闸门（≤4 次 batch 往返 ≈ 0.5s）。`ratelimit.ts` 模块与单测保留，恢复只需改回 /search。
 //
 // ── 绝不打印 IP ──
 // 本段所有日志只含档位/限额/原因（**没有 IP，没有密钥**）。IP 只在 ratecount 内部参与 HMAC，
@@ -266,16 +252,28 @@ let rateOpsSincePurge = 0
  * 顺手清理过期计数行（plan §5：**不引入定时任务**）。
  * 生产走 `c.executionCtx.waitUntil`（不增加请求延迟）；测试环境没有 ExecutionContext 时静默跳过。
  */
+/**
+ * 取 `ctx.waitUntil`（拿不到就返回 undefined）。
+ * Hono 的 `c.executionCtx` 在**没有执行上下文**时（单测 `app.request` 不带第 4 参、非 Worker 调用）
+ * 会 **throw**，所以统一在这里 try/catch 一次，调用方按 undefined 走"同步等待"的回退路径。
+ */
+function ctxWaitUntil(c: Context<{ Bindings: Env }>): ((promise: Promise<unknown>) => void) | undefined {
+  try {
+    const ctx = c.executionCtx
+    return (promise: Promise<unknown>) => ctx.waitUntil(promise)
+  } catch {
+    return undefined
+  }
+}
+
 function maybePurgeCounters(c: Context<{ Bindings: Env }>, nowMs: number): void {
   rateOpsSincePurge += 1
   if (rateOpsSincePurge < purgeEvery(c.env)) return
   rateOpsSincePurge = 0
   const job = purgeExpiredCounters(c.env.DB, nowMs).catch(() => 0)
-  try {
-    c.executionCtx.waitUntil(job)
-  } catch {
-    // 无 ExecutionContext（单测 / 非 Worker 调用）：丢弃这次清理，下次请求再来
-  }
+  const waitUntil = ctxWaitUntil(c)
+  if (waitUntil) waitUntil(job)
+  // 无 ExecutionContext → 丢弃这次清理，下次请求再来（清理是"顺手做"，不是正确性依赖）
 }
 
 /**
@@ -577,19 +575,19 @@ api.post("/search", async (c) => {
     throw err
   }
 
-  // ① 限流：未登录按 IP，登录按账号（KV 缺失 fail-open）
+  // ① 会话（限流已由下面的 D1 分档闸门统一负责，KV 限流器 2026-09-11 摘除，原因见下）
   const session = await sessionFromHeader(c.env, c.req.header("Authorization"))
-  const ip = clientIpFromHeaders(c.req.raw.headers, c.env)
-  const rl = await checkSubjectRateLimit(
-    c.env.SEARCH_CACHE ? kvRateLimitStore(c.env.SEARCH_CACHE) : undefined,
-    { ip, accountId: session?.sub },
-    rateLimitPolicy(c.env),
-    nowMs,
-  )
-  if (rl.degraded) console.warn(`[ratelimit] degraded scope=${rl.scope}`)
-  if (!rl.allowed) {
-    return c.json({ error: "rate-limited", retry_after: rl.retryAfterSec }, 429, rateLimitHeaders(rl))
-  }
+
+  // ── KV 限流器为什么被摘掉（线上实测，别再凭直觉加回来）──
+  // 这里原本先跑一遍 `checkSubjectRateLimit`（KV）：对 account 与 ip **各 get + put**。
+  // 拆掉它的三个理由：
+  //   ① **成本最大头**：`/admin/d1bench` 实测 KV put = **635–653ms**、未命中 get = 260–496ms
+  //      → 2 次 put ≈ 1.3s/请求，正是"handler 5.6s 里 gate 段 2.28s 却只解释 461ms"的差值来源。
+  //   ② **功能冗余**：D1 分档闸门（下一个步骤）才是**权威判定**，且压到 ≤4 次 batch 往返（~0.5s）。
+  //   ③ **可靠性早就否掉**：KV 无原子自增 + 多边缘最终一致 → 经反代实测失效（history.md 坑 23/35），
+  //      当时已把它降级成"粗兜底"；一个既不准又最贵的东西不该待在最热的路径上。
+  // KV 里的 `rl:*` 键会自然过期，无需迁移；`ratelimit.ts` 模块与其单测**保留**（要恢复只需把这段调回）。
+  // 相应 env `RATE_LIMIT_IP_PER_MIN` / `RATE_LIMIT_ACCOUNT_PER_MIN` 已废弃（见 types.ts 注释，声明保留避免 wrangler 报错）。
 
   // ①b D1 分档计数（**权威**，plan-ratelimit.md §5）：按真实 country/ASN 定档给额度，
   //     并发突发与全局匿名熔断也在这里判定。D1 不可用 → fail-open（打 warning）。
@@ -630,6 +628,8 @@ api.post("/search", async (c) => {
   try {
     const result = await runSearch(req, c.env, {
       denied: await loadDeniedKeys(c.env),
+      // 缓存**写**交给 waitUntil（KV put 实测 635–653ms，不该阻塞响应）；见 search.ts 的 RunSearchOpts.waitUntil
+      waitUntil: ctxWaitUntil(c),
       // 账号作用域的用量记账：embedding / rerank 的每次上游调用都落 key_usage.account_id
       // （匿名 = 空串，仍记账；只是不归属任何账号）。不改检索语义。
       db: makeKeyUsageDb(c.env, session?.sub),
@@ -817,6 +817,7 @@ api.post("/search/stream", async (c) => {
   try {
     result = (await runSearch({ ...req, use_llm: false }, c.env, {
       denied,
+      waitUntil: ctxWaitUntil(c), // 同上：缓存写不阻塞流式响应的首包
       db: makeKeyUsageDb(c.env, session.sub),
     })) as SearchResponse
   } catch (err) {

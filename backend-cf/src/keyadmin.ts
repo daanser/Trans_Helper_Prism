@@ -120,6 +120,56 @@ export function emptyDeniedPools(): DeniedPools {
   return { embed: [], llm: [], rerank: [] }
 }
 
+/** 禁用集进程内缓存的默认 TTL（秒）：env `KEY_DENY_CACHE_TTL_SEC` 可覆盖。 */
+export const DEFAULT_DENY_CACHE_TTL_SEC = 30
+
+/** isolate 级缓存条目（每个 isolate 各存一份）。 */
+let denyCache: { pools: DeniedPools; at: number } | null = null
+
+/** 清空禁用集缓存（单测用；也便于运维在调试时手动失效）。 */
+export function resetDeniedPoolsCache(): void {
+  denyCache = null
+}
+
+/** 缓存 TTL（秒）：env `KEY_DENY_CACHE_TTL_SEC`，默认 30；`<= 0` = 关闭缓存（每次都读 KV）。 */
+export function denyCacheTtlSec(env: unknown = {}): number {
+  const raw = envString(env, "KEY_DENY_CACHE_TTL_SEC")
+  if (raw === undefined || raw.trim() === "") return DEFAULT_DENY_CACHE_TTL_SEC
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return DEFAULT_DENY_CACHE_TTL_SEC
+  return Math.max(0, Math.floor(n))
+}
+
+/**
+ * `readDeniedPools()` 的**带缓存**版本（热路径用）—— 性能优化第二轮 B。
+ *
+ * ── 为什么需要缓存 ──
+ * 禁用集变化极少（只有管理端上下架 key 时才变），但每次搜索都会读一次 KV（3 个键、Promise.all）。
+ * 线上实测：KV 未命中 get = 260–496ms，于是"永远没有 key 被禁用"的正常情况下，
+ * 每个请求仍要白等 ~0.3–0.5s。缓存后 TTL 内 0 次 KV 读。
+ *
+ * ── 语义（改前先读）──
+ *   · **fail-open 不变**：`readDeniedPools()` 自身吞错返回空集；这里连"读失败"也会被缓存 30 秒
+ *     （等价于"这段时间视为无禁用"），与既有的 fail-open 取向一致。
+ *   · **时效取舍（重要）**：管理端下架某个 key 后，**当前 isolate 最多 30 秒后才生效**；
+ *     多 isolate（多 colo / 多实例）各自缓存，最坏情形也是 30 秒。这是刻意接受的：
+ *     禁用集只是"硬控制面"（防某把 key 被滥用/欠费），**不是安全边界**，
+ *     30 秒的延迟换掉每请求 0.3–0.5s 的固定成本非常划算。
+ *     需要立刻生效的场景：把 `KEY_DENY_CACHE_TTL_SEC` 设成 0（关闭缓存），或等 isolate 轮换。
+ *   · TTL 用注入的 `nowMs` 判定，便于单测；生产用 `Date.now()`。
+ */
+export async function readDeniedPoolsCached(
+  kv: DenyKvStore | undefined,
+  env: unknown = {},
+  nowMs: number = Date.now(),
+): Promise<DeniedPools> {
+  const ttlSec = denyCacheTtlSec(env)
+  if (ttlSec > 0 && denyCache && nowMs - denyCache.at < ttlSec * 1000) return denyCache.pools
+  const pools = await readDeniedPools(kv, env)
+  if (ttlSec > 0) denyCache = { pools, at: nowMs }
+  return pools
+}
+
 /**
  * 读 KV 得到「每个池被禁用的 ref」。
  * **绝不抛错**：KV 缺失 / 读失败 / 解析失败 / env 异常 → 空集合（fail-open）。

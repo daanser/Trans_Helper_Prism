@@ -36,6 +36,13 @@ export interface RunSearchOpts {
    * 只透传给 KeyPool，**不改动检索语义**；缺省/空 = 无禁用（fail-open）。
    */
   denied?: Partial<Record<PoolName, Iterable<string>>>
+  /**
+   * 把"可以不阻塞响应"的副作用交给运行时的 `waitUntil`（Worker 的 `ctx.waitUntil`）。
+   * 目前只用于**缓存写**：线上实测 KV put = **635–653ms**，而它省下的 embed 只有 ~500ms
+   * —— 让响应等一次比自己省的还贵的写，纯亏。读路径不受影响（命中时 4ms）。
+   * 不传（测试 / 其它调用方）→ 回退为 `await`，行为与优化前完全一致。
+   */
+  waitUntil?: (promise: Promise<unknown>) => void
 }
 
 export type RunSearchResult = SearchResponse | FallbackResponse
@@ -295,7 +302,11 @@ export async function runSearch(
     }
 
     // 只缓存纯向量阶段结果（rerank 每次重算，不入缓存）。写失败不影响结果。
-    await cachePutVectorStage(cache, cacheKey, { hits: merged, searchMs })
+    // ⚠️ 缓存**写**默认交给 `waitUntil`（不阻塞响应）：KV put 实测 635–653ms，比它省下的 embed（~500ms）还贵。
+    //    拿不到 waitUntil（单测 / 非 Worker 调用）→ 回退为 await，语义与优化前一致（写失败一样被吞掉）。
+    const cachePut = cachePutVectorStage(cache, cacheKey, { hits: merged, searchMs })
+    if (opts.waitUntil) opts.waitUntil(cachePut)
+    else await cachePut
   }
 
   // ── 可选 rerank：候选裁剪 → 批量重排 → 重排分降序 → 截断 top_k。

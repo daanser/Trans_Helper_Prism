@@ -193,6 +193,91 @@ describe("runSearch 正常链路", () => {
   })
 })
 
+// ── 性能优化第二轮 C：缓存**写**不阻塞响应（交给 waitUntil）──
+describe("缓存写与 waitUntil（不阻塞响应）", () => {
+  /** 可控 put：记录调用，返回一个由测试决定何时 resolve 的 promise。 */
+  function makePutStore() {
+    const puts: string[] = []
+    let release!: () => void
+    const gate = new Promise<void>((r) => {
+      release = r
+    })
+    let putDone = false
+    const store: CacheStore = {
+      get: async () => null, // 永远未命中 → 一定走"写缓存"分支
+      put: async (key) => {
+        puts.push(key)
+        await gate
+        putDone = true
+      },
+    }
+    return { store, puts, release, isPutDone: () => putDone }
+  }
+
+  it("传了 waitUntil → runSearch **不等** put：响应先回来，put 才被放行", async () => {
+    const { fetchImpl } = makeFetchMock({ search: async () => new Response(searchBody([{ id: "a", score: 1, payload: { path: "p", title: "T", text: "x" } }]), { status: 200 }) })
+    const { store, puts, release, isPutDone } = makePutStore()
+    const deferred: Array<Promise<unknown>> = []
+
+    const res = (await runSearch({ query: "激素", corpora: ["mtf-wiki"] }, makeEnv(), {
+      fetchImpl,
+      cache: store,
+      waitUntil: (p) => deferred.push(p),
+    })) as SearchResponse
+
+    expect(res.hits.length).toBe(1) // 结果已拿到（没有卡在 put 上）
+    expect(puts).toHaveLength(1) // put 已被**启动**
+    expect(isPutDone()).toBe(false) // 但还没完成 → 证明没被 await
+    expect(deferred).toHaveLength(1) // 且被交给了 waitUntil（Worker 会在响应后继续跑完）
+
+    release()
+    await deferred[0]
+    expect(isPutDone()).toBe(true)
+  })
+
+  it("没传 waitUntil（单测 / 非 Worker 调用）→ 回退为 await put，行为与优化前一致", async () => {
+    const { fetchImpl } = makeFetchMock({ search: async () => new Response(searchBody([{ id: "a", score: 1, payload: { path: "p", title: "T", text: "x" } }]), { status: 200 }) })
+    const { store, puts, release, isPutDone } = makePutStore()
+    let settled = false
+    const p = runSearch({ query: "激素", corpora: ["mtf-wiki"] }, makeEnv(), { fetchImpl, cache: store })
+    void p.then(() => {
+      settled = true
+    })
+    // 轮询到 put 被调用（说明已经走到写缓存那一步）——此时它应当**卡在 put 上**
+    for (let i = 0; i < 50 && puts.length === 0; i++) await new Promise((r) => setTimeout(r, 0))
+    expect(puts).toHaveLength(1)
+    expect(isPutDone()).toBe(false)
+    expect(settled).toBe(false) // 关键：runSearch 还没返回 → 确实在 await put
+    release()
+    const res = (await p) as SearchResponse
+    expect(res.hits.length).toBe(1)
+    expect(isPutDone()).toBe(true) // await 语义：返回时 put 已完成
+  })
+
+  it("缓存**读**不变：命中时直接用缓存、不写（4ms 的热路径仍然划算）", async () => {
+    const { fetchImpl, searches } = makeFetchMock({})
+    let gets = 0
+    let puts = 0
+    const store: CacheStore = {
+      get: async () => {
+        gets++
+        return JSON.stringify({ hits: [{ id: "c1", title: "C", url: "u", source: "mtf-wiki", path: "p", snippet: "s", score: 1 }], searchMs: 7 })
+      },
+      put: async () => {
+        puts++
+      },
+    }
+    const res = (await runSearch({ query: "激素", corpora: ["mtf-wiki"], use_reranker: false }, makeEnv(), {
+      fetchImpl,
+      cache: store,
+    })) as SearchResponse
+    expect(gets).toBe(1)
+    expect(puts).toBe(0) // 命中 → 不写缓存（连 put 都不调）
+    expect(searches).toHaveLength(0) // 也没打 Qdrant
+    expect(res.timings.cached).toBe(true)
+  })
+})
+
 describe("runSearch 非法参数", () => {
   it("空 query → invalid-query", async () => {
     const env = makeEnv()

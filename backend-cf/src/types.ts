@@ -71,9 +71,14 @@ export interface Env {
   QUOTA_WINDOW_HOURS?: string
   /** 未登录是否只走关键词回退（默认 "1"=是；"0"=放开完整检索，仅靠限流挡滥用） */
   REQUIRE_LOGIN?: string
-  /** 单 IP 限流（次/分钟），默认 20；匿名放开检索后这是主要成本闸门 */
+  /**
+   * ⚠️ **已废弃（2026-09-11，性能优化第二轮 A）**：KV 限流器已从 `/search` 请求路径摘除。
+   * 声明**保留**（wrangler 部署时若线上 vars 里还有它，删掉声明会报"变量未定义"）。
+   * 为什么废弃：实测 KV put 635–653ms → 每请求白付 ~1.3s；且 KV 无原子自增 + 跨 colo 不收敛
+   * （history.md 坑 23/35），功能上早被 D1 分档闸门取代。恢复办法见 src/index.ts 的 /search 注释。
+   */
   RATE_LIMIT_IP_PER_MIN?: string
-  /** 单账号限流（次/分钟），默认 60 */
+  /** ⚠️ **已废弃**（同上，KV 限流器摘除）——声明保留仅为兼容线上 vars。 */
   RATE_LIMIT_ACCOUNT_PER_MIN?: string
 
   // ── 分档限流（plan-ratelimit.md §4；D1 权威计数，见 src/tiers.ts / src/ratecount.ts）──
@@ -100,6 +105,12 @@ export interface Env {
   ANON_GLOBAL_HARD_PER_MIN?: string
   /** 过期计数行的清理频率（每 N 次受限请求顺手删一批），默认 200；**不引入定时任务** */
   RATE_COUNT_PURGE_EVERY?: string
+  /**
+   * `keydeny:<pool>` 禁用集的**进程内缓存** TTL（秒），默认 30；`0` = 关闭缓存（每次都读 KV）。
+   * 见 src/keyadmin.ts 的 `readDeniedPoolsCached()`：缓存省掉每请求 0.3–0.5s 的 KV 读，
+   * 代价是管理端下架 key 后本 isolate 最多 30s 才生效（禁用集是硬控制面，不是安全边界）。
+   */
+  KEY_DENY_CACHE_TTL_SEC?: string
 
   // ── LLM（T3.4 / T3.5）──
   LLM_MODEL?: string

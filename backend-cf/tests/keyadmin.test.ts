@@ -15,11 +15,13 @@ import {
   fetchProviderKeyRows,
   isPoolName,
   isSafeKeyRef,
+  denyCacheTtlSec,
   kvDenyStore,
   mapPoolRefs,
   parseDenyList,
   poolRefsFromEnv,
   readDeniedPools,
+  readDeniedPoolsCached,
   refIndex,
   serializeDenyList,
   setKeyDenied,
@@ -179,6 +181,89 @@ describe("readDeniedPools（fail-open）", () => {
       put: async () => undefined,
     }
     expect(await readDeniedPools(dirty, env)).toEqual({ embed: [], llm: [], rerank: [] })
+  })
+})
+
+describe("readDeniedPoolsCached（性能优化第二轮 B：进程内缓存）", () => {
+  const env = { LLM_POOL_KEYS: LLM_SECRETS.join(",") }
+
+  it("TTL 内只读一次 KV（第二次命中缓存，0 次 KV 读）", async () => {
+    let gets = 0
+    const kv: DenyKvStore = {
+      get: async (k) => {
+        gets++
+        return k === `${KEY_DENY_PREFIX}embed` ? "embed-key-1" : ""
+      },
+      put: async () => undefined,
+    }
+    const t0 = 1_800_000_000_000
+    const first = await readDeniedPoolsCached(kv, env, t0)
+    expect(first.embed).toEqual(["embed-key-1"])
+    expect(gets).toBe(3) // 三个池各读一次（embed/llm/rerank）
+    const second = await readDeniedPoolsCached(kv, env, t0 + 29_000) // TTL 30s 内
+    expect(second).toEqual(first)
+    expect(gets).toBe(3) // 没有新增 KV 读
+  })
+
+  it("TTL 过后会重读（禁用集变化最多滞后 30 秒）", async () => {
+    let value = ""
+    let gets = 0
+    const kv: DenyKvStore = {
+      get: async () => {
+        gets++
+        return value
+      },
+      put: async () => undefined,
+    }
+    const t0 = 1_800_000_000_000
+    expect((await readDeniedPoolsCached(kv, env, t0)).embed).toEqual([])
+    expect(gets).toBe(3)
+
+    value = "embed-key-1" // 管理端刚下架 embed-key-1
+    expect((await readDeniedPoolsCached(kv, env, t0 + 10_000)).embed).toEqual([]) // 仍在 TTL 内 → 旧值
+    expect(gets).toBe(3)
+
+    const refreshed = await readDeniedPoolsCached(kv, env, t0 + 30_000) // TTL 到期
+    expect(refreshed.embed).toEqual(["embed-key-1"])
+    expect(gets).toBe(6)
+  })
+
+  it("env KEY_DENY_CACHE_TTL_SEC=0 → 关闭缓存（每次都读）", async () => {
+    let gets = 0
+    const kv: DenyKvStore = {
+      get: async () => {
+        gets++
+        return ""
+      },
+      put: async () => undefined,
+    }
+    const noCache = { ...env, KEY_DENY_CACHE_TTL_SEC: "0" }
+    await readDeniedPoolsCached(kv, noCache, 1)
+    await readDeniedPoolsCached(kv, noCache, 2)
+    expect(gets).toBe(6)
+  })
+
+  it("KV 读失败 → 空集且不抛错（fail-open），并且失败结果也会被缓存住", async () => {
+    let gets = 0
+    const kv: DenyKvStore = {
+      get: async () => {
+        gets++
+        throw new Error("kv-down")
+      },
+      put: async () => undefined,
+    }
+    const t0 = 1_800_000_000_000
+    expect(await readDeniedPoolsCached(kv, env, t0)).toEqual({ embed: [], llm: [], rerank: [] })
+    expect(await readDeniedPoolsCached(kv, env, t0 + 1_000)).toEqual({ embed: [], llm: [], rerank: [] })
+    expect(gets).toBe(3) // 第二次没有再去撞 KV（等价于"这段时间视为无禁用"）
+  })
+
+  it("KV 缺失（无绑定）→ 空集；TTL 非法值回默认 30s", async () => {
+    expect(await readDeniedPoolsCached(undefined, env, 0)).toEqual({ embed: [], llm: [], rerank: [] })
+    expect(denyCacheTtlSec({})).toBe(30)
+    expect(denyCacheTtlSec({ KEY_DENY_CACHE_TTL_SEC: "abc" })).toBe(30)
+    expect(denyCacheTtlSec({ KEY_DENY_CACHE_TTL_SEC: "-5" })).toBe(0)
+    expect(denyCacheTtlSec({ KEY_DENY_CACHE_TTL_SEC: "120" })).toBe(120)
   })
 })
 
