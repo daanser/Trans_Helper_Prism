@@ -115,6 +115,18 @@
    修法：消息区 `max-h-* + overflow-y-auto + overscroll-behavior: contain`（后者是关键——否则滚动链会穿透到页面，用户会觉得"我滚它整页都跟着动"），
    并且**只在用户贴着底部时才自动跟随**（`scrollHeight - scrollTop - clientHeight < 48`），否则用户上翻读历史会被反复拽回底部。
 
+41. **`/about` 的隐私与免责声明必须与代码行为逐条一致**（2026-09-11 建立，改动下列任一行为都要同步改 `/about`）：
+   实测核对结果（写声明时的事实基础）：
+   - 账号：`accounts` 只存 `id/created_at/status`（`handle` 恒为空串）；X 身份只在 `bindings.identifier` 存 **sha256 摘要** → 声明里说"只存 id 的 SHA-256 摘要、用户名不落库"是准确的。
+   - **检索缓存**：`src/searchcache.ts` 的 key 是 `vec:<归一化查询词>|<库>|<top_k>`，**含查询词明文**，KV TTL **3600s**（1 小时）→ 声明里必须写"查询词不写数据库，但相同查询结果会在服务端缓存约 1 小时、不与账号关联"，**不能**说成"完全不记录查询"。
+   - **AI 追问会话**：`chat_sessions.history` 保存消息（含用户问题与 AI 回答）+ `initial_hits` 摘要 → 声明里必须写"会话内容会保存以支持多轮（≤10 轮）"。
+   - **限流计数**：`rate_counters.bucket_key` 是 `HMAC(secret, scope|tier|ip|窗口)`，**不含 IP 明文** → 声明里写"不可逆 HMAC 摘要"是准确的。
+   - 审计日志只记管理员动作，不含用户检索内容。
+   **教训**：对外声明是最容易被代码演进"悄悄说错"的东西 —— 改缓存/会话/计数相关代码时，顺手核对 `/about`。
+42. **医疗免责是产品必需项，不是文案装饰**：语料与 AI 输出都涉及 HRT/用药，现已在三处落地 ——
+   AI 卡片常驻一行（"可能出错或过时，不能替代医生建议；请以 [来源n] 原文为准"）、`/about` 顶部醒目区块、登录页隐私段指向 `/about`。
+   改动 AI 卡片或删除 `/about` 前请先想清楚这一点。
+
 ## 6. 前端现状（2026-09-08 全量重写 UI/UX；2026-09-09 已上线 Pages）
 - **设计语言已彻底换掉**：不再是照搬 `vitepress-theme-project-trans` 的 indigo 色板。现为自定「温润学术检索」风——浅底 `#F8FAFC` / 深底 `#0B1120`，品牌蓝 `#2563EB`（深 `#3B82F6`），token 全走 `assets/css/main.css` 的 CSS 变量（`--bg-canvas/--bg-surface/--text-*/--primary*`），`tailwind.config.ts` 只做语义映射（`canvas/surface/primary/ink`）。
 - **用户明确否决过的方向（别再走回头路）**：① 高饱和四色彩虹 wiki 徽章（粉/天蓝/紫/翠绿）——太 AI 味；② 纯黑 `bg-slate-900` 实色选中块——太凝重死寂；③ 全大写英文终端风标签（`ARCHIVE RETRIEVAL //`、`SEARCH`、`PERF //`）——读不懂。现方案：四库**统一中性**选中态（淡蓝底 `bg-blue-50/80` + 勾选 `✓`，无彩色区分），中文标签，`max-w-7xl` 宽屏。
