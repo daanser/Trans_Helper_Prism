@@ -503,3 +503,5 @@ POST /api/v1/admin/backfill-urls              # 存量 URL 回填（分页）
 ---
 
 *plan v0.2 已锁定，对应任务清单见 `tasks.md`（M0–M4）。开工顺序：M0 连通实测 → M0 骨架 → M1 → M2 → M3。*
+
+> **M4（灰度与运营）执行计划见 [`plan-m4.md`](./plan-m4.md)** —— 内测/压测复跑/月账/运营面板/免责与 about/应急演练/阈值校准。
