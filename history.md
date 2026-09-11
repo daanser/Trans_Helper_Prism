@@ -177,8 +177,17 @@
 4. **✅ `/admin/usage.requests` 已是真实用户请求数**：`quotas` 增列 `requests`，在 `chargeQuota` 的**同一条原子 UPDATE**
    里 `requests = requests + 1`（零额外写）；并有 `try { 带 requests } catch { 不带 requests }` 兜底 —— **迁移前也不会坏**。
    口径：额度耗尽走回退的请求不扣费、因而不计入该列。
-5. **产出 0 chunk 的极短文件**：每次增量都被复核（无 payload 可存 `blob_sha`）。**现已可量化**（见 #1 的观测：
-   实测 `rle-wiki files=3 points=0`）。修法：借 #1 打开的通道把这类文件的 sha 记进 `ingest_files`（待做）。
+5. **✅ 产出 0 chunk 的极短文件已不再每轮复核**（2026-09-11 完成并线上验证）
+   - **根因**：这类文件没有 Qdrant point → 没有 payload 可存 `blob_sha` → 每轮都被当新文件重新解析（永远空转）。
+   - **修法**：`ingest_files` 增列 **`blob_sha`**（与 Worker 侧的 `content_hash` **分工不同、互不干扰**），
+     在集合里的 = `blob_sha` 非空的行；新增 `GET/POST /api/v1/admin/ingest/files`（admin，批量，单请求上限 2000 条）
+     由脚本跑前拉取、跑后回报；判据收敛到 `src/ingestfiles.ts` 的 `shouldProcessFile()`：
+     `--full` → 处理；`payloadSha === treeSha` → **跳过（Qdrant 主判据，行为与改造前逐字节一致）**；否则看集合。
+   - **线上实测**：第一轮登记（mtf **78** 条、ftm 16 条、rle 3 条），**第二轮全部 `files=0`**
+     且日志显示「无变更（243 个 .md，其中 78 个零 chunk 文件已登记），跳过」。
+   - **顺手修掉一个隐患**：Worker 侧 `upsertIngestFile` 原用 `INSERT OR REPLACE`（= DELETE+INSERT）**会把 Actions 写入的
+     `blob_sha` 抹成 NULL** → 改为 `ON CONFLICT DO UPDATE`（对 Worker 自身语义不变，已在真实 SQLite 上验证差异）。
+   - 上限行为只影响"少记/少返回几条"，被漏掉的文件下一轮会补登记，**正确性不受影响**（响应带 `truncated` 可观测）。
 6. **配额窗口无主动清理任务**：靠"读取时判断"，够用；若将来要清理历史行再另加 cron。
 7. **`ASN` 清单是初始值**：需按真实流量校准（`plan-ratelimit.md` §4.1 有方法：APNIC/iptoasn + `asOrganization` 关键词筛选）。
 8. **前端可选**：自定义模型「设为默认」；LLM 回答的轻量 markdown 渲染（用户已否决引 md 库，可自研极简版）；i18n。

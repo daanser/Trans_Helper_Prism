@@ -133,12 +133,13 @@ _最后更新：2026-09-09_
 | 2 | 清掉死掉的 `bigram_index`（表 + 写入路径；**保留 `splitBigrams`**）| ✅ `DROP TABLE` 已在线执行 |
 | 3 | 删掉从未被消费的 `KeyPoolDb.listActiveKeys?` | ✅ |
 | 4 | `/admin/usage.requests` 改真实用户请求数（同条原子 UPDATE 自增）| ✅ 实测 0→1 |
+| 5 | 极短文件不再每轮复核（`ingest_files.blob_sha` + 批量端点 + 统一判据）| ✅ 线上连跑两轮：第一轮登记、第二轮全部 `files=0` |
 
 - 迁移：`apply-schema` 26 条语句（`tolerated` 仅预期的重复列、`failed` 空）
 - GitHub Secret `ADMIN_API_KEY` 已配置
 - 线上遗留一条**测试记录**：`ingest_runs` 里 `commit_sha=test0001` 那行（手工验证端点时写的，无删除端点，忽略即可）
 
 ### 下一步候选
-- **技术债 #5**：极短文件每轮复核 —— 现在已能观测到（`rle-wiki files=3 points=0`），修法是把这类文件的 sha 记进 `ingest_files`
-- **M4（灰度运营）**：内测反馈、压测复跑、月账、运营面板
+- **M4（灰度运营）** ← 建议下一个：内测反馈收集、**压测复跑**（顺便检验 20 次/10 秒硬封禁会不会误伤正常用户）、月账、运营面板
 - 技术债 #7（ASN 清单按真实流量校准）—— 等有量再说
+- 技术债 #6（配额窗口清理）已判定不需要
