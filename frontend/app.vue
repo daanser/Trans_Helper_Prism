@@ -195,6 +195,9 @@
 
     <!-- 全局轻量 Toast 提示 -->
     <Toast />
+
+    <!-- 免责声明弹窗：任何页面首次访问都弹（含 /about、/login）；判定链见 useDisclaimer.ts -->
+    <DisclaimerDialog />
   </div>
 </template>
 
@@ -202,6 +205,7 @@
 import { computed, onMounted } from "vue"
 import { useDarkMode } from "~/composables/useDarkMode"
 import { describeAuthError } from "~/composables/useAuth"
+import DisclaimerDialog from "~/components/DisclaimerDialog.vue"
 
 const { isDark, toggle: toggleDark } = useDarkMode()
 const {

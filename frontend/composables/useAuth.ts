@@ -183,6 +183,8 @@ export function useAuth() {
     user.value = null
     quota.value = null
     authError.value = ""
+    // 顺便清掉"服务端已确认"的内存态：换账号登录时由下一次 loadMe 重新同步，避免把上个账号的确认态带过来
+    useDisclaimer().clearServerAck()
   }
 
   /** 拉取当前账号与配额；401/403 视为会话失效并自动清理 */
@@ -197,6 +199,8 @@ export function useAuth() {
       const res = await useApi().me()
       user.value = res.user
       quota.value = res.quota
+      // 免责声明：服务端记录过确认 → 补写本地（**换设备不再弹**；判定链见 useDisclaimer.ts）
+      useDisclaimer().syncFromAccount(res)
       authError.value = ""
       return true
     } catch (err: unknown) {

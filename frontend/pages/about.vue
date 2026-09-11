@@ -133,6 +133,11 @@
         提示：若你在网络受限的环境中访问，可能无法完成 X 登录（授权页在 x.com）；此时匿名检索仍然可用。
       </p>
     </section>
+
+    <!-- 底部返回：本页较长，用户反馈"看完要滚回顶部很麻烦"（顶部那个保留不动） -->
+    <div class="mt-10 flex justify-center border-t border-surface-border pt-6">
+      <BackButton label="返回上一页" />
+    </div>
   </div>
 </template>
 

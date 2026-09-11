@@ -668,19 +668,79 @@ api.get("/me", async (c) => {
   if (!session) return c.json({ error: "unauthorized" }, 401)
   if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
 
-  const acc = await c.env.DB.prepare("SELECT status, created_at FROM accounts WHERE id = ?")
-    .bind(session.sub)
-    .first<{ status: string; created_at: number }>()
+  // `disclaimer_ack_at` 由 SCHEMA_MIGRATIONS 补列。部署后若还没跑 apply-schema（旧库没有该列），
+  // 带它的查询会报 `no such column` —— 那时**退化为旧查询**（确认态视为未确认，最多少弹一次提示），
+  // 绝不让 /me 500（那会让顶栏账号区整块报错，比"多弹一次弹窗"严重得多）。
+  // 退化查询自身再失败（真·DB 故障）→ 照旧向上抛（500），不假装成"账号不存在"。
+  const acc = await (async () => {
+    try {
+      return await c.env.DB!.prepare("SELECT status, created_at, disclaimer_ack_at FROM accounts WHERE id = ?")
+        .bind(session.sub)
+        .first<{ status: string; created_at: number; disclaimer_ack_at: number | null }>()
+    } catch {
+      const legacy = await c.env.DB!.prepare("SELECT status, created_at FROM accounts WHERE id = ?")
+        .bind(session.sub)
+        .first<{ status: string; created_at: number }>()
+      return legacy ? { ...legacy, disclaimer_ack_at: null } : null
+    }
+  })()
   if (!acc) return c.json({ error: "account-not-found" }, 404)
   if (acc.status !== "active") return c.json({ error: "account-" + acc.status }, 403)
 
   const quota = await getQuota(c.env.DB, session.sub, Date.now(), c.env)
+  // 免责声明同意态（前端 DisclaimerDialog 据此决定"登录用户已确认过就不再弹"）：
+  //   · `disclaimer_ack_at` 毫秒时间戳，NULL = 从未确认；
+  //   · `disclaimer_ack` 是它的布尔投影，前端判空更方便（老部署无该字段 → undefined → 视为未确认）。
+  const ackAt = typeof acc.disclaimer_ack_at === "number" && Number.isFinite(acc.disclaimer_ack_at) ? acc.disclaimer_ack_at : null
   return c.json({
     // handle 来自会话 JWT（DB 不存 X 明文，见 auth.ts 隐私注释）
     user: { account_id: session.sub, handle: session.handle, role: session.role, created_at: acc.created_at },
     quota,
     quota_display: formatPct(quota.used_pct),
+    disclaimer_ack_at: ackAt,
+    disclaimer_ack: ackAt !== null,
   })
+})
+
+// POST /me/disclaimer → 记录/撤销"免责声明已确认"（需 Authorization: Bearer <JWT>）
+//   body: { ack?: boolean }   缺省 true
+//     · ack=true  → disclaimer_ack_at = now（前端"我知道了，不再提示"）
+//     · ack=false → disclaimer_ack_at = NULL（前端设置页"启动时显示免责提示"重新打开）
+// 返回：{ ok: true, disclaimer_ack_at }（写库后的真值，认 number|null）
+// 语义说明：**只影响"是否再弹窗"这一件事**，与配额/限流/账号状态无关；重复调用幂等（true 会刷新时间戳）。
+// 注意：不经过分档限流闸门（与 /me、/settings/models 同级：登录态的元数据读写，不产生上游成本）。
+api.post("/me/disclaimer", async (c) => {
+  const session = await sessionFromHeader(c.env, c.req.header("Authorization"))
+  if (!session) return c.json({ error: "unauthorized" }, 401)
+  if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
+
+  // body 可选：空 body 视为 `{}`（= ack 缺省 true，方便 `curl -X POST` 直接确认）；
+  // 非空但解析失败 / 解析出来不是对象（数组、字符串、null）→ 422，绝不猜用户意图。
+  const rawText = await c.req.text().catch(() => "")
+  let body: unknown = {}
+  if (rawText.trim() !== "") {
+    try {
+      body = JSON.parse(rawText)
+    } catch {
+      return c.json({ error: "invalid-body" }, 422)
+    }
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return c.json({ error: "invalid-body" }, 422)
+  const ackRaw = (body as { ack?: unknown }).ack
+  if (ackRaw !== undefined && typeof ackRaw !== "boolean") return c.json({ error: "invalid-ack" }, 422)
+  const ack = ackRaw === undefined ? true : ackRaw
+
+  const ackAt = ack ? Date.now() : null
+  try {
+    const res = await c.env.DB.prepare("UPDATE accounts SET disclaimer_ack_at = ? WHERE id = ?")
+      .bind(ackAt, session.sub)
+      .run()
+    // changes === 0：账号行不存在（会话有效但账号被删）→ 404，别让前端以为已经记住了
+    if (res?.meta?.changes !== 1) return c.json({ error: "account-not-found" }, 404)
+  } catch {
+    return c.json({ error: "db-unavailable" }, 503)
+  }
+  return c.json({ ok: true, disclaimer_ack_at: ackAt })
 })
 
 // ── POST /search/stream（T3.4）：SSE 流式 AI 总结 ──

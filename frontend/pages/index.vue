@@ -50,6 +50,13 @@
           </template>
         </SearchBox>
 
+        <!-- 合规告知（搜索框正下方）：一句话 + 指回 /about 的完整免责声明与使用须知。
+             与弹窗（DisclaimerDialog）互补：弹窗负责"首次知情"，这行常驻负责"随时可查"。 -->
+        <p class="mt-3 text-center text-[11px] leading-relaxed text-ink-muted sm:text-xs">
+          继续使用即表示你已阅读并同意
+          <NuxtLink to="/about" class="font-medium text-primary underline-offset-2 hover:underline">免责声明与使用须知</NuxtLink>
+        </p>
+
         <!-- 移动端 AI 伴读卡位 -->
         <div v-if="hasSearched" class="mt-6 lg:hidden">
           <AiCompanionCard

@@ -49,6 +49,7 @@ describe("key_usage.account_id：新库建表 + 历史表补列迁移", () => {
       `ALTER TABLE key_usage ADD COLUMN account_id TEXT NOT NULL DEFAULT ''`,
       `ALTER TABLE quotas ADD COLUMN requests INTEGER NOT NULL DEFAULT 0`,
       `ALTER TABLE ingest_files ADD COLUMN blob_sha TEXT`,
+      `ALTER TABLE accounts ADD COLUMN disclaimer_ack_at INTEGER`,
       `DROP TABLE IF EXISTS bigram_index`,
       `DROP INDEX IF EXISTS idx_bigram_gram_wiki`,
       `DROP INDEX IF EXISTS idx_bigram_path_wiki`,
@@ -59,6 +60,7 @@ describe("key_usage.account_id：新库建表 + 历史表补列迁移", () => {
     expect(SCHEMA_MIGRATIONS[0]).toMatch(/^ALTER TABLE key_usage ADD COLUMN account_id TEXT NOT NULL DEFAULT ''$/)
     expect(SCHEMA_MIGRATIONS[1]).toMatch(/^ALTER TABLE quotas ADD COLUMN requests INTEGER NOT NULL DEFAULT 0$/)
     expect(SCHEMA_MIGRATIONS[2]).toMatch(/^ALTER TABLE ingest_files ADD COLUMN blob_sha TEXT$/)
+    expect(SCHEMA_MIGRATIONS[3]).toMatch(/^ALTER TABLE accounts ADD COLUMN disclaimer_ack_at INTEGER$/)
   })
 
   it("容忍的报错：duplicate column name（任意语句）、ALTER 的 no such table", () => {
@@ -69,7 +71,9 @@ describe("key_usage.account_id：新库建表 + 历史表补列迁移", () => {
     expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[2], "D1_ERROR: duplicate column name: blob_sha")).toBe(true)
     expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[2], "SQLITE_ERROR: no such table: ingest_files")).toBe(true)
     // DROP 不需要容忍规则：它本身幂等；真报错（库不可用）必须算 failed
-    expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[3], "D1_ERROR: network connection lost")).toBe(false)
+    expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[3], "D1_ERROR: duplicate column name: disclaimer_ack_at")).toBe(true)
+    expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[3], "SQLITE_ERROR: no such table: accounts")).toBe(true)
+    expect(isToleratedSchemaError(SCHEMA_MIGRATIONS[4], "D1_ERROR: network connection lost")).toBe(false)
     // 已迁移过 / 新库建表时已带该列
     expect(isToleratedSchemaError(alter, "SQLITE_ERROR: duplicate column name: account_id")).toBe(true)
     expect(isToleratedSchemaError(alter, "D1_ERROR: duplicate column name: account_id")).toBe(true)

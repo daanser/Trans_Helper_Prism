@@ -8,11 +8,16 @@
 -- 账号（accounts）：登录主体。X/邮箱绑定分开存，见 bindings。
 -- 不做实名/手机；绑定标识落库最小化（X 只存 id+handle hash）。
 -- ─────────────────────────────────────────────
+-- ⚠️ 历史表补列（SQLite 没有 ADD COLUMN IF NOT EXISTS）：
+--    ALTER TABLE accounts ADD COLUMN disclaimer_ack_at INTEGER;
+--    同 key_usage.account_id / quotas.requests / ingest_files.blob_sha：**故意不写在本文件**，
+--    由 SCHEMA_MIGRATIONS 单独导出 + apply-schema 容忍 duplicate column name / ALTER 的 no such table。
 CREATE TABLE IF NOT EXISTS accounts (
-  id             TEXT PRIMARY KEY,              -- 内部 UUID（randomUUID）
-  handle         TEXT NOT NULL DEFAULT '',      -- 展示名（可空）
-  created_at     INTEGER NOT NULL,              -- epoch ms
-  status         TEXT NOT NULL DEFAULT 'active' -- active | banned | disabled
+  id                  TEXT PRIMARY KEY,              -- 内部 UUID（randomUUID）
+  handle              TEXT NOT NULL DEFAULT '',      -- 展示名（可空）
+  created_at          INTEGER NOT NULL,              -- epoch ms
+  status              TEXT NOT NULL DEFAULT 'active', -- active | banned | disabled
+  disclaimer_ack_at   INTEGER                        -- 免责声明确认时刻（epoch ms）；NULL = 未确认（登录后跨设备不再弹的依据）
 );
 
 -- ─────────────────────────────────────────────

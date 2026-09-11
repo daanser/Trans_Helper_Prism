@@ -63,6 +63,20 @@ export interface MeUser {
 export interface MeResponse {
   user: MeUser
   quota: QuotaState
+  /**
+   * 免责声明确认时刻（epoch ms）；`null` = 从未确认。
+   * 字段可选：老部署没有这两列时前端视为"未确认"（只是会弹一次，不影响任何功能）。
+   */
+  disclaimer_ack_at?: number | null
+  /** `disclaimer_ack_at !== null` 的布尔投影（后端 /me 直接给，前端判空更方便） */
+  disclaimer_ack?: boolean
+}
+
+/** POST /api/v1/me/disclaimer 返回体 */
+export interface DisclaimerAckResponse {
+  ok: boolean
+  /** 写库后的真值（`ack:false` 时为 null） */
+  disclaimer_ack_at: number | null
 }
 
 /** 可选 LLM 总结（plan.md §3.3） */
@@ -386,6 +400,18 @@ export function useApi() {
   }
 
   /**
+   * 记录/撤销「免责声明已确认」（POST /api/v1/me/disclaimer，需 Bearer）。
+   * `ack=true` → 服务端记时间戳（换设备不再弹）；`ack=false` → 置 NULL（设置页重新打开提示）。
+   * 调用方（useDisclaimer）对失败只 warn：本地状态已经写好，不该因网络问题反复弹窗。
+   */
+  async function ackDisclaimer(ack: boolean): Promise<DisclaimerAckResponse> {
+    return request<DisclaimerAckResponse>("/v1/me/disclaimer", {
+      method: "POST",
+      body: JSON.stringify({ ack }),
+    })
+  }
+
+  /**
    * LLM 总结流式接口（POST /api/v1/search/stream，tasks.md T3.4）。
    * 契约：SSE，`data: {"delta":"..."}` 增量，`data: [DONE]` 结束；请求体同 /v1/search + session_id。
    * 后端尚未实现（当前 501 / 404）→ 抛 ApiError，调用方用 isUnimplemented 降级，绝不影响主检索。
@@ -620,6 +646,7 @@ export function useApi() {
     searchStream,
     chat,
     me,
+    ackDisclaimer,
     adminUsage,
     adminRatelimit,
     adminAudit,

@@ -175,6 +175,24 @@
             </div>
             <ToggleMini :model-value="prefs.llm" label="" @update:model-value="(v: boolean) => save({ llm: v })" />
           </div>
+
+          <!-- 免责提示开关：ON = 每次启动先弹一次免责声明（撤销"不再提示"）；OFF = 不再弹。
+               语义是"启动时显示"，所以拨到 ON 时**不会立刻弹**（本次会话内仍保持安静，下次访问才弹）。
+               未登录也能用：只写本地；已登录时顺带同步账号（换设备一致）。 -->
+          <div class="flex items-center justify-between gap-4 border-t border-surface-border pt-3">
+            <div class="min-w-0">
+              <p class="text-xs font-medium text-ink-title">启动时显示免责提示</p>
+              <p class="mt-0.5 text-xs text-ink-muted">
+                关闭后不再弹窗（本设备记住；<template v-if="isLoggedIn">已登录，会同步到账号，换设备也不再弹</template><template v-else>登录后会同步到账号，换设备也不再弹</template>）。
+                随时可以在这里重新打开。
+              </p>
+            </div>
+            <ToggleMini
+              :model-value="showDisclaimerOnStart"
+              label=""
+              @update:model-value="(v: boolean) => onDisclaimerToggle(v)"
+            />
+          </div>
         </div>
 
         <div class="flex items-center gap-2 border-t border-surface-border pt-4">
@@ -400,6 +418,8 @@ type ModelsState = "idle" | "loading" | "ok" | "unimplemented" | "error"
 const { saveModelSettings, listModels, deleteModel } = useApi()
 const { pushToast } = useToast()
 const { prefs, load: loadPrefs, save, reset } = usePrefs()
+// 免责提示开关（B5）：模型 = "本设备尚未记住"（见 useDisclaimer.showOnStart）
+const { showOnStart: disclaimerShowOnStart, load: loadDisclaimer, setShowOnStart: setDisclaimerShowOnStart } = useDisclaimer()
 const {
   isLoggedIn,
   user,
@@ -417,6 +437,18 @@ const {
 } = useAuth()
 
 const corporaOptions: CorpusOption[] = DEFAULT_CORPORA_OPTIONS
+
+/** 开关模型：ON = 启动时显示免责提示（= 尚未记住） */
+const showDisclaimerOnStart = computed(() => disclaimerShowOnStart.value)
+
+/**
+ * 拨 ON → 撤销确认（下次启动会弹；本次会话内不打扰）；拨 OFF → 确认（不再提示）。
+ * 未登录只写本地；已登录时 useDisclaimer 内部会 `POST /v1/me/disclaimer`（失败只 warn，不影响本地）。
+ */
+function onDisclaimerToggle(next: boolean) {
+  setDisclaimerShowOnStart(next)
+  pushToast(next ? "已开启：下次访问会再提示一次免责声明" : "已关闭：不再弹出免责声明提示", "info")
+}
 
 const modelForm = reactive({ name: "", base_url: "", model: "", api_key: "" })
 const modelSubmitting = ref(false)
@@ -646,6 +678,8 @@ watch(isLoggedIn, (logged) => {
 
 onMounted(async () => {
   loadPrefs()
+  // 直接打开 /settings（不走首页）时也要能读到本设备的免责提示偏好（幂等、仅客户端）
+  loadDisclaimer()
   // init()：页面 onMounted 早于 app.vue，需要先把 localStorage 里的 token 同步进响应式状态
   init()
   if (isLoggedIn.value) {

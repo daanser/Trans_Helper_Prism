@@ -18,7 +18,7 @@
 
 /** 幂等 DDL 语句（数组顺序即执行顺序）。 */
 export const SCHEMA_STATEMENTS: readonly string[] = [
-  `CREATE TABLE IF NOT EXISTS accounts ( id TEXT PRIMARY KEY, handle TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active' )`,
+  `CREATE TABLE IF NOT EXISTS accounts ( id TEXT PRIMARY KEY, handle TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'active', disclaimer_ack_at INTEGER )`,
   `CREATE TABLE IF NOT EXISTS bindings ( id TEXT PRIMARY KEY, account_id TEXT NOT NULL, type TEXT NOT NULL, identifier TEXT NOT NULL, provider_id TEXT, created_at INTEGER NOT NULL, verified INTEGER NOT NULL DEFAULT 0 )`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_type_identifier ON bindings (type, identifier)`,
   `CREATE TABLE IF NOT EXISTS quotas ( account_id TEXT PRIMARY KEY, period_start INTEGER NOT NULL, used_cost REAL NOT NULL DEFAULT 0, monthly_limit REAL NOT NULL DEFAULT 5.0, requests INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL )`,
@@ -58,7 +58,10 @@ export const SCHEMA_STATEMENTS: readonly string[] = [
  *      · 同样的三种情形由同一套 `isToleratedSchemaError()` 兜住（duplicate column / ALTER 的 no such table）。
  *   ③ `ALTER TABLE ingest_files ADD COLUMN blob_sha`（2026-09-11 技术债 #5：零 chunk 文件的 sha 来源）
  *      · 与 ①② 同一套容忍规则；**只有 blob_sha 非空的行**属于"零 chunk 集合"，Worker 侧摄取不受影响。
- *   ④ `DROP TABLE IF EXISTS bigram_index`（+ 两条 `DROP INDEX IF EXISTS`）
+ *   ④ `ALTER TABLE accounts ADD COLUMN disclaimer_ack_at`（2026-09-11：免责声明确认时刻，
+ *      登录后跨设备不再弹的依据；NULL = 未确认）
+ *      · 与 ①②③ 同一套容忍规则。
+ *   ⑤ `DROP TABLE IF EXISTS bigram_index`（+ 两条 `DROP INDEX IF EXISTS`）
  *      · **天然幂等**：表/索引不存在时 SQLite 不报错，所以不需要容忍规则；
  *        显式删索引是为了"表被人为重建过、索引还在"这种中间态也干净。
  *      · 顺序安全：本数组**先于** SCHEMA_STATEMENTS 执行，而后者已不再创建 bigram_index，
@@ -68,6 +71,7 @@ export const SCHEMA_MIGRATIONS: readonly string[] = [
   `ALTER TABLE key_usage ADD COLUMN account_id TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE quotas ADD COLUMN requests INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE ingest_files ADD COLUMN blob_sha TEXT`,
+  `ALTER TABLE accounts ADD COLUMN disclaimer_ack_at INTEGER`,
   `DROP TABLE IF EXISTS bigram_index`,
   `DROP INDEX IF EXISTS idx_bigram_gram_wiki`,
   `DROP INDEX IF EXISTS idx_bigram_path_wiki`,
