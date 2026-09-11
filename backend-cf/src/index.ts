@@ -236,6 +236,8 @@ interface RateGateDeny {
 
 /** 分档闸门结果。 */
 interface RateGateResult {
+  /** 诊断：闸门内部逐段耗时（ms）——用于定位 D1 往返之外的瓶颈 */
+  timings?: Record<string, number>
   tier: Tier
   /** 本次生效的限额（搜索档或 LLM 档） */
   limit: number
@@ -311,7 +313,10 @@ async function rateGate(
   const limit = opts.scope === "llm" ? llmLimitForTier(tier, c.env) : limitForTier(tier, c.env)
   const base: RateGateResult = { tier, limit, count: 0, degraded: false, resolvedBy: meta.by, softBreak: false }
 
+  const tm: Record<string, number> = {}
+  let _t = Date.now()
   const hmacKey = await deriveRateLimitHmacKey(c.env)
+  tm.hmac = Date.now() - _t
   if (isDegradedHmacKey(hmacKey)) {
     // 只打一次警告就够，但 isolate 生命周期短，这里每次打也只是 noise 级；**绝不打印密钥**。
     console.warn("[ratelimit] PROXY_SHARED_SECRET 未配置 → 计数桶匿名化强度下降（生产必须配置）")
@@ -323,7 +328,9 @@ async function rateGate(
 
   // ① 突发封禁检查（硬停）：封禁期内一律 429，且**不再消耗**任何名额
   if (meta.ip) {
+    _t = Date.now()
     const blockedUntil = await readBlockUntil(c.env.DB, { hmacKey, ip: meta.ip, tier, nowMs })
+    tm.block = Date.now() - _t
     if (blockedUntil > nowMs) {
       return {
         ...base,
@@ -354,6 +361,7 @@ async function rateGate(
   // **不要**为了省这 1 行而把顺序退回去：那样突发层就是死代码，省下的是攻击者的成本，付掉的是整站的可用性。
   const burstLimit = burstPer10s(c.env)
   if (meta.ip) {
+    _t = Date.now()
     const burst = await consumeRateToken(c.env.DB, {
       scope: "burst",
       tier,
@@ -363,6 +371,7 @@ async function rateGate(
       limit: burstLimit,
       nowMs,
     })
+    tm.burst = Date.now() - _t
     if (!burst.ok && !burst.degraded) {
       await writeBlockUntil(c.env.DB, {
         hmacKey,
@@ -383,6 +392,7 @@ async function rateGate(
   }
 
   // ③ 分档计数（D1 原子「判-占」）
+  _t = Date.now()
   const res = await consumeRateToken(c.env.DB, {
     scope: opts.scope,
     tier,
@@ -392,6 +402,7 @@ async function rateGate(
     limit,
     nowMs,
   })
+  tm.tier = Date.now() - _t
   maybePurgeCounters(c, nowMs)
   if (res.degraded) console.warn(`[ratelimit] D1 异常 → fail-open scope=${opts.scope} tier=${tier}`)
   if (!res.ok) {
@@ -409,6 +420,7 @@ async function rateGate(
   if (opts.applyGlobalBreak && !opts.loggedIn) {
     const soft = anonGlobalLimit(c.env)
     const hard = anonGlobalHardLimit(c.env)
+    _t = Date.now()
     const g = await consumeRateToken(c.env.DB, {
       scope: "global",
       hmacKey,
@@ -428,7 +440,8 @@ async function rateGate(
     if (softBreak) console.warn(`[ratelimit] 全局软熔断触发 → 匿名仅关键词回退 count=${g.count} soft=${soft}`)
   }
 
-  return { ...base, count: res.count, softBreak }
+  tm.global = tm.global ?? 0
+  return { ...base, count: res.count, softBreak, timings: tm }
 }
 
 /**
@@ -623,6 +636,7 @@ api.post("/search", async (c) => {
     })
     const diag = {
       gate_ms: gateMs,
+      ...Object.fromEntries(Object.entries(gate.timings ?? {}).map(([k, v]) => [`gate_${k}_ms`, v])),
       quota_ms: session ? Date.now() - tQuota : 0,
       handler_ms: Date.now() - tHandler,
     }
