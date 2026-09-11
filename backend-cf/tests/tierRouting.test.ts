@@ -5,6 +5,7 @@
 //       ④ 全局匿名软熔断（匿名只走关键词回退、**零上游调用**）与硬熔断（匿名 429、登录用户不受影响）；
 //       ⑤ /admin/whoami 的分档诊断字段（线上验收的关键位）。
 import { describe, it, expect, vi, beforeEach } from "vitest"
+import { withBatch } from "./d1MockBatch"
 import { app } from "../src/index"
 import { issueSession } from "../src/auth"
 import type { Env } from "../src/types"
@@ -85,7 +86,7 @@ function makeDb() {
       return stmt
     },
   } as unknown as D1Database
-  return { db, rows, calls }
+  return { db: withBatch(db as unknown as { prepare: (sql: string) => unknown }) as unknown as D1Database, rows, calls }
 }
 
 /** 基础 env：无 KV（KV 限流 fail-open，隔离出 D1 分档路径）、无 Qdrant（回退分支零网络）。 */

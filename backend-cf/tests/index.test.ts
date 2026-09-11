@@ -3,6 +3,7 @@
 // 全 mock fetch（Qdrant collection info / scroll），验证 /api/v1/corpora、/api/v1/tree/:wiki_id 的
 // 200/422/404 路径与 queue consumer 的 wikiId 分发。绝不调真实上游。
 import { describe, it, expect, vi, beforeEach } from "vitest"
+import { withBatch } from "./d1MockBatch"
 import { app } from "../src/index"
 import { issueSession } from "../src/auth"
 import type { Env } from "../src/types"
@@ -139,7 +140,10 @@ describe("GET /api/v1/me（配额 + 重置时刻）", () => {
         }
       },
     }
-    return { DB: db as unknown as Env["DB"], JWT_SECRET } as unknown as Env
+    return {
+      DB: withBatch(db as unknown as { prepare: (sql: string) => unknown }) as unknown as Env["DB"],
+      JWT_SECRET,
+    } as unknown as Env
   }
 
   async function callMe(env: Env) {
@@ -232,7 +236,13 @@ describe("免责声明同意态（GET /me + POST /me/disclaimer）", () => {
         }
       },
     }
-    return { env: { DB: db as unknown as Env["DB"], JWT_SECRET } as unknown as Env, state }
+    return {
+      env: {
+        DB: withBatch(db as unknown as { prepare: (sql: string) => unknown }) as unknown as Env["DB"],
+        JWT_SECRET,
+      } as unknown as Env,
+      state,
+    }
   }
 
   async function token(env: Env) {

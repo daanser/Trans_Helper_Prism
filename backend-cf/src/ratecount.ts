@@ -210,13 +210,25 @@ function tierColumnValue(scope: RateScope, tier: string | undefined): string {
   return tier ?? "unknown"
 }
 
+/** 三条热路径语句的**逐字** SQL（单条执行与 batch 共用同一份，杜绝两处漂移）。 */
+const SQL_INSERT_COUNTER =
+  "INSERT OR IGNORE INTO rate_counters (bucket_key, tier, window_start, window_sec, count, updated_at) VALUES (?, ?, ?, ?, 0, ?)"
+const SQL_OCCUPY_SLOT =
+  "UPDATE rate_counters SET count = count + 1, updated_at = ? WHERE bucket_key = ? AND count < ?"
+const SQL_SELECT_COUNT = "SELECT count FROM rate_counters WHERE bucket_key = ?"
+
 /** 读一行计数（异常 → null，由调用方按 fail-open 处理）。 */
 async function readCount(db: D1Database, bucketKey: string): Promise<number | null> {
-  const row = await db
-    .prepare("SELECT count FROM rate_counters WHERE bucket_key = ?")
-    .bind(bucketKey)
-    .first<{ count: number }>()
+  const row = await db.prepare(SQL_SELECT_COUNT).bind(bucketKey).first<{ count: number }>()
   return row && Number.isFinite(row.count) ? row.count : null
+}
+
+/** 从 batch 结果里取某条 SELECT 的第一行计数（缺行/脏值 → 0）。 */
+function countFromResult(res: D1Result<unknown> | undefined): number {
+  const rows = res?.results as Array<{ count?: unknown }> | undefined
+  const raw = rows?.[0]?.count
+  const n = typeof raw === "number" ? raw : Number(raw)
+  return Number.isFinite(n) ? n : 0
 }
 
 /**
@@ -251,29 +263,28 @@ export async function consumeRateToken(db: RateCountDb, args: ConsumeRateTokenAr
 
   const start = windowStart(nowMs, windowSec)
   try {
-    // ① 补行（幂等；并发下只有一条生效，已存在时写 0 行 = 不消耗写配额）
-    await db
-      .prepare(
-        "INSERT OR IGNORE INTO rate_counters (bucket_key, tier, window_start, window_sec, count, updated_at) VALUES (?, ?, ?, ?, 0, ?)",
-      )
-      .bind(bucketKey, tierColumnValue(scope, args.tier), start, windowSec, nowMs)
-      .run()
-
-    // ② 单条原子「判-占」：changes===1 才算占到名额（并发下绝不超卖）
-    const res = await db
-      .prepare("UPDATE rate_counters SET count = count + 1, updated_at = ? WHERE bucket_key = ? AND count < ?")
-      .bind(nowMs, bucketKey, safeLimit)
-      .run()
-
-    // ③ 回读当前计数（给调用方做突发闸门判断；读 1 行，不消耗写配额）
-    const count = (await readCount(db, bucketKey)) ?? 0
-    if (res?.meta?.changes === 1) {
+    // 三条语句**一次往返**（`db.batch` 是隐式事务，按序执行、按序返回结果）：
+    //   ① 补行（幂等；并发下只有一条生效，已存在时写 0 行 = 不消耗写配额）
+    //   ② 单条原子「判-占」：`meta.changes === 1` 才算占到名额（并发下绝不超卖）—— 判据与单条执行时**逐字相同**
+    //   ③ 回读当前计数（给调用方做突发/熔断闸门判断）
+    // 为什么能这么合：三条语句语义上本来就是「补行 → 判占 → 回读」，串行 + 同事务只会让结果更确定；
+    // 阈值、判定顺序、fail-open 行为一律不变（唯一差别：整批失败会一起回滚，见下方 catch）。
+    const [, occupyRes, selectRes] = await db.batch([
+      db.prepare(SQL_INSERT_COUNTER).bind(bucketKey, tierColumnValue(scope, args.tier), start, windowSec, nowMs),
+      db.prepare(SQL_OCCUPY_SLOT).bind(nowMs, bucketKey, safeLimit),
+      db.prepare(SQL_SELECT_COUNT).bind(bucketKey),
+    ])
+    const count = countFromResult(selectRes)
+    if (occupyRes?.meta?.changes === 1) {
       return { ok: true, count, limit: safeLimit, retryAfterSec: 0, degraded: false, bucketKey }
     }
     // changes === 0：已满额（或被并发抢先占光）→ 拒绝，绝不抛错
     return { ok: false, count, limit: safeLimit, retryAfterSec, degraded: false, bucketKey }
   } catch {
-    // D1 异常 → fail-open（可用性优先）
+    // D1 异常 → fail-open（可用性优先）。
+    // 注意：batch 是隐式事务，整批失败 → **本次自增也已回滚**（不会留下"占了名额但请求被放行"的脏状态）。
+    // 这与优化前（逐条执行、前面成功后面失败时计数已落库）略有差别，但两者都属 fail-open 的一致语义：
+    // 少记一次比"记了却放行"更保守，且没有超卖风险。
     return { ok: true, count: 0, limit: safeLimit, retryAfterSec: 0, degraded: true, bucketKey }
   }
 }
@@ -351,24 +362,20 @@ export async function writeBlockUntil(
     nowMs: 0,
     windowSec: 60,
   })
+  const sec = Math.max(1, Math.floor(args.blockSec))
+  const until = Math.floor(args.blockUntilMs)
   try {
-    await db
-      .prepare(
-        "INSERT OR IGNORE INTO rate_counters (bucket_key, tier, window_start, window_sec, count, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-      )
-      .bind(
-        bucketKey,
-        tierColumnValue("block", args.tier),
-        args.nowMs,
-        Math.max(1, Math.floor(args.blockSec)),
-        Math.floor(args.blockUntilMs),
-        args.nowMs,
-      )
-      .run()
-    await db
-      .prepare("UPDATE rate_counters SET count = ?, window_start = ?, window_sec = ?, updated_at = ? WHERE bucket_key = ?")
-      .bind(Math.floor(args.blockUntilMs), args.nowMs, Math.max(1, Math.floor(args.blockSec)), args.nowMs, bucketKey)
-      .run()
+    // 补行 + 写 block_until：一次往返（无论哪条失败都整批回滚 → 视为"没封上"，fail-open 语义不变）
+    await db.batch([
+      db
+        .prepare(
+          "INSERT OR IGNORE INTO rate_counters (bucket_key, tier, window_start, window_sec, count, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(bucketKey, tierColumnValue("block", args.tier), args.nowMs, sec, until, args.nowMs),
+      db
+        .prepare("UPDATE rate_counters SET count = ?, window_start = ?, window_sec = ?, updated_at = ? WHERE bucket_key = ?")
+        .bind(until, args.nowMs, sec, args.nowMs, bucketKey),
+    ])
     return bucketKey
   } catch {
     return null

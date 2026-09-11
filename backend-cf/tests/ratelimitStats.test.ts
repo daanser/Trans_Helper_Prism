@@ -12,6 +12,7 @@
 //   ④ 突发层顺序修复：被档位拒绝的请求**仍计入突发桶**；第 21 个请求 → scope=burst；
 //      随后 → scope=blocked（Retry-After ≈ 60）；CN 家宽正常节奏不会误触 20/10s。
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
+import { withBatch } from "./d1MockBatch"
 import { app } from "../src/index"
 import { GLOBAL_TIER_VALUE, STATS_WINDOWS, aggregateRateLimitRows } from "../src/ratecount"
 import type { Env } from "../src/types"
@@ -90,7 +91,7 @@ function makeStatsDb(rows: SeedRow[], opts: { failAll?: boolean; failFirst?: boo
       return stmt
     },
   } as unknown as D1Database
-  return { db, writes, reads }
+  return { db: withBatch(db as unknown as { prepare: (sql: string) => unknown }) as unknown as D1Database, writes, reads }
 }
 
 function adminEnv(over: Partial<Env> = {}): Env {
@@ -424,7 +425,7 @@ function makeRateDb() {
       return stmt
     },
   } as unknown as D1Database
-  return { db, rows }
+  return { db: withBatch(db as unknown as { prepare: (sql: string) => unknown }) as unknown as D1Database, rows }
 }
 
 /** 经代理转发的境外 IP（overseas 档 = 10 次/分钟）。 */

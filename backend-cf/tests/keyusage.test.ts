@@ -7,6 +7,7 @@
 //       而 /chat 的 LLM 调用确实把 account_id 落到 key_usage（端到端）。
 // 全 mock D1 + mock fetch（embeddings/Qdrant/LLM），零网络。
 import { describe, it, expect, afterEach, vi } from "vitest"
+import { withBatch } from "./d1MockBatch"
 import { app, makeKeyUsageDb } from "../src/index"
 import { issueSession } from "../src/auth"
 import type { Env } from "../src/types"
@@ -57,11 +58,9 @@ function makeDb(opts: { failRun?: boolean } = {}) {
       }
       return stmt
     },
-    async batch(stmts: unknown[]) {
-      return stmts
-    },
   } as unknown as D1Database
-  return { db, calls }
+  // batch()：性能优化后 ratecount/quota 用 db.batch 压缩往返，这里补上通用实现
+  return { db: withBatch(db as unknown as { prepare: (sql: string) => unknown }) as unknown as D1Database, calls }
 }
 
 function makeEnv(db?: D1Database): Env {
@@ -199,11 +198,8 @@ function makeRouteDb(chatRow: Record<string, unknown> | null = null) {
       }
       return stmt
     },
-    async batch(stmts: unknown[]) {
-      return stmts
-    },
   } as unknown as D1Database
-  return { db, inserts }
+  return { db: withBatch(db as unknown as { prepare: (sql: string) => unknown }) as unknown as D1Database, inserts }
 }
 
 /** fetch mock：embeddings / Qdrant 检索 / LLM chat completions（全部本地 mock，零网络）。 */

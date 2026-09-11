@@ -7,6 +7,7 @@
 //       ⑧ **网格锚定**：对齐/清零/同窗口不清零/并发不抹用量/accounts 缺失回退；
 //       ⑨ 视图重置字段 window_end / reset_at / reset_in_sec。
 import { describe, it, expect, vi } from "vitest"
+import { withBatch } from "./d1MockBatch"
 import {
   QUOTA_COST,
   DEFAULT_WINDOW_HOURS,
@@ -183,7 +184,7 @@ function makeDb(
     },
   } as unknown as D1Database
 
-  return { db, rows, accs, calls }
+  return { db: withBatch(db as unknown as { prepare: (sql: string) => unknown }) as unknown as D1Database, rows, accs, calls }
 }
 
 describe("加权 token 成本表", () => {
@@ -716,11 +717,24 @@ describe("chargeQuota（原子扣减）", () => {
     expect(advanceIdx).toBeGreaterThan(resetIdx) // 顺序不能反：先把旧窗口清零，再推进窗口
   })
 
-  it("同窗口内不清零（快路径 0 写；对齐路径只动 period_start）", async () => {
-    const { db, rows, calls } = makeDb({ "acc-1": { used_cost: 300, requests: 2 } })
+  it("同窗口内不清零：对齐语句的 `period_start < gridStart` 条件不成立 → requests 用量保留", async () => {
+    const { db, rows } = makeDb({ "acc-1": { used_cost: 300, requests: 2 } })
     await chargeQuota(db, "acc-1", 200, NOW)
-    expect(rows.get("acc-1")!.requests).toBe(3)
-    expect(calls.some((c) => c.sql.includes("SET requests = 0"))).toBe(false)
+    // 性能优化后，"清零 requests"这条语句**始终在 batch 里**（省不掉，否则跨窗口时来不及清），
+    // 但仍靠 SQL 里的条件 `period_start < gridStart` 保证同窗口内 0 行受影响 —— 断言**效果**而非语句存在性。
+    expect(rows.get("acc-1")!.requests).toBe(3) // 旧值 2 + 本次 1（没被清零）
+    expect(rows.get("acc-1")!.used_cost).toBe(500) // 旧值 300 + 本次 200（没被清零）
+    expect(rows.get("acc-1")!.period_start).toBe(NOW) // 窗口起点没动
+  })
+
+  it("真故障（非缺列）→ 不做 legacy 重跑（避免 batch 未回滚时重复扣费），直接 fail-open", async () => {
+    // 扣费语句抛"网络/限流"这类真错误：**不该**再跑一次不带 requests 的语句（那可能重复扣费）
+    const { db, rows, calls } = makeDb({ "acc-1": {} }, "used_cost = used_cost + ?")
+    const res = await chargeQuota(db, "acc-1", 200, NOW)
+    expect(res.ok).toBe(false)
+    expect(res.reason).toBe("db-unavailable")
+    expect(calls.filter((c) => c.sql.includes("used_cost = used_cost + ?")).length).toBe(1) // 只尝试过一次
+    expect(rows.get("acc-1")!.used_cost).toBe(0)
   })
 
   it("旧库（还没跑 apply-schema，没有 requests 列）→ 退化为旧语句，配额照常扣、不 fail-open", async () => {

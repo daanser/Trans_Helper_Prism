@@ -594,10 +594,12 @@ api.post("/search", async (c) => {
     )
   }
 
-  // ③ 登录：先扣配额（D1 原子），超额 → 回退且不扣
+  // ③ 登录：先扣配额（D1 原子批）：窗口对齐 + 判-扣-计数 + 回读在**一次往返**里完成（见 quota.ts）
+  let chargeResult: Awaited<ReturnType<typeof chargeQuota>> | null = null
   if (session) {
     const cost = computeQuotaCost({ search: true, rerank: req.use_reranker !== false })
     const charge = await chargeQuota(c.env.DB, session.sub, cost, nowMs, c.env)
+    chargeResult = charge
     if (!charge.ok && charge.reason === "quota-exceeded") {
       const fb = await runFallback(req.query ?? "", corporaList, c.env)
       return c.json(
@@ -616,7 +618,9 @@ api.post("/search", async (c) => {
       db: makeKeyUsageDb(c.env, session?.sub),
     })
     if (!session) return c.json(result)
-    const view = await getQuota(c.env.DB, session.sub, nowMs, c.env)
+    // 配额视图**复用扣费时同事务回读的结果**（`charge.view`），不再为响应单独查一次 D1。
+    // 只有"扣费走了 db-unavailable 兜底"这种罕见情况才回退到一次 getQuota（那时视图本来就是"放行视图"）。
+    const view = chargeResult?.view ?? (await getQuota(c.env.DB, session.sub, nowMs, c.env))
     const fb = Boolean((result as SearchResponse).fallback)
     return c.json({ ...(result as SearchResponse), quota: toQuotaResponse(view, fb) })
   } catch (err) {
@@ -799,7 +803,8 @@ api.post("/search/stream", async (c) => {
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
-        const view = await getQuota(c.env.DB, session.sub, nowMs, c.env)
+        // 复用扣费时同事务回读的视图（原来在流内单独 getQuota = 多 1~2 次往返）
+        const view = charge.view ?? (await getQuota(c.env.DB, session.sub, nowMs, c.env))
         controller.enqueue(
           sse("hits", {
             hits: result.hits,

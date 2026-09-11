@@ -5,6 +5,7 @@
 //       ③ D1 异常 fail-open + degraded；④ 过期行清理；⑤ **bucket_key 不含 IP 明文**（隐私验收项）；
 //       ⑥ HMAC 键来源（不新增 secret，未配置时退化）。
 import { describe, it, expect } from "vitest"
+import { withBatch } from "./d1MockBatch"
 import {
   RATE_LIMIT_HMAC_KEY_FALLBACK,
   bucketKeyFor,
@@ -137,7 +138,7 @@ function makeDb(opts: { failOn?: string } = {}) {
     },
   } as unknown as D1Database
 
-  return { db, rows, calls }
+  return { db: withBatch(db as unknown as { prepare: (sql: string) => unknown }) as unknown as D1Database, rows, calls }
 }
 
 /** 便捷：用固定 HMAC 键消费一次。 */

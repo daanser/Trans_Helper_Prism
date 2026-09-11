@@ -118,6 +118,14 @@ export interface ChargeResult {
   remaining_pct: number
   /** 失败原因：quota-exceeded（超额，切回退）/ db-unavailable（放行 + warning） */
   reason?: "quota-exceeded" | "db-unavailable"
+  /**
+   * 扣减时同事务回读出来的**完整窗口视图**（含 window_start / reset_at 等 R6 字段）。
+   *
+   * 存在的意义：**消除路由里重复的 getQuota** —— 原来"扣费后 GetQuota 一次 + 响应再 GetQuota 一次"
+   * 要花 2~4 次额外往返，现在直接用本字段拼响应（性能优化：/search 的 D1 往返 ≤5）。
+   * additive：缺省 undefined（db-unavailable / cost=0 的旧路径仍可只读 used_* 三个数）。
+   */
+  view?: QuotaView
 }
 
 /** D1 绑定（允许 undefined/null 以便优雅降级）。 */
@@ -300,20 +308,118 @@ function gridStartFor(anchorMs: number | null, nowMs: number, env: unknown): num
   return gridWindowStart(anchorMs, nowMs, windowMs(env))
 }
 
-/** 读 quotas 行；异常 → 抛出（由调用方捕获降级）。 */
-async function readRow(db: D1Database, accountId: string): Promise<QuotaRow | null> {
-  const row = await db
-    .prepare("SELECT period_start, used_cost, monthly_limit FROM quotas WHERE account_id = ?")
-    .bind(accountId)
-    .first<QuotaRow>()
-  return row ?? null
+/**
+ * **一次往返**读「配额行 + 网格锚（accounts.created_at）」。
+ *
+ * 为什么要合并：这两个读原本是两次顺序往返（每次 0.1–0.2s），而它们**必须一起**才能算出网格窗口
+ * （见 gridStartFor）—— 拆开纯属浪费。`db.batch` 是隐式事务 + 单次往返，两条 SELECT 正好一批。
+ * 语义与逐条读**完全一致**（同一事务内的两个只读快照；本函数不做任何写）。
+ */
+async function readQuotaContext(
+  db: D1Database,
+  accountId: string,
+): Promise<{ row: QuotaRow | null; anchorMs: number | null }> {
+  const [quotaRes, accountRes] = await db.batch([
+    db.prepare("SELECT period_start, used_cost, monthly_limit FROM quotas WHERE account_id = ?").bind(accountId),
+    db.prepare("SELECT created_at FROM accounts WHERE id = ?").bind(accountId),
+  ])
+  const row: QuotaRow | null = (quotaRes?.results as QuotaRow[] | undefined)?.[0] ?? null
+  const createdRaw = (accountRes?.results as Array<{ created_at?: unknown }> | undefined)?.[0]?.created_at
+  const anchorMs = typeof createdRaw === "number" && Number.isFinite(createdRaw) ? createdRaw : null
+  return { row, anchorMs }
+}
+
+/**
+ * 窗口对齐语句（补行 + ⓪清零 requests + ①网格推进 + ②同窗口错位对齐）——**唯一实现**，
+ * 由 `ensureWindow()` 与 `chargeQuota()` 共用，保证两条路径的落库语义逐字相同。
+ *
+ * `withRequests=false` = 未迁移的旧库兜底（没有 `requests` 列）：省掉两条提到该列的语句，
+ * 其余（补行/推进/对齐）照常 —— 缺列绝不能影响窗口推进与扣费。
+ * ⚠️ ⓪ 必须在 ① 之前（见下方注释）；数组顺序即 batch 内的执行顺序。
+ */
+function windowAlignStatements(
+  db: D1Database,
+  accountId: string,
+  gridStart: number,
+  nowMs: number,
+  spanMs: number,
+  withRequests: boolean,
+): D1PreparedStatement[] {
+  const stmts: D1PreparedStatement[] = [
+    db
+      .prepare(
+        "INSERT OR IGNORE INTO quotas (account_id, period_start, used_cost, monthly_limit, updated_at) VALUES (?, ?, 0, ?, ?)",
+      )
+      .bind(accountId, gridStart, 5.0, nowMs),
+  ]
+  if (withRequests) {
+    // ⓪ 窗口切换前先清零 `requests`（技术债 #4）。**必须在 ① 之前**：条件 `period_start < gridStart`
+    //    只在"行还停在旧窗口"时成立，① 一执行 period_start 就等于 gridStart，本语句就再也匹配不到了。
+    stmts.push(db.prepare("UPDATE quotas SET requests = 0 WHERE account_id = ? AND period_start < ?").bind(accountId, gridStart))
+  }
+  // ① 网格推进（旧起点落后）→ 清零并对齐。单条条件写，并发下只会成功一次。
+  stmts.push(
+    db
+      .prepare("UPDATE quotas SET used_cost = 0, period_start = ?, updated_at = ? WHERE account_id = ? AND period_start < ?")
+      .bind(gridStart, nowMs, accountId, gridStart),
+  )
+  // ② 同窗口内错位 → 只对齐起点、不清零；上界排除"已被推进到后面网格"的行（防把窗口拽回）。
+  stmts.push(
+    db
+      .prepare(
+        "UPDATE quotas SET period_start = ?, updated_at = ? WHERE account_id = ? AND period_start > ? AND period_start < ?",
+      )
+      .bind(gridStart, nowMs, accountId, gridStart, gridStart + spanMs),
+  )
+  return stmts
+}
+
+/**
+ * 判断一个错误是不是「旧库还没迁移出 `requests` 列」（`no such column: requests`）。
+ *
+ * 为什么**只**在这种情况下走兜底重跑（而不是"任何错误都重跑一次"）：
+ *   · 语义上只有缺列是"可以靠换语句解决"的；
+ *   · 真故障（D1 不可用 / 网络抖动 / 限流）重跑没有意义，且**如果 batch 因故没有整体回滚**，
+ *     重跑会**重复扣费**。把兜底收窄成"缺列"，既保住旧库可用性，又不可能双重计费。
+ * 其余错误一律向上抛 → 调用方按 db-unavailable → fail-open（可用性优先，与既有语义一致）。
+ */
+function isMissingColumnError(err: unknown): boolean {
+  const msg = String((err as Error)?.message ?? err ?? "").toLowerCase()
+  return msg.includes("no such column") || msg.includes("no column named")
+}
+
+/** 读一行配额（`ensureWindow` 慢路径 / `chargeQuota` 收尾用；与 batch 同事务时读到的是**写后**值）。 */
+function readRowStatement(db: D1Database, accountId: string): D1PreparedStatement {
+  return db.prepare("SELECT period_start, used_cost, monthly_limit FROM quotas WHERE account_id = ?").bind(accountId)
+}
+
+/** 从 batch 结果里取一行配额（缺行/脏值 → null）。 */
+function rowFromResult(res: D1Result<unknown> | undefined): QuotaRow | null {
+  const raw = (res?.results as QuotaRow[] | undefined)?.[0]
+  return raw ?? null
+}
+
+/**
+ * 「行 + 锚」→ 配额视图（**纯函数**）。这就是 `getQuota` 原本的全部逻辑，
+ * 抽出来供 `getQuota` / `ensureWindow` / `chargeQuota` 共用 —— 三条路径的窗口/网格口径**必然一致**。
+ */
+function viewFromContext(row: QuotaRow | null, anchorMs: number | null, nowMs: number, env: unknown): QuotaView {
+  const gridStart = gridStartFor(anchorMs, nowMs, env)
+  if (!row) return toView({ period_start: gridStart, used_cost: 0, monthly_limit: 0 }, nowMs, env, true)
+  if (row.period_start !== gridStart) {
+    // 网格推进过 → 视作新窗口（用量归零）；同窗口内错位 → 保留用量、起点按网格。
+    const rolled = row.period_start < gridStart
+    return toView({ ...row, period_start: gridStart, used_cost: rolled ? 0 : row.used_cost }, nowMs, env, anchorMs === null)
+  }
+  return toView(row, nowMs, env, anchorMs === null)
 }
 
 /**
  * 网格窗口对齐 + 保证行存在（幂等、并发安全）。R6 核心。
  *
  * 1. 读 `quotas` 行 + 读 `accounts.created_at`（锚），算出**当前网格窗口起点** `gridStart`；
- * 2. **快路径**：`period_start === gridStart` → 直接返回，**不写库**（成本 = 2 次读）；
+ * 2. **快路径**：`period_start === gridStart` → 直接返回，**不写库**
+ *    （成本 = **1 次 D1 往返**：`db.batch` 里两条 SELECT —— quotas 行 + accounts.created_at，2026-09-11 由两次顺序读合并）；
  * 3. **慢路径**（首次触达 / 跨窗口 / 同窗口错位）：
  *    - `INSERT OR IGNORE`：补行，`period_start = gridStart`（**不是 now**）；
  *    - ① 网格推进：`UPDATE ... SET used_cost = 0, period_start = ? WHERE period_start < ?`
@@ -331,8 +437,10 @@ async function readRow(db: D1Database, accountId: string): Promise<QuotaRow | nu
  * 所以 A 之后扣的 `used_cost` 不会被 B 抹掉（不存在"两个并发各自清零 → 用量丢失"）。
  * 反向交叉（B 的时间片还停在上一窗口）时，B 的 ① 条件同样不成立，② 又被上界排除 → 不会把窗口拽回去。
  * 与 `chargeQuota` 一样：**不读-改-写、不做多语句事务**，只靠单条条件 UPDATE 的原子性。
- * 成本：快路径 0 写（2 读）；慢路径最多 3 条写（1 INSERT + 2 条件 UPDATE），只在**窗口切换 /
- * 首次触达 / 旧数据首对齐**时发生 —— 即每账号每窗口最多一次，与 D1 的 100k 写/天相比可忽略。
+ * 成本（2026-09-11 性能优化后）：快路径 **1 次往返**（批量 2 条 SELECT、0 写）；
+ * 慢路径 **2 次往返**（上下文 1 次 + 「对齐语句 + 回读」1 次 batch），只在**窗口切换 / 首次触达 /
+ * 旧数据首对齐**时发生 —— 即每账号每窗口最多一次，与 D1 的 100k 写/天相比可忽略。
+ * 语句条数没变（1 INSERT + 1 requests 清零 + 2 条件 UPDATE + 1 SELECT），减少的是**往返次数**。
  * D1 缺失/异常 → null（调用方按放行处理）。
  */
 export async function ensureWindow(
@@ -344,57 +452,49 @@ export async function ensureWindow(
   if (!db || !accountId) return null
   const span = windowMs(env)
   try {
-    const existing = await readRow(db, accountId)
-    const anchorMs = await readCreatedAt(db, accountId)
+    // ① 一次往返：配额行 + 网格锚（原本是两次顺序读）
+    const { row: existing, anchorMs } = await readQuotaContext(db, accountId)
     const gridStart = gridStartFor(anchorMs, nowMs, env)
-    // 行已对齐当前网格窗口 → 快路径（只读，不写库）；accounts 缺失时 degraded 可见。
+    // 行已对齐当前网格窗口 → 快路径（**0 写**）；accounts 缺失时 degraded 可见。
     if (existing && existing.period_start === gridStart) return toView(existing, nowMs, env, anchorMs === null)
 
-    await db
-      .prepare(
-        "INSERT OR IGNORE INTO quotas (account_id, period_start, used_cost, monthly_limit, updated_at) VALUES (?, ?, 0, ?, ?)",
-      )
-      .bind(accountId, gridStart, 5.0, nowMs)
-      .run()
-    // ⓪ 窗口切换前先清零 `requests`（技术债 #4：`/admin/usage` 的"本窗口真实请求数"）。
-    // **必须放在 ① 之前**：条件 `period_start < gridStart` 只在"行还停在旧窗口"时成立，
-    // ① 一执行 period_start 就等于 gridStart，本语句就再也匹配不到了。
-    // **单独一条 + 单独 try/catch**：`requests` 列由 SCHEMA_MIGRATIONS 补，旧库可能还没迁移；
-    // 缺列失败**绝不能**影响窗口推进，否则 ensureWindow 返回 null → chargeQuota 判 db-unavailable
-    // → 配额闸门整体 fail-open（那比少一个后台指标严重得多）。
-    // 竞态说明：本语句只碰"旧窗口"的行，新窗口上刚扣的请求不会被清掉（最多丢掉窗口边界上
-    // 旧窗口里的那 1~2 次计数，属观测噪声）。
-    try {
-      await db.prepare("UPDATE quotas SET requests = 0 WHERE account_id = ? AND period_start < ?").bind(accountId, gridStart).run()
-    } catch {
-      // 列未迁移 / 写失败 → 跳过（迁移完成后 requests 从头开始计数）
-    }
-    // ① 网格推进（旧起点落后于当前网格起点）→ 清零并对齐。单条条件写，并发下只会成功一次。
-    await db
-      .prepare("UPDATE quotas SET used_cost = 0, period_start = ?, updated_at = ? WHERE account_id = ? AND period_start < ?")
-      .bind(gridStart, nowMs, accountId, gridStart)
-      .run()
-    // ② 同窗口内错位 → 只对齐起点、不清零；上界排除"已被推进到后面网格"的行（防把窗口拽回）。
-    await db
-      .prepare(
-        "UPDATE quotas SET period_start = ?, updated_at = ? WHERE account_id = ? AND period_start > ? AND period_start < ?",
-      )
-      .bind(gridStart, nowMs, accountId, gridStart, gridStart + span)
-      .run()
-    const row = await readRow(db, accountId)
-    return toView(row, nowMs, env, row === null || anchorMs === null)
+    // ② 慢路径：对齐语句 + 回读，**一次往返**（隐式事务：写与读在同一事务里，读到的是写后值）
+    const view = await runAlignBatch(db, accountId, gridStart, nowMs, span, env, anchorMs)
+    return view
   } catch {
     return null
   }
 }
 
 /**
- * 读配额（前端只展示百分比 + 重置时刻）。
- * **只读**：不改库。窗口/网格已推进时，视图按「新窗口」返回（`used=0`、`window_start=gridStart`）；
- * 同窗口内错位时按网格起点返回但**保留**已用量（与 `ensureWindow` 的落库语义一致）。
- * 实际落库推进由 `ensureWindow` / `chargeQuota` 完成。
- * D1 缺失/异常 → 放行视图（degraded=true）。
+ * 慢路径的一条 batch：`windowAlignStatements()` + 回读 quotas 行（**1 次往返**）。
+ *
+ * 缺列兜底（旧库没有 `requests` 列）：先带 requests 跑一次；整批失败 → 去掉那两条语句重跑。
+ * batch 是隐式事务 → 第一次失败**全部回滚**，重跑不会留下半截状态（比逐条执行更干净）。
+ * 两次都失败 → 向上抛（调用方按 db-unavailable / fail-open 处理）。
  */
+async function runAlignBatch(
+  db: D1Database,
+  accountId: string,
+  gridStart: number,
+  nowMs: number,
+  span: number,
+  env: unknown,
+  anchorMs: number | null,
+): Promise<QuotaView> {
+  const run = (withRequests: boolean) =>
+    db.batch([...windowAlignStatements(db, accountId, gridStart, nowMs, span, withRequests), readRowStatement(db, accountId)])
+  let res: Awaited<ReturnType<typeof run>>
+  try {
+    res = await run(true)
+  } catch (err) {
+    if (!isMissingColumnError(err)) throw err // 真故障 → 交给调用方的 fail-open
+    res = await run(false) // 旧库兜底：没有 requests 列
+  }
+  const row = rowFromResult(res[res.length - 1])
+  return toView(row, nowMs, env, row === null || anchorMs === null)
+}
+
 export async function getQuota(
   db: QuotaDb,
   accountId: string,
@@ -403,51 +503,14 @@ export async function getQuota(
 ): Promise<QuotaView> {
   if (!db || !accountId) return permissiveView(nowMs, env)
   try {
-    const row = await readRow(db, accountId)
-    const anchorMs = await readCreatedAt(db, accountId)
-    const gridStart = gridStartFor(anchorMs, nowMs, env)
-    if (!row) return toView({ period_start: gridStart, used_cost: 0, monthly_limit: 0 }, nowMs, env, true)
-    if (row.period_start !== gridStart) {
-      // 网格推进过 → 视作新窗口（用量归零）；同窗口内错位 → 保留用量、起点按网格。
-      const rolled = row.period_start < gridStart
-      return toView(
-        { ...row, period_start: gridStart, used_cost: rolled ? 0 : row.used_cost },
-        nowMs,
-        env,
-        anchorMs === null,
-      )
-    }
-    return toView(row, nowMs, env, anchorMs === null)
+    // 一次往返拿到「行 + 锚」，再走与 ensureWindow/chargeQuota **同一个**纯函数算视图（口径必然一致）
+    const { row, anchorMs } = await readQuotaContext(db, accountId)
+    return viewFromContext(row, anchorMs, nowMs, env)
   } catch {
     return permissiveView(nowMs, env)
   }
 }
 
-/**
- * 原子扣减配额（T3.2 核心；2026-09-11 增补 `requests` 计数，技术债 #4）。
- * @param tokens 加权 token 消耗（见 computeQuotaCost）
- * @param nowMs  当前时间（epoch ms；用于窗口推进）
- * @param env    读取 `QUOTA_WINDOW_TOKENS` / `QUOTA_WINDOW_HOURS`
- * 返回 `{ ok, used_tokens, used_pct, remaining_pct, reason? }`：
- *   - 成功：ok=true；
- *   - 超额：ok=false, reason="quota-exceeded"（未扣，调用方切回退分支）；
- *   - 无 D1/DB 异常：ok=false, reason="db-unavailable"（调用方按「放行 + warning」处理）。
- * tokens <= 0（如回退）直接放行，不写库。
- *
- * ── `requests`（本窗口**真实用户请求数**，adminstats 的 `/admin/usage` 用它）──
- * 与 `used_cost` 在**同一条 UPDATE** 里自增，因此：
- *   · 零额外写（D1 免费版 10 万行写/天，见 history.md §5 坑 14）；
- *   · **只在扣费成功时 +1** —— `WHERE used_cost + ? <= ?` 不成立时整条语句不改任何列，
- *     `requests` 也就不会涨。所以"额度耗尽后走关键词回退"的请求**不计入**（口径见 adminstats.ts）；
- *   · 原子性与并发安全完全继承原语句（判-扣-计数三者同一条语句，不存在"扣了没记"或"记了没扣"）。
- * 窗口切换时由 `ensureWindow()` 把它清零（与 used_cost 同步）。
- *
- * ── 未迁移旧库的兼容（重要）──
- * `requests` 列由 `SCHEMA_MIGRATIONS` 的 `ALTER TABLE quotas ADD COLUMN requests` 补上。
- * 若部署后**还没跑 apply-schema**（列不存在），带 `requests` 的语句会报 `no such column`；
- * 此处**退化为旧语句**（只扣 used_cost），保证配额闸门不会因为没有这一列而整体 fail-open
- * （那会让额度形同虚设）。代价仅是迁移完成前 requests 恒为 0（在 /admin/usage 上可见）。
- */
 export async function chargeQuota(
   db: QuotaDb,
   accountId: string,
@@ -460,52 +523,86 @@ export async function chargeQuota(
     return { ok: false, used_tokens: 0, used_pct: 0, remaining_pct: 100, reason: "db-unavailable" }
   }
   if (cost === 0) {
-    // 回退 / 零消耗：不写库，但仍回报当前窗口状态
+    // 回退 / 零消耗：不写库，但仍回报当前窗口状态（1 次往返）
     const view = await getQuota(db, accountId, nowMs, env)
-    return { ok: true, used_tokens: view.used_tokens, used_pct: view.used_pct, remaining_pct: view.remaining_pct }
+    return { ok: true, used_tokens: view.used_tokens, used_pct: view.used_pct, remaining_pct: view.remaining_pct, view }
   }
 
-  const window = await ensureWindow(db, accountId, nowMs, env)
-  if (!window) {
-    return { ok: false, used_tokens: 0, used_pct: 0, remaining_pct: 100, reason: "db-unavailable" }
-  }
-
+  const span = windowMs(env)
   const limit = limitTokens(env)
   try {
-    // 单条原子「判-扣-计数」：并发下不会超卖（meta.changes === 0 即超额/已被扣光）。
-    const runCharge = (withRequests: boolean) =>
-      db
-        .prepare(
-          withRequests
-            ? "UPDATE quotas SET used_cost = used_cost + ?, requests = requests + 1, updated_at = ? WHERE account_id = ? AND used_cost + ? <= ?"
-            : // 旧库兜底（requests 列还没迁移）：只扣 used_cost，绝不因为缺列而放行整站
-              "UPDATE quotas SET used_cost = used_cost + ?, updated_at = ? WHERE account_id = ? AND used_cost + ? <= ?",
-        )
-        .bind(cost, nowMs, accountId, cost, limit)
-        .run()
+    // ① 一次往返：配额行 + 网格锚
+    const { anchorMs } = await readQuotaContext(db, accountId)
+    const gridStart = gridStartFor(anchorMs, nowMs, env)
 
+    // ② 一次往返（隐式事务、按序执行）：窗口对齐（补行/清零/推进/错位）→ 原子「判-扣-计数」→ 回读。
+    //
+    // 为什么可以把"建窗"和"扣费"放进同一条 batch（**语义与逐条执行逐字相同**）：
+    //   · 对齐语句全部是**条件写**：窗口已对齐时 0 行受影响（与 ensureWindow 快路径等效）；
+    //     跨窗口时它们先于扣费执行，于是扣费落在**新窗口**上 —— 正是今天"先 ensureWindow 再 charge"的顺序。
+    //   · batch 是隐式事务：对齐与扣费要么一起生效、要么一起回滚（不会"窗口推进了但没扣费"）。
+    //   · 并发安全来自 `UPDATE ... WHERE used_cost + ? <= ?` 这一条语句本身（判-扣同句），
+    //     与它在不在 batch 里无关；D1 对同一库的写事务是串行的，因此并发下依然**绝不超卖**、
+    //     "两个并发各自跨窗口时只有一个清零"也依然成立（第二个事务里 ① 的条件已不成立 → 0 行）。
+    //   · 收尾的 SELECT 与扣费**同事务**，因此返回的是**扣费后的真值** —— 这就是"消除重复 getQuota"的关键：
+    //     路由不再需要为响应单独查一次配额（原来那条 GET/1~2 次往返被彻底省掉）。
+    //
+    // 缺列兜底：旧库没有 `requests` 列时整批失败 → 去掉两条提到该列的语句重跑
+    // （第一次失败已整体回滚，重跑不会重复扣费）。两次都失败 → db-unavailable（调用方 fail-open）。
+    const runCharge = (withRequests: boolean) =>
+      db.batch([
+        ...windowAlignStatements(db, accountId, gridStart, nowMs, span, withRequests),
+        runChargeStatement(db, accountId, cost, nowMs, limit, withRequests),
+        readRowStatement(db, accountId),
+      ])
     let res: Awaited<ReturnType<typeof runCharge>>
     try {
       res = await runCharge(true)
-    } catch {
-      res = await runCharge(false)
+    } catch (err) {
+      if (!isMissingColumnError(err)) throw err // 真故障 → db-unavailable（fail-open），绝不重跑扣费
+      res = await runCharge(false) // 旧库兜底：没有 requests 列
     }
-    if (res?.meta?.changes === 1) {
-      const view = await getQuota(db, accountId, nowMs, env)
-      return { ok: true, used_tokens: view.used_tokens, used_pct: view.used_pct, remaining_pct: view.remaining_pct }
+    const chargeRes = res[res.length - 2]
+    const row = rowFromResult(res[res.length - 1])
+    const view = viewFromContext(row, anchorMs, nowMs, env)
+
+    if (chargeRes?.meta?.changes === 1) {
+      return { ok: true, used_tokens: view.used_tokens, used_pct: view.used_pct, remaining_pct: view.remaining_pct, view }
     }
-    // changes === 0：超额（或行被并发删）。读一次当前状态给调用方，绝不抛错。
-    const view = await getQuota(db, accountId, nowMs, env)
+    // changes === 0：超额（或行被并发扣光）→ 未扣，视图仍是**当前真实状态**（同事务回读，无需再查）。
     return {
       ok: false,
       used_tokens: view.used_tokens,
       used_pct: view.used_pct,
       remaining_pct: view.remaining_pct,
       reason: "quota-exceeded",
+      view,
     }
   } catch {
     return { ok: false, used_tokens: 0, used_pct: 0, remaining_pct: 100, reason: "db-unavailable" }
   }
+}
+
+/**
+ * 单条原子「判-扣-计数」语句（唯一实现，batch 与非 batch 路径共用）。
+ * @param withRequests false = 未迁移旧库兜底（不带 `requests = requests + 1`）
+ */
+function runChargeStatement(
+  db: D1Database,
+  accountId: string,
+  cost: number,
+  nowMs: number,
+  limit: number,
+  withRequests: boolean,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      withRequests
+        ? "UPDATE quotas SET used_cost = used_cost + ?, requests = requests + 1, updated_at = ? WHERE account_id = ? AND used_cost + ? <= ?"
+        : // 旧库兜底（requests 列还没迁移）：只扣 used_cost，绝不因为缺列而放行整站
+          "UPDATE quotas SET used_cost = used_cost + ?, updated_at = ? WHERE account_id = ? AND used_cost + ? <= ?",
+    )
+    .bind(cost, nowMs, accountId, cost, limit)
 }
 
 /**
