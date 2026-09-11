@@ -167,6 +167,8 @@
           <span aria-hidden="true">·</span>
           <span>GPL-3.0 开源协议</span>
           <span aria-hidden="true">·</span>
+          <NuxtLink to="/about" class="text-primary hover:underline">关于与免责</NuxtLink>
+          <span aria-hidden="true">·</span>
           <a
             href="https://transprism.chengxi.moe"
             target="_blank"

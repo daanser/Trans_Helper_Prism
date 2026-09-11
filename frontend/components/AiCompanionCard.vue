@@ -75,6 +75,16 @@
       </button>
     </div>
 
+    <!-- AI 免责（plan-m4.md W5）：只要出现过 AI 内容就常驻一句，不藏在页脚 -->
+    <p
+      v-if="answer || streaming || notice"
+      class="mt-3 border-t border-surface-border pt-2.5 text-[11px] leading-relaxed text-ink-muted"
+    >
+      内容由 AI 生成，<span class="font-medium text-ink-sub">可能出错或过时，不能替代医生建议</span>；
+      请以 <span class="font-medium text-ink-sub">[来源n]</span> 指向的原文为准。
+      <NuxtLink to="/about" class="text-primary hover:underline">了解详情</NuxtLink>
+    </p>
+
     <!-- 追问面板 -->
     <slot name="followup">
       <div v-if="followupEnabled" class="mt-4 border-t border-surface-border pt-3">

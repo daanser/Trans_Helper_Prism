@@ -104,6 +104,10 @@
         <li>· X 的授权页会显示「可查看你能查看的所有帖子」——这是 X 的权限粒度较粗（读取账号信息必须同时授予该权限，实测只给 users.read 会返回 403）。我们只取 id 与用户名，不会读取、也不会保存你的任何帖子或关注关系。</li>
         <li>· 会话凭据只存在你自己的浏览器本地，30 天有效；点顶栏「退出」即可随时清除。</li>
       </ul>
+      <p class="mt-3 text-xs leading-relaxed text-ink-muted">
+        更完整的说明（数据来源、缓存与限流如何处理、AI 免责）见
+        <NuxtLink to="/about" class="text-primary hover:underline">关于页</NuxtLink>。
+      </p>
     </div>
   </div>
 </template>
