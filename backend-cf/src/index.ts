@@ -1218,6 +1218,56 @@ api.post("/admin/accounts/:id/quota", async (c) => {
   return c.json({ ok: true, quota: view, quota_display: formatPct(view.used_pct) })
 })
 
+// GET /admin/d1bench —— 【临时诊断】直接量 D1 的读/写/批成本（用于定位延迟瓶颈；定位完可删）
+api.get("/admin/d1bench", async (c) => {
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
+  if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
+  const db = c.env.DB
+  const out: Record<string, number> = {}
+  const t = () => Date.now()
+  const key = `bench:${Date.now()}`
+
+  let t0 = t()
+  for (let i = 0; i < 3; i++) await db.prepare("SELECT 1 AS x").first()
+  out["3_sequential_reads_ms"] = t() - t0
+
+  t0 = t()
+  await db.batch([db.prepare("SELECT 1 AS x"), db.prepare("SELECT 1 AS x"), db.prepare("SELECT 1 AS x")])
+  out["1_batch_of_3_reads_ms"] = t() - t0
+
+  t0 = t()
+  await db
+    .prepare(
+      "INSERT OR IGNORE INTO rate_counters (bucket_key, tier, window_start, window_sec, count, updated_at) VALUES (?, ?, ?, ?, 0, ?)",
+    )
+    .bind(key, "bench", 0, 60, Date.now())
+    .run()
+  out["1_insert_ms"] = t() - t0
+
+  t0 = t()
+  await db
+    .batch([
+      db
+        .prepare(
+          "INSERT OR IGNORE INTO rate_counters (bucket_key, tier, window_start, window_sec, count, updated_at) VALUES (?, ?, ?, ?, 0, ?)",
+        )
+        .bind(key, "bench", 0, 60, Date.now()),
+      db
+        .prepare("UPDATE rate_counters SET count = count + 1, updated_at = ? WHERE bucket_key = ? AND count < ?")
+        .bind(Date.now(), key, 100),
+      db.prepare("SELECT count FROM rate_counters WHERE bucket_key = ?").bind(key),
+    ])
+  out["1_batch_insert_update_select_ms"] = t() - t0
+
+  t0 = t()
+  await db.prepare("SELECT count FROM rate_counters WHERE bucket_key = ?").bind(key).first()
+  out["1_read_ms"] = t() - t0
+
+  await db.prepare("DELETE FROM rate_counters WHERE bucket_key = ?").bind(key).run()
+  return c.json(out)
+})
+
 // GET /admin/whoami —— 诊断：看 Worker 到底收到了哪些「来源相关」请求头
 // 用途：经 Pages Function 反代后，判断客户端 IP 是否还能被正确识别（限流依赖它，见 TODO.md P0 / R2）。
 // 安全：需 admin 鉴权；只回白名单头，绝不回 Authorization / Cookie / **任何密钥**。
