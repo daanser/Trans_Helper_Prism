@@ -9,6 +9,8 @@
 #   QDRANT_URL        Qdrant Cloud 地址（https://xxx.cloud.qdrant.io）
 #   QDRANT_API_KEY    Qdrant API key
 #   EMBED_POOL_KEYS   硅基流动 embedding key（可逗号分隔多个）
+#   ADMIN_API_KEY     可选：摄取跑完把摘要上报给 Worker（它代笔写 D1 ingest_runs，
+#                     后台 /admin 才看得见摄取历史）；未配置则该步自动跳过，摄取不受影响
 #   （GITHUB_TOKEN 由 Actions 自动提供，用于 GitHub API 提高限额）
 
 name: ingest
@@ -37,6 +39,9 @@ jobs:
   ingest:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # 放 job 级是为了能在**步骤的 if 条件**里判断（`secrets` 上下文不能直接用在 if）
+    env:
+      ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
     defaults:
       run:
         working-directory: backend-cf
@@ -60,9 +65,57 @@ jobs:
           QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
           EMBED_POOL_KEYS: ${{ secrets.EMBED_POOL_KEYS }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 让脚本把每个 wiki 的结果写成机器可读摘要，供下一步上报（见 scripts/ingest-incremental.ts 文件头）
+          INGEST_SUMMARY_PATH: ${{ runner.temp }}/ingest-summary.json
         run: |
           ARGS=""
           if [ "${{ inputs.full }}" = "true" ]; then ARGS="$ARGS --full"; fi
           if [ -n "${{ inputs.wiki }}" ]; then ARGS="$ARGS --only=${{ inputs.wiki }}"; fi
           echo "运行：npx tsx scripts/ingest-incremental.ts $ARGS"
           npx tsx scripts/ingest-incremental.ts $ARGS
+
+      # 上报摄取摘要 → Worker 代笔写 D1 `ingest_runs`（Actions 不持有 D1 凭据）。
+      # `always()`：即使上一步因某个 wiki 失败而以非 0 退出，也要把"哪几个 wiki 失败"如实上报。
+      # `continue-on-error`：记账失败只影响后台观测，绝不让它把整轮摄取标红。
+      # 未配置 ADMIN_API_KEY 时整步跳过（自行部署的人不配也能正常摄取）。
+      - name: 上报摄取摘要
+        if: always() && env.ADMIN_API_KEY != ''
+        continue-on-error: true
+        env:
+          SUMMARY_PATH: ${{ runner.temp }}/ingest-summary.json
+          API_BASE: https://transhelper-prism-backend.transprism.workers.dev
+        run: |
+          if [ ! -f "$SUMMARY_PATH" ]; then echo "无摘要文件，跳过上报"; exit 0; fi
+          node - <<'NODE'
+          // 逐个 wiki 上报（端点一次一条）。逻辑失败一律只警告：观测不该影响摄取。
+          const fs = require("node:fs")
+          ;(async () => {
+            const summary = JSON.parse(fs.readFileSync(process.env.SUMMARY_PATH, "utf-8"))
+            const reports = Array.isArray(summary.reports) ? summary.reports : []
+            if (reports.length === 0) { console.log("摘要里没有 reports，跳过"); return }
+            for (const r of reports) {
+              const body = {
+                wiki_id: r.wiki_id,
+                status: r.status,
+                started_at: summary.started_at,
+                finished_at: summary.finished_at,
+                files_changed: r.changed,
+                chunks_upserted: r.chunks_upserted,
+              }
+              if (r.error) body.error = r.error
+              try {
+                const resp = await fetch(`${process.env.API_BASE}/api/v1/admin/ingest/runs`, {
+                  method: "POST",
+                  headers: {
+                    "content-type": "application/json",
+                    authorization: `Bearer ${process.env.ADMIN_API_KEY}`,
+                  },
+                  body: JSON.stringify(body),
+                })
+                console.log(`${r.wiki_id} (${r.status}) → HTTP ${resp.status}`)
+              } catch (e) {
+                console.warn(`${r.wiki_id} 上报失败（不影响摄取）：${e && e.message ? e.message : e}`)
+              }
+            }
+          })().catch((e) => console.warn("上报步骤异常（不影响摄取）：" + e))
+          NODE
