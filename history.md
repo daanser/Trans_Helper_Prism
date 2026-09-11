@@ -126,6 +126,15 @@
 42. **医疗免责是产品必需项，不是文案装饰**：语料与 AI 输出都涉及 HRT/用药，现已在三处落地 ——
    AI 卡片常驻一行（"可能出错或过时，不能替代医生建议；请以 [来源n] 原文为准"）、`/about` 顶部醒目区块、登录页隐私段指向 `/about`。
    改动 AI 卡片或删除 `/about` 前请先想清楚这一点。
+   **2026-09-11 追加：免责改为默认弹窗**（`components/DisclaimerDialog.vue` + `composables/useDisclaimer.ts`）：
+   - 同意 = 双写（localStorage `prism_disclaimer_ack` + 登录时的 `accounts.disclaimer_ack_at`）；
+     **版本串 `DISCLAIMER_VERSION`（现 `v1`）改成 `v2` 即可让所有人重新看一次** —— 改了条款就该重新告知，这是合规动作。
+   - **点遮罩不关闭**是有意的：误触遮罩若等于「我知道了」就是在用户最需要知情的一刻静默代签。
+   - 判定链：`ready（客户端已读盘，SSR 期恒不弹）&& !acked && !dismissedSession && !serverAck`；
+     `serverAck` 只由 `loadMe` 成功后写入，因此自带"已登录"语义，避免 `useAuth` ↔ `useDisclaimer` 循环依赖。
+   - 已登录且 `/me` 在途时**先不弹**，避免"别的设备确认过"的用户看到弹窗又消失。
+   - 已知取舍：本地 ack 是**设备级**（不带账号标识）→ 同一浏览器换账号登录不会再弹；且**有意不**把本地 ack 反推给服务端
+     （否则共享电脑上 A 的确认会静默代表 B 同意）。
 
 ## 6. 前端现状（2026-09-08 全量重写 UI/UX；2026-09-09 已上线 Pages）
 - **设计语言已彻底换掉**：不再是照搬 `vitepress-theme-project-trans` 的 indigo 色板。现为自定「温润学术检索」风——浅底 `#F8FAFC` / 深底 `#0B1120`，品牌蓝 `#2563EB`（深 `#3B82F6`），token 全走 `assets/css/main.css` 的 CSS 变量（`--bg-canvas/--bg-surface/--text-*/--primary*`），`tailwind.config.ts` 只做语义映射（`canvas/surface/primary/ink`）。

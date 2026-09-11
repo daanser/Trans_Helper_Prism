@@ -108,6 +108,16 @@
 > AI 卡片底部常驻免责行、页脚「关于与免责」入口、登录页隐私段指向 `/about`。
 > 线上验证：`https://search.chengxi.moe/about/` 200，关键句全部在页面里。
 > 隐私声明的事实依据与"改代码要同步改声明"的约束已记入 `history.md` 坑 41–42。
+>
+> **追加（用户反馈后，2026-09-11 当天完成）**：免责声明不再只藏在页脚 ——
+> ① **默认弹窗**（`DisclaimerDialog`，全站首次访问即弹）：主按钮「我知道了，不再提示」= `ack()`、
+> 次按钮「本次关闭」= 仅本次会话；**Esc = 本次关闭、点遮罩不关闭**（同意必须显式，避免误触代签）；
+> ② **记住方式双写**：localStorage `prism_disclaimer_ack`（值 = 版本串 `v1`）+ 已登录时写账号
+> `accounts.disclaimer_ack_at`（换设备不再弹）；**文案大改时把 `DISCLAIMER_VERSION` 改成 `v2` 即让所有人重看一次**；
+> ③ **搜索框正下方常驻合规小字**「继续使用即表示你已阅读并同意 免责声明与使用须知」→ `/about`；
+> ④ `/settings` 新增「启动时显示免责提示」开关；⑤ `/about` **底部**再加返回按钮。
+> 后端：`GET /me` 增 `disclaimer_ack_at`/`disclaimer_ack`，新增 `POST /api/v1/me/disclaimer`（401/422/404/503 全测）。
+> 线上已验证：`/me` 初值 null/false → ack=true 写入时间戳 → ack=false 清空；前端产物里弹窗**只在 JS、不在任何 HTML**（SSR 门控，不闪）。
 
 
 | 项 | 内容 |
