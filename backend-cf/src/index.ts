@@ -544,6 +544,8 @@ api.get("/tree/:wiki_id", async (c) => {
 // POST /api/v1/search —— 纯向量检索（T0.4）
 // ── POST /search（T3.2/T3.3）：限流 → 登录判定 → 配额 → 检索 ──
 api.post("/search", async (c) => {
+  // 延迟剖析探针：handler 入口时间（用于把"端到端 TTFB"拆成"Worker 内耗时"与"边缘/网络耗时"）
+  const tHandler = Date.now()
   let body: Partial<SearchRequest> = {}
   try {
     body = await c.req.json<SearchRequest>()
@@ -579,6 +581,7 @@ api.post("/search", async (c) => {
   // ①b D1 分档计数（**权威**，plan-ratelimit.md §5）：按真实 country/ASN 定档给额度，
   //     并发突发与全局匿名熔断也在这里判定。D1 不可用 → fail-open（打 warning）。
   const gate = await rateGate(c, { loggedIn: Boolean(session), scope: "search", nowMs, applyGlobalBreak: true })
+  const gateMs = Date.now() - tHandler
   if (gate.deny) return rateLimitedResponse(c, gate.deny)
 
   // ② 未登录：按 plan §2 登录制只走关键词回退（REQUIRE_LOGIN=0 可放开）；
@@ -595,6 +598,7 @@ api.post("/search", async (c) => {
   }
 
   // ③ 登录：先扣配额（D1 原子批）：窗口对齐 + 判-扣-计数 + 回读在**一次往返**里完成（见 quota.ts）
+  const tQuota = Date.now()
   let chargeResult: Awaited<ReturnType<typeof chargeQuota>> | null = null
   if (session) {
     const cost = computeQuotaCost({ search: true, rerank: req.use_reranker !== false })
@@ -617,12 +621,24 @@ api.post("/search", async (c) => {
       // （匿名 = 空串，仍记账；只是不归属任何账号）。不改检索语义。
       db: makeKeyUsageDb(c.env, session?.sub),
     })
-    if (!session) return c.json(result)
+    const diag = {
+      gate_ms: gateMs,
+      quota_ms: session ? Date.now() - tQuota : 0,
+      handler_ms: Date.now() - tHandler,
+    }
+    // 注：`RunSearchResult` 是联合类型，`FallbackResponse` 的类型里没声明 `timings`，
+    // 但运行时它一定带（见 fallbackResponse 构造）→ 统一按 SearchResponse 取用。
+    const sr = result as SearchResponse
+    if (!session) return c.json({ ...sr, timings: { ...sr.timings, ...diag } })
     // 配额视图**复用扣费时同事务回读的结果**（`charge.view`），不再为响应单独查一次 D1。
     // 只有"扣费走了 db-unavailable 兜底"这种罕见情况才回退到一次 getQuota（那时视图本来就是"放行视图"）。
     const view = chargeResult?.view ?? (await getQuota(c.env.DB, session.sub, nowMs, c.env))
-    const fb = Boolean((result as SearchResponse).fallback)
-    return c.json({ ...(result as SearchResponse), quota: toQuotaResponse(view, fb) })
+    const fb = Boolean(sr.fallback)
+    return c.json({
+      ...sr,
+      timings: { ...sr.timings, ...diag },
+      quota: toQuotaResponse(view, fb),
+    })
   } catch (err) {
     if (err instanceof SearchValidationError) return c.json({ error: err.code }, 422)
     throw err

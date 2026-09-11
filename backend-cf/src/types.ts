@@ -147,6 +147,12 @@ export interface SearchResponse {
     total_ms: number
     /** T1.2：命中短期向量缓存时为 true（跳过 embed+Qdrant；rerank 仍重算）。缺省视作 false。 */
     cached?: boolean
+    /** 诊断（延迟剖析）：限流闸门耗时（KV + D1 分档计数） */
+    gate_ms?: number
+    /** 诊断（延迟剖析）：配额扣减 + 视图耗时 */
+    quota_ms?: number
+    /** 诊断（延迟剖析）：**整个 handler** 从入口到响应构造的耗时（含上面两项与检索管线） */
+    handler_ms?: number
   }
   quota: { used_pct: number; remaining_pct: number; fallback: boolean }
   warnings: string[]
