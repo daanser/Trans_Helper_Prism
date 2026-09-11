@@ -162,8 +162,8 @@ CREATE INDEX IF NOT EXISTS idx_rate_counters_window ON rate_counters (window_sta
 | 层 | 触发 | 动作 |
 |---|---|---|
 | 单 IP 突发 | 10 秒内 ≥ `BURST_PER_10S`（默认 20）| 429 + `Retry-After`，并在 D1 记 `block_until = now + 60s`（期间一律 429）|
-| 全局匿名软熔断 | 匿名请求 > `ANON_GLOBAL_PER_MIN`（默认 600）| 匿名**只给关键词回退**（不调 embedding/rerank，成本≈0），响应带 `warning` |
-| 全局匿名硬熔断 | 匿名请求 > `ANON_GLOBAL_HARD_PER_MIN`（默认 1200）| 匿名一律 429；登录用户不受影响 |
+| 全局匿名软熔断 | 匿名请求 > `ANON_GLOBAL_PER_MIN`（**线上已设 300**，代码默认 600）| 匿名**只给关键词回退**（不调 embedding/rerank，成本≈0），响应带 `warning` |
+| 全局匿名硬熔断 | 匿名请求 > `ANON_GLOBAL_HARD_PER_MIN`（**线上已设 600**，代码默认 1200）| 匿名一律 429；登录用户不受影响 |
 | LLM/追问 | 本就要求登录 | 由 5h 配额精确计量，无需另设 |
 
 原则：**熔断只掐匿名**，登录用户（有配额、可追溯）保持可用；所有阈值 env 可调，默认从保守值起步。
@@ -494,5 +494,7 @@ window_start = registration_time + floor((now - registration_time) / window_ms) 
 6. **窗口网格锚定**：需要一次数据迁移（对齐 `period_start` + 清零 `used_cost`），线上仅有 1 个真实账号，风险极低。
 
 ---
+
+> ⚠️ **软/硬熔断不能设成同值**：硬熔断先扣名额（`count < hard` 失败即 429），软熔断要 `count > soft` 才降级 —— 同值会让“优雅降级带”消失、超限直接全站匿名 429。2026-09-11 用户要求“上限收到 600”，故设 **软 300 / 硬 600**。
 
 _最后更新：2026-09-09（限流 R2✅ R3✅ R4✅ R5✅ R1⏸；子域委派 ❌ 因 CF 限制取消；新增第二前端域名 `search.transhelper.org`）_
