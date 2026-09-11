@@ -1279,6 +1279,24 @@ api.get("/admin/d1bench", async (c) => {
   out["1_read_ms"] = t() - t0
 
   await db.prepare("DELETE FROM rate_counters WHERE bucket_key = ?").bind(key).run()
+
+  // KV 成本（限流器、key 禁用集、检索缓存都走 KV）
+  if (c.env.SEARCH_CACHE) {
+    const kv = c.env.SEARCH_CACHE
+    const kvKey = `bench:kv:${Date.now()}`
+    t0 = t()
+    await kv.get(kvKey)
+    out["k v_get_miss_ms"] = t() - t0
+    t0 = t()
+    await kv.put(kvKey, "1", { expirationTtl: 60 })
+    out["kv_put_ms"] = t() - t0
+    t0 = t()
+    await kv.get(kvKey)
+    out["kv_get_hit_ms"] = t() - t0
+    t0 = t()
+    for (let i = 0; i < 3; i++) await kv.get(kvKey)
+    out["3_sequential_kv_gets_ms"] = t() - t0
+  }
   return c.json(out)
 })
 
