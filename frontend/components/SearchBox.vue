@@ -74,7 +74,7 @@
           type="button"
           :title="c.desc"
           :aria-pressed="selectedCorpora.includes(c.id)"
-          class="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-all"
+          class="inline-flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-lg border px-3 py-1.5 text-xs font-medium transition-all"
           :class="
             selectedCorpora.includes(c.id)
               ? 'border-blue-500/40 bg-blue-50/80 text-blue-700 shadow-sm dark:border-blue-400/30 dark:bg-blue-950/40 dark:text-blue-300'
