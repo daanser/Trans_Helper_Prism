@@ -46,6 +46,10 @@ on:
         description: "覆盖反代基址（默认线上地址；填坏域名可演练失败）"
         type: string
         default: ""
+      daily_call_limit:
+        description: "每日上游调用数告警阈值（留空 = 1000；上游是免费额度，超阈值只意味用量异常，不是花钱）"
+        type: string
+        default: ""
 
 # 同一时刻只跑一个（探活很轻，纯粹避免手动触发与定时撞车时日志交叉）
 concurrency:
@@ -63,6 +67,7 @@ jobs:
       PROXY_BASE: ${{ inputs.proxy_base || 'https://search.chengxi.moe' }}
       # 只注入给 ④⑤；绝不 echo
       ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+      DAILY_CALL_LIMIT: ${{ inputs.daily_call_limit || '1000' }}
     steps:
       - name: 五项探活
         run: |
@@ -198,4 +203,26 @@ jobs:
             echo "   排查顺序：先看①直连是否通（不通=Worker/账号问题）→ ②③反代（不通=Pages 或域名）→ ④⑤用 ADMIN_API_KEY 手工 curl 复核。"
             exit 1
           fi
-          echo "✅ 五项探活全部通过（$(date -u '+%Y-%m-%d %H:%M:%S') UTC）"
+          # ── ⑥ 今日上游调用量（真正的风险是"被判滥用/题材敏感而封号"，不是花钱）──
+          #    硅基流动的 bge-m3/rerank/chat 长期免费 → 无金钱成本；额度白嫖的代价是"被封就得买新号"。
+          #    所以这里盯的是**量级**：超过阈值说明今日用量异常（或被人刷），应立刻收紧限流档位。
+          #    阈值可用 workflow_dispatch 输入 daily_call_limit 覆盖（默认 1000/天）。
+          if [ -n "${ADMIN_API_KEY:-}" ]; then
+            resp=$(fetch_retry "$api_base/api/v1/admin/usage/summary?days=1" -H "Authorization: Bearer ${ADMIN_API_KEY}")
+            code=$(printf '%s' "$resp" | tail -n1)
+            body=$(printf '%s' "$resp" | sed '$d')
+            if [ "$code" != "200" ]; then
+              problems+=("⑥ 用量汇总读取失败：GET $api_base/api/v1/admin/usage/summary?days=1 → HTTP ${code:-无响应}（期望 200）")
+            else
+              calls=$(printf '%s' "$body" | jq -r '.totals.calls // 0' 2>/dev/null || echo 0)
+              detail=$(printf '%s' "$body" | jq -r '[.by_endpoint[]? | "\(.endpoint)=\(.calls)"] | join(" ")' 2>/dev/null || echo "?")
+              limit="${DAILY_CALL_LIMIT:-1000}"
+              if [ "${calls:-0}" -gt "${limit:-1000}" ] 2>/dev/null; then
+                problems+=("⑥ 今日上游调用 ${calls} 次已超过阈值 ${limit}（${detail}）→ 上游为免费额度，真正的风险是被判滥用而**封号**；请检查是否有异常流量，必要时收紧 RATE_LIMIT_* 档位")
+              else
+                notes+=("⑥ 今日上游调用 ${calls} 次 / 阈值 ${limit}（${detail}）")
+              fi
+            fi
+          fi
+
+          echo "✅ 六项探活全部通过（$(date -u '+%Y-%m-%d %H:%M:%S') UTC）"
