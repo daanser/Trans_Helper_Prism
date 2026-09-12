@@ -93,8 +93,31 @@
         </button>
       </div>
 
-      <!-- 参数开关（精准重排 & AI伴读） -->
-      <div class="flex shrink-0 items-center gap-6">
+      <!-- 参数开关（返回条数 & 精准重排 & AI伴读） -->
+      <div class="flex shrink-0 flex-wrap items-center gap-x-6 gap-y-3">
+        <!-- 返回条数（plan-topk.md §3.4）：登录 1–50；未登录只允许 1–5，并提示登录后可用 50 -->
+        <div class="flex items-center gap-2">
+          <label for="prism-topk" class="text-xs font-medium text-slate-500 dark:text-slate-400">返回条数</label>
+          <input
+            id="prism-topk"
+            v-model.number="topK"
+            type="number"
+            :min="1"
+            :max="topKMax"
+            step="1"
+            inputmode="numeric"
+            :aria-describedby="topKHintId"
+            class="w-16 rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 text-center text-xs tabular-nums text-slate-700 transition-colors focus:border-blue-600 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+            @blur="normalizeTopK()"
+            @change="onTopKChange()"
+          />
+          <span class="text-xs text-slate-400 dark:text-slate-500">/ {{ topKMax }}</span>
+          <span v-if="!loggedIn" :id="topKHintId" class="text-[11px] leading-snug text-amber-600 dark:text-amber-400">
+            登录后可返回最多 {{ TOP_K_MAX }} 条
+          </span>
+          <span v-else :id="topKHintId" class="sr-only">允许范围 1 到 {{ TOP_K_MAX }} 条</span>
+        </div>
+
         <ToggleMini v-model="useReranker" label="精准重排" hint="已激活 BAAI/bge-reranker-v2-m3 二次重排序" />
         <ToggleMini
           :model-value="useLlm"
@@ -104,14 +127,21 @@
       </div>
     </div>
 
+    <!-- 成本口径文案（plan-topk.md §3.4：**只讲质量**，不写"条数越多越贵"——纯检索成本恒定 200，那是假话） -->
+    <p class="mt-3 text-[11px] leading-relaxed text-slate-400 dark:text-slate-500">
+      返回条数越多，结果里不相关的内容也可能越多；<strong class="font-medium text-slate-500 dark:text-slate-400">开启 AI 重排会把最相关的排到前面</strong>。
+      开启 AI 重排会消耗更多额度。
+    </p>
+
     <!-- 快捷建议插槽 -->
     <slot name="examples" />
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from "vue"
+import { computed, nextTick, onMounted, ref, watch } from "vue"
 import { DEFAULT_CORPORA_OPTIONS, type CorpusOption, type SearchRequest } from "~/composables/useApi"
+import { TOP_K_ANON_MAX, TOP_K_DEFAULT, TOP_K_MAX, TOP_K_MIN, clampTopK } from "~/composables/usePrefs"
 import { useToast } from "~/composables/useToast"
 import ToggleMini from "./ToggleMini.vue"
 
@@ -123,21 +153,52 @@ import ToggleMini from "./ToggleMini.vue"
  * > 0 时禁用提交按钮并把按钮文案换成「N 秒后可重试」——输入框**保持可编辑**，
  * 用户仍可改词/换库，只是不能提交（提交的硬拦截在 pages/index.vue 的 doSearch 里还有一道）。
  */
-const props = withDefaults(defineProps<{ loading: boolean; useLlm: boolean; cooldownSec?: number }>(), {
-  cooldownSec: 0,
-})
+const props = withDefaults(
+  defineProps<{
+    loading: boolean
+    useLlm: boolean
+    cooldownSec?: number
+    /** 是否已登录（决定返回条数上限：未登录 5，登录 50）；缺省 false（安全侧） */
+    loggedIn?: boolean
+  }>(),
+  { cooldownSec: 0, loggedIn: false },
+)
 const emit = defineEmits<{
   (e: "submit", p: Pick<SearchRequest, "query" | "corpora" | "use_reranker" | "use_llm" | "top_k">): void
   (e: "update:useLlm", v: boolean): void
 }>()
 const { pushToast } = useToast()
-const { prefs, load: loadPrefs } = usePrefs()
+const { prefs, load: loadPrefs, save: savePrefs } = usePrefs()
 
 const query = ref("")
 const searchInput = ref<HTMLInputElement | null>(null)
 const selectedCorpora = ref<string[]>(["mtf-wiki", "ftm-wiki", "rle-wiki", "miomtfwiki"])
 const useReranker = ref(true)
 const corporaOptions: CorpusOption[] = DEFAULT_CORPORA_OPTIONS
+
+/**
+ * 返回条数：未登录上限 5（与后端夹取一致），登录 1–50。
+ * 初始值取匿名上限（预渲染/SSR 阶段无会话 → 渲染出 "5 / 5" 这种自洽状态），
+ * 挂载后再按"登录态 + 本地偏好"校正（登录用户恢复自己存的值）。
+ */
+const topK = ref<number>(Math.min(TOP_K_ANON_MAX, TOP_K_DEFAULT))
+const topKMax = computed(() => (props.loggedIn ? TOP_K_MAX : TOP_K_ANON_MAX))
+const topKHintId = "prism-topk-hint"
+
+/** 输入框失焦/回车后归一：夹到 [1, topKMax] 的整数（手输 999 不会静默发出去） */
+/** 只夹取、**不写偏好**（登录态变化/失焦/提交前调用：这些都不是"用户表达偏好"） */
+function normalizeTopK() {
+  topK.value = Math.min(topKMax.value, Math.max(TOP_K_MIN, Math.round(Number(topK.value) || TOP_K_DEFAULT)))
+}
+
+/**
+ * 用户主动改过输入框（`change` 事件）→ 归一 + 持久化进 usePrefs（与 corpora/rerank/llm 一致）。
+ * 只在用户改动时写盘，避免把"未登录被夹到 5"当成用户偏好存下来（那会让登录后仍停在 5）。
+ */
+function onTopKChange() {
+  normalizeTopK()
+  if (prefs.value.topK !== topK.value) savePrefs({ topK: topK.value })
+}
 
 /** 限流冷却中（父组件传下来的剩余秒数 > 0） */
 const cooling = computed(() => (props.cooldownSec ?? 0) > 0)
@@ -166,12 +227,13 @@ function clear() {
 function submit() {
   const q = query.value.trim()
   if (!q || props.loading || cooling.value) return
+  normalizeTopK() // 提交前再夹一次：键盘回车等入口不会绕过上限
   emit("submit", {
     query: q,
     corpora: [...selectedCorpora.value],
     use_reranker: useReranker.value,
     use_llm: props.useLlm,
-    top_k: 10,
+    top_k: topK.value,
   })
 }
 
@@ -180,7 +242,14 @@ onMounted(() => {
   const saved = loadPrefs()
   selectedCorpora.value = [...saved.corpora]
   useReranker.value = saved.reranker
+  topK.value = Math.min(topKMax.value, clampTopK(saved.topK))
 })
+
+// 登录态变化（登录/登出）后重新夹取：未登录时必须回到 ≤5，避免把 50 发出去被后端夹
+watch(
+  () => props.loggedIn,
+  () => normalizeTopK(),
+)
 
 defineExpose({
   focus: () => searchInput.value?.focus(),

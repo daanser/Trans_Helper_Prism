@@ -48,15 +48,30 @@
 // D1 缺失或 SQL 异常一律优雅降级、不抛错：chargeQuota → `{ ok:false, reason:"db-unavailable" }`，
 // 写操作返回 null，getQuota 返回「放行」视图（degraded=true，used 0 / 100%），由调用方决定打 warning。
 
-/** 加权 token 成本表（新单位；plan §3.4 方案 A 的权重按 token 重定）。 */
+import { TOP_K_DEFAULT, rerankCandidateLimit } from "./topk"
+
+/**
+ * 加权 token 成本表（新单位；plan §3.4 方案 A 的权重按 token 重定）。
+ *
+ * ⚠️ 2026-09-11（plan-topk.md §0 决策 1/2）起：
+ *   · `search` 仍恒为 **200**，且**与返回条数 n 无关**（embed 恒 1 次、Qdrant 恒 1 次，n 不改变上游调用次数）；
+ *   · `rerank` 的**固定 100 已废弃** —— rerank 改为按**候选条数**线性计费（见 `rerankCostTokens()`）。
+ *     保留该常量只为兼容既有 import/文档引用（不再参与 `computeQuotaCost` 的计算）。
+ */
 export const QUOTA_COST = {
-  /** 纯搜索（embed + 向量检索）1 次 */
+  /** 纯搜索（embed + 向量检索）1 次；与 n 无关，恒定 */
   search: 200,
-  /** 开 rerank 的额外消耗 */
+  /** @deprecated 固定值已被"按候选数"公式取代，见 `rerankCostTokens()`；保留仅为兼容引用 */
   rerank: 100,
   /** 关键词/结巴回退：不扣 */
   fallback: 0,
 } as const
+
+/**
+ * rerank 计费的**归一化基准候选数**：候选 30 条 = 200 token（= 1 个纯搜索）。
+ * 于是 `n=10`（默认 3× 过采样 → 30 条候选）时总成本恰为 **2× 纯搜索**（plan-topk.md §0 决策 4）。
+ */
+export const QUOTA_RERANK_BASE_CANDIDATES = 30
 
 /** 默认窗口长度（小时）：5h。env `QUOTA_WINDOW_HOURS` 可覆盖。 */
 export const DEFAULT_WINDOW_HOURS = 5
@@ -208,22 +223,44 @@ export function usedPct(usedTokens: number, limit: number): number {
 
 /** 一次请求的配额消耗输入（加权 token）。 */
 export interface QuotaCostInput {
-  /** 是否走了向量检索（默认 true） */
+  /** 是否走了向量检索（默认 true）；成本恒定 200，与 `topK` 无关 */
   search?: boolean
-  /** 是否开了 rerank（额外 +100） */
+  /** 是否开了 rerank（按 **候选条数** 计费，见 `rerankCostTokens()`） */
   rerank?: boolean
+  /** 用户请求的返回条数（缺省 10，保证既有调用方行为不变）；只影响 rerank 计费 */
+  topK?: number
   /** LLM 真实 token 数（tokens_in + tokens_out，由调用方传入） */
   llmTokens?: number
   /** 是否走了关键词/结巴回退（优先级最高：回退恒为 0） */
   fallback?: boolean
 }
 
-/** 单次请求的加权 token 消耗。回退恒 0；否则 search(200) + rerank(100) + LLM 真实 token。 */
-export function computeQuotaCost(input: QuotaCostInput = {}): number {
+/**
+ * rerank 一次的加权 token 成本（plan-topk.md §0 定稿公式）：
+ *   `ceil(QUOTA_COST.search × 候选数(n) / 30)`
+ * 候选数来自 `topk.rerankCandidateLimit()`（**同一份实现**，保证"按多少条候选收费"与"实际打多少条"一致）。
+ * 例（默认 3× / 封顶 64）：n=1→3 候选→20；n=5→15→100；n=10→30→200；n=20→60→400；n=50→64→427。
+ * 候选封顶后**不再加价**（§0 决策 2：封顶后我们真实花销也不再增长，继续加价就是乱收费）。
+ */
+export function rerankCostTokens(env: unknown = {}, topK: number = TOP_K_DEFAULT): number {
+  const candidates = rerankCandidateLimit(env, topK)
+  return Math.ceil((QUOTA_COST.search * candidates) / QUOTA_RERANK_BASE_CANDIDATES)
+}
+
+/**
+ * 单次请求的加权 token 消耗（加权 token 的**唯一**计算入口）。
+ *   · 回退（关键词）：恒 0；
+ *   · 纯检索：**200，与 n 无关**；
+ *   · 开 rerank：+ `rerankCostTokens(env, topK)`（按候选数）；
+ *   · LLM：按真实 `tokens_in + tokens_out`（只取前 `LLM_MAX_HITS=6` 条做上下文 → n>6 不增加 LLM 成本）。
+ * `env` 用于读取过采样系数/候选上限（默认 3×/64）——**必须与真实检索用同一份 env**，
+ * 否则会出现"按 30 条候选收费、实际打 64 条"的静默不一致。
+ */
+export function computeQuotaCost(input: QuotaCostInput = {}, env: unknown = {}): number {
   if (input.fallback) return QUOTA_COST.fallback
   let cost = 0
   if (input.search !== false) cost += QUOTA_COST.search
-  if (input.rerank) cost += QUOTA_COST.rerank
+  if (input.rerank) cost += rerankCostTokens(env, input.topK ?? TOP_K_DEFAULT)
   const llm = input.llmTokens ?? 0
   if (Number.isFinite(llm) && llm > 0) cost += Math.floor(llm)
   return cost

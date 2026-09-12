@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// TransHelper Prism — 检索偏好（tasks.md T3.6 /settings）
+// TransHelper Prism — 检索偏好（tasks.md T3.6 /settings；plan-topk.md 增"返回条数"）
 // 只存 localStorage（键 `prism_prefs`），不涉账号数据、不涉任何 key。
-// 覆盖：默认知识库 / 精准重排默认开 / AI 伴读默认开。
+// 覆盖：默认知识库 / 精准重排默认开 / AI 伴读默认开 / 返回条数（top_k）。
 
 import { ALL_CORPUS_IDS } from "~/composables/useApi"
 
@@ -12,12 +12,30 @@ export interface PrismPrefs {
   reranker: boolean
   /** AI 伴读默认开（默认关，开启需二次确认并消耗配额） */
   llm: boolean
+  /**
+   * 返回条数（top_k），1–50，默认 10（plan-topk.md §3.1）。
+   * 未登录时前端**只允许 1–5**（后端也会夹取，两侧一致）；因此本地存的值在未登录态展示时会被夹到 5。
+   */
+  topK: number
 }
 
 export const PREFS_KEY = "prism_prefs"
 
+/** 返回条数边界（与后端 src/topk.ts 的 TOP_K_MIN/MAX/DEFAULT、匿名上限 5 保持一致）。 */
+export const TOP_K_MIN = 1
+export const TOP_K_MAX = 50
+export const TOP_K_DEFAULT = 10
+export const TOP_K_ANON_MAX = 5
+
 export function defaultPrefs(): PrismPrefs {
-  return { corpora: [...ALL_CORPUS_IDS], reranker: true, llm: false }
+  return { corpora: [...ALL_CORPUS_IDS], reranker: true, llm: false, topK: TOP_K_DEFAULT }
+}
+
+/** 夹到 [1, 50] 的整数；非法 → 默认 10。 */
+export function clampTopK(value: unknown): number {
+  const n = typeof value === "number" ? value : Number(value)
+  if (!Number.isFinite(n)) return TOP_K_DEFAULT
+  return Math.min(TOP_K_MAX, Math.max(TOP_K_MIN, Math.round(n)))
 }
 
 function sanitize(raw: unknown): PrismPrefs {
@@ -31,6 +49,8 @@ function sanitize(raw: unknown): PrismPrefs {
     corpora: corpora.length ? corpora : base.corpora,
     reranker: typeof obj.reranker === "boolean" ? obj.reranker : base.reranker,
     llm: typeof obj.llm === "boolean" ? obj.llm : base.llm,
+    // 老版本存的偏好没有 topK 字段 → 回默认 10（向后兼容）
+    topK: obj.topK === undefined ? base.topK : clampTopK(obj.topK),
   }
 }
 

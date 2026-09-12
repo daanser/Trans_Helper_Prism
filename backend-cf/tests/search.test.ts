@@ -298,15 +298,19 @@ describe("runSearch 非法参数", () => {
     ).rejects.toMatchObject({ code: "invalid-corpora" })
   })
 
-  it("top_k 越界 → invalid-top-k", async () => {
+  it("top_k 越界 → invalid-top-k（范围 1–50：0/51/1.5/\"abc\" 非法，1 与 50 合法）", async () => {
     const env = makeEnv()
     const { fetchImpl } = makeFetchMock({})
-    await expect(
-      runSearch({ query: "x", corpora: ["mtf-wiki"], top_k: 0 }, env, { fetchImpl }),
-    ).rejects.toMatchObject({ code: "invalid-top-k" })
-    await expect(
-      runSearch({ query: "x", corpora: ["mtf-wiki"], top_k: 31 }, env, { fetchImpl }),
-    ).rejects.toMatchObject({ code: "invalid-top-k" })
+    for (const bad of [0, 51, 1.5, "abc", -1]) {
+      await expect(
+        runSearch({ query: "x", corpora: ["mtf-wiki"], top_k: bad as never }, env, { fetchImpl }),
+      ).rejects.toMatchObject({ code: "invalid-top-k" })
+    }
+    // 边界内的两个极值都可用（无命中 → 200 空结果，不报错）
+    for (const ok of [1, 50]) {
+      const res = await runSearch({ query: "x", corpora: ["mtf-wiki"], top_k: ok }, env, { fetchImpl })
+      expect((res as SearchResponse).hits).toEqual([])
+    }
   })
 })
 
@@ -345,7 +349,7 @@ describe("POST /api/v1/search 路由：非法参数 422", () => {
     // top_k 越界
     resp = await app.request(
       "/api/v1/search",
-      { method: "POST", headers: jsonHeaders, body: JSON.stringify({ query: "x", corpora: ["mtf-wiki"], top_k: 40 }) },
+      { method: "POST", headers: jsonHeaders, body: JSON.stringify({ query: "x", corpora: ["mtf-wiki"], top_k: 51 }) },
       env,
     )
     expect(resp.status).toBe(422)

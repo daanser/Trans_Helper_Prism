@@ -10,6 +10,7 @@ import { createRerankProvider } from "./rerank"
 import { runFallback, FallbackResponse } from "./fallback"
 import { kvCache, buildCacheKey, cacheGetVectorStage, cachePutVectorStage, type CacheStore } from "./searchcache"
 import type { KeyPoolDb, PoolName } from "./keypool"
+import { TOP_K_DEFAULT, TOP_K_MAX, TOP_K_MIN, rerankCandidateLimit } from "./topk"
 
 /** M0 四个库的 corpora 白名单（tasks.md T0.4）。 */
 export const VALID_CORPORA = ["mtf-wiki", "ftm-wiki", "rle-wiki", "miomtfwiki"] as const
@@ -149,25 +150,22 @@ export function validate(req: SearchRequest): { corpora: CorpusId[]; topK: numbe
       throw new SearchValidationError("invalid-corpora")
     }
   }
-  const topK = req.top_k ?? 10
-  if (!Number.isInteger(topK) || topK < 1 || topK > 30) {
+  // top_k：1–50（plan-topk.md §3.1；上限由 30 提到 50）。越界/非整数一律 422 invalid-top-k。
+  // ⚠️ 未登录的 5 条上限**不在这里**：那是"夹取"不是"校验"（见 topk.ts 的 clampTopKForAnon，
+  //    由路由在检索前调用），混进 validate 会让手写客户端直接 422 而不是拿到 5 条结果。
+  const topK = req.top_k ?? TOP_K_DEFAULT
+  if (!Number.isInteger(topK) || topK < TOP_K_MIN || topK > TOP_K_MAX) {
     throw new SearchValidationError("invalid-top-k")
   }
   return { corpora, topK }
 }
 
 /**
- * 给 rerank 的候选集上限（tasks.md T1.1：删旧魔法数字，做成配置项）。
- * 默认取 top_k*3（与单库检索 limit 一致），可用 env.RERANK_TOP_K 覆盖。
+ * 给 rerank 的候选集条数（T1.1 起是配置项；plan-topk.md §3.2 起改为"过采样系数 × n、封顶 64"）。
+ * **实现在 `src/topk.ts`**（与配额成本共用同一份，绝不漂移），这里重导出以保持既有调用点/测试可用。
+ * 优先级：`env.RERANK_TOP_K`（显式绝对覆盖）> `min(ceil(RERANK_OVERFETCH × n), RERANK_MAX_CANDIDATES)`。
  */
-export function rerankCandidateLimit(env: Env, topK: number): number {
-  const cfg = env.RERANK_TOP_K
-  if (cfg !== undefined && cfg.trim() !== "") {
-    const n = parseInt(cfg, 10)
-    if (Number.isFinite(n) && n >= 1) return n
-  }
-  return topK * 3
-}
+export { rerankCandidateLimit }
 
 /** 单条 hit 供 rerank 的正文：标题 + 摘要（truncate 由 rerank 内部再做一次）。 */
 function rerankDocText(hit: SearchHit): string {
@@ -238,13 +236,26 @@ export async function runSearch(
       vector = await provider.embed(req.query.trim(), { kind: "query" })
       embedMs = nowMs() - t0
     } catch {
-      return toSearchResponse(await runFallback(req.query, corpora, env), quota, warnings, "embedding-unavailable")
+      // ⚠️ 必须把注入的 `fetchImpl` 传给 runFallback：否则回退分支会退回**全局 fetch**
+      //（生产里两者是同一个 defaultFetch，行为不变；但单测里会出现"注入的 mock 没生效、真去打网络"
+      // —— env.QDRANT_URL 指向示例域时就是真实的 DNS/连接，测试会挂到超时）。
+      return toSearchResponse(
+        await runFallback(req.query, corpora, env, { fetchImpl }),
+        quota,
+        warnings,
+        "embedding-unavailable",
+      )
     }
 
     const qdrantUrl = env.QDRANT_URL
     if (!qdrantUrl) {
       // Qdrant 未配置：视为上游失败 → 回退
-      return toSearchResponse(await runFallback(req.query, corpora, env), quota, warnings, "qdrant-unconfigured")
+      return toSearchResponse(
+        await runFallback(req.query, corpora, env, { fetchImpl }),
+        quota,
+        warnings,
+        "qdrant-unconfigured",
+      )
     }
 
     // ── 多 collection 并行检索，limit 取 top_k*3 给 rerank 留 candidate。
@@ -298,7 +309,12 @@ export async function runSearch(
 
     // 所有库都失败且无任何命中 → 视为上游全灭，整体降级回退（tasks.md T1.3 上游失败触发）。
     if (merged.length === 0 && corpora.every((c) => warnings.some((w) => w.startsWith(`collection-unavailable:${collectionName(c)}:`)))) {
-      return toSearchResponse(await runFallback(req.query, corpora, env), quota, warnings, "all-collections-unavailable")
+      return toSearchResponse(
+        await runFallback(req.query, corpora, env, { fetchImpl }),
+        quota,
+        warnings,
+        "all-collections-unavailable",
+      )
     }
 
     // 只缓存纯向量阶段结果（rerank 每次重算，不入缓存）。写失败不影响结果。

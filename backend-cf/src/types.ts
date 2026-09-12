@@ -25,8 +25,23 @@ export interface Env {
   EMBEDDING_DIM?: string
   RERANK_ENDPOINT?: string
   RERANK_MODEL?: string
-  /** 给 rerank 的候选集上限（tasks.md T1.1：删掉旧魔法数字，改成配置项）。默认取前 top_k*入库检索每库 limit 合并后的前 N 条。 */
+  /**
+   * rerank 候选集的**显式绝对覆盖**（tasks.md T1.1 的旧配置项，优先级最高）。
+   * 设了它就完全按它（既不乘过采样系数，也不受 `RERANK_MAX_CANDIDATES` 约束）——语义是"我就要这么多候选"。
+   * 不设（推荐）→ 走下面的过采样公式（见 src/topk.ts）。
+   */
   RERANK_TOP_K?: string
+  /**
+   * rerank 过采样系数（plan-topk.md §3.2）：候选数 = `min(ceil(该系数 × top_k), RERANK_MAX_CANDIDATES)`。
+   * 默认 **3**（保持现状，不为省成本降质量）。例：n=10 → 30 条候选；n=20 → 60。
+   */
+  RERANK_OVERFETCH?: string
+  /**
+   * rerank 候选数上限，默认 **64**。为什么是 64：rerank 上游单次 HTTP 批量 32 条 → 64 恰好两批，
+   * 而"每请求 rerank 调用 ≤2 批"是本项目 rerank 计费唯一有真实依据的口径（成本与候选数线性挂钩）。
+   * 注意下界：候选数永远不低于用户请求的 `top_k`（否则用户拿不满请求的条数）。
+   */
+  RERANK_MAX_CANDIDATES?: string
 
   // ── 超时配置（T1.3，毫秒；默认 15s）──
   EMBED_TIMEOUT_MS?: string

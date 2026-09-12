@@ -29,6 +29,7 @@
           ref="searchBoxRef"
           :loading="loading"
           :use-llm="llmEnabled"
+          :logged-in="isLoggedIn"
           :cooldown-sec="cooldownRemaining"
           @submit="doSearch"
           @update:use-llm="onLlmToggle"
@@ -190,11 +191,26 @@
             </span>
           </div>
 
+          <!-- 未登录被夹取返回条数（plan-topk.md §3.1）：**非错误**提示，info 级 -->
+          <div
+            v-if="topKClamped"
+            class="mt-4 flex items-start gap-2.5 rounded-xl border border-surface-border bg-canvas-subtle p-3.5"
+          >
+            <span class="rounded bg-primary-subtle px-1.5 py-0.5 text-xs font-medium text-primary">
+              提示
+            </span>
+            <span class="text-xs leading-relaxed text-ink-sub">
+              未登录时最多返回 {{ TOP_K_ANON_MAX }} 条；
+              <NuxtLink to="/login" class="font-medium underline underline-offset-2">登录</NuxtLink>
+              后可选择最多 {{ TOP_K_MAX }} 条。
+            </span>
+          </div>
+
           <!-- 检索指标与命中数量 -->
           <div class="mb-4 mt-6 flex flex-col gap-2 border-b border-surface-border pb-3 sm:flex-row sm:items-center sm:justify-between">
             <TimingsBar :timings="resultsTimings" />
             <span class="text-xs text-ink-muted">
-              共命中 <b class="font-medium text-ink-title">{{ results.length }}</b> 条文献
+              共返回 <b class="font-medium text-ink-title">{{ results.length }}</b> 条文献
             </span>
           </div>
 
@@ -258,6 +274,7 @@ import HitCard from "~/components/HitCard.vue"
 import TimingsBar from "~/components/TimingsBar.vue"
 import AiCompanionCard from "~/components/AiCompanionCard.vue"
 import ConfirmDialog from "~/components/ConfirmDialog.vue"
+import { TOP_K_ANON_MAX, TOP_K_MAX } from "~/composables/usePrefs"
 
 type AiStatus = "idle" | "streaming" | "done" | "unavailable"
 
@@ -277,6 +294,8 @@ const responseTimings = ref<SearchTimings | null>(null)
 const fallback = ref(false)
 /** 服务端在 REQUIRE_LOGIN=1 时对匿名请求回 keywords 回退（warnings 含 "login-required"）→ 提示登录 */
 const loginRequired = ref(false)
+/** 未登录被后端夹取返回条数（警告码来自后端 topk.ts 的 ANON_TOP_K_WARNING） */
+const topKClamped = computed(() => warnings.value.includes("top-k-clamped-anon"))
 const quota = ref<SearchResponse["quota"] | null>(null)
 const warnings = ref<string[]>([])
 const highlightedHitId = ref<string | null>(null)

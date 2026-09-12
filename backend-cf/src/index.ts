@@ -8,6 +8,7 @@ import type { Context } from "hono"
 import { cors } from "hono/cors"
 import { Env, SearchRequest, SearchResponse } from "./types"
 import { runSearch, validate, SearchValidationError } from "./search"
+import { ANON_TOP_K_WARNING, clampTopKForAnon } from "./topk"
 import { listWikis, collectionName, isValidCorpus, buildCorporaResponse } from "./wiki_registry"
 import { fetchAllChunks, buildTree, QdrantScrollError } from "./tree"
 import { ingestWiki, type IngestMessage } from "./ingest/incremental"
@@ -578,6 +579,14 @@ api.post("/search", async (c) => {
   // ① 会话（限流已由下面的 D1 分档闸门统一负责，KV 限流器 2026-09-11 摘除，原因见下）
   const session = await sessionFromHeader(c.env, c.req.header("Authorization"))
 
+  // ①a 未登录夹取返回条数（plan-topk.md §3.1）：`top_k > 5` → 夹到 5 并回 warning（**不报错**）。
+  //     **必须在这里就夹**（早于扣费、早于 embedding/Qdrant/rerank）——夹晚了一步就是"白花钱再丢结果"。
+  //     夹取结果同时用于：扣费成本（rerank 按候选数）、实际检索（runSearch）、
+  //     以及下面每条 fallback 路径（关键词回退也要遵守 5 条上限）。
+  const anonClamp = clampTopKForAnon(req.top_k, Boolean(session))
+  if (anonClamp.clamped) req.top_k = anonClamp.topK
+  const effectiveTopK = anonClamp.topK
+
   // ── KV 限流器为什么被摘掉（线上实测，别再凭直觉加回来）──
   // 这里原本先跑一遍 `checkSubjectRateLimit`（KV）：对 account 与 ip **各 get + put**。
   // 拆掉它的三个理由：
@@ -598,7 +607,7 @@ api.post("/search", async (c) => {
   // ② 未登录：按 plan §2 登录制只走关键词回退（REQUIRE_LOGIN=0 可放开）；
   //    若全局匿名软熔断生效（§6），**即使放开了登录制也只给关键词回退**（不调 embedding/rerank，成本≈0）。
   if (!session && (requireLogin(c.env) || gate.softBreak)) {
-    const fb = await runFallback(req.query ?? "", corporaList, c.env)
+    const fb = await runFallback(req.query ?? "", corporaList, c.env, { topK: effectiveTopK })
     return c.json(
       fallbackResponse(
         fb,
@@ -612,11 +621,16 @@ api.post("/search", async (c) => {
   const tQuota = Date.now()
   let chargeResult: Awaited<ReturnType<typeof chargeQuota>> | null = null
   if (session) {
-    const cost = computeQuotaCost({ search: true, rerank: req.use_reranker !== false })
+    // 成本：纯检索恒 200（与 n 无关）+ 开 rerank 时按**候选数**计（见 quota.rerankCostTokens）。
+    // env 必须与真实检索用同一份（否则"按 30 条候选收费、实际打 64 条"）。
+    const cost = computeQuotaCost(
+      { search: true, rerank: req.use_reranker !== false, topK: effectiveTopK },
+      c.env,
+    )
     const charge = await chargeQuota(c.env.DB, session.sub, cost, nowMs, c.env)
     chargeResult = charge
     if (!charge.ok && charge.reason === "quota-exceeded") {
-      const fb = await runFallback(req.query ?? "", corporaList, c.env)
+      const fb = await runFallback(req.query ?? "", corporaList, c.env, { topK: effectiveTopK })
       return c.json(
         fallbackResponse(fb, { used_pct: charge.used_pct, remaining_pct: charge.remaining_pct }, "quota-exceeded"),
       )
@@ -643,6 +657,7 @@ api.post("/search", async (c) => {
     // 注：`RunSearchResult` 是联合类型，`FallbackResponse` 的类型里没声明 `timings`，
     // 但运行时它一定带（见 fallbackResponse 构造）→ 统一按 SearchResponse 取用。
     const sr = result as SearchResponse
+    if (anonClamp.clamped) sr.warnings = [...(sr.warnings ?? []), ANON_TOP_K_WARNING]
     if (!session) return c.json({ ...sr, timings: { ...sr.timings, ...diag } })
     // 配额视图**复用扣费时同事务回读的结果**（`charge.view`），不再为响应单独查一次 D1。
     // 只有"扣费走了 db-unavailable 兜底"这种罕见情况才回退到一次 getQuota（那时视图本来就是"放行视图"）。
@@ -801,8 +816,11 @@ api.post("/search/stream", async (c) => {
   const req = body as SearchRequest
   const nowMs = Date.now()
 
-  // 搜索部分先扣额度
-  const cost = computeQuotaCost({ search: true, rerank: req.use_reranker !== false })
+  // 搜索部分先扣额度（top_k 参与 rerank 计费；该端点要求登录，故不存在匿名夹取）
+  const cost = computeQuotaCost(
+    { search: true, rerank: req.use_reranker !== false, topK: req.top_k },
+    c.env,
+  )
   const charge = await chargeQuota(c.env.DB, session.sub, cost, nowMs, c.env)
   if (!charge.ok && charge.reason === "quota-exceeded") {
     return c.json(

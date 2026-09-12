@@ -195,12 +195,15 @@ describe("加权 token 成本表", () => {
     expect(LOW_QUOTA_PCT).toBe(10)
   })
 
-  it("computeQuotaCost：搜索 200、+rerank 300、LLM 按真实 token、回退恒 0", () => {
+  // ⚠️ 2026-09-11 口径变更（plan-topk.md §0 决策 2/4，用户已批准）：rerank 从"固定 +100"改为
+  //    "按候选数计费"，默认 n=10 → 候选 30 → +200 → **开 rerank 恰好是纯搜索的 2×**（原 1.5×）。
+  //    纯搜索仍是 200，且**与 n 无关**（§0 决策 1）。逐条核对表见 tests/topk.test.ts。
+  it("computeQuotaCost：搜索 200、+rerank 按候选数（n=10 → 400）、LLM 按真实 token、回退恒 0", () => {
     expect(computeQuotaCost()).toBe(200)
     expect(computeQuotaCost({ search: true })).toBe(200)
-    expect(computeQuotaCost({ rerank: true })).toBe(300)
+    expect(computeQuotaCost({ rerank: true })).toBe(400) // 200 + rerank(候选 30 → 200)
     expect(computeQuotaCost({ llmTokens: 1200 })).toBe(1400)
-    expect(computeQuotaCost({ rerank: true, llmTokens: 1000 })).toBe(1300) // 200 + 100 + 1000
+    expect(computeQuotaCost({ rerank: true, llmTokens: 1000 })).toBe(1400) // 200 + 200 + 1000
     expect(computeQuotaCost({ search: false })).toBe(0)
     expect(computeQuotaCost({ search: false, llmTokens: 800 })).toBe(800)
     // 回退优先级最高：即使带 rerank/LLM 也不扣
