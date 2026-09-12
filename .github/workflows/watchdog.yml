@@ -1,0 +1,193 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# TransHelper Prism — 定时探活（M4·W4）
+#
+# ── 它在回答什么 ──
+# 「现在健康吗 / 昨天摄取成功了吗 / key 池够吗」—— 没人盯着的时候也能发现问题的**唯一免费通道**。
+# 每 30 分钟跑一次，五项检查全部在日志里给出人能一眼看懂的结论行（`::error::` / `::warning::`）。
+#
+# ── 需要的 secret（Settings → Secrets and variables → Actions）──
+#   ADMIN_API_KEY   可选但**强烈建议**：检查 ④（key 池补货）与 ⑤（摄取历史）要用它。
+#                   未配置时这两项只打 `::warning::` 跳过，健康检查（①②③）照跑。
+#                   ⚠️ 本 workflow **绝不 echo** 这个值，日志里不会出现 key 本身。
+#   （不需要其它 secret：①③⑤ 走公开端点；②③ 走反代，匿名请求，不带头）
+#
+# ── 失败时通知去哪看 ──
+# 任何一项不达标 → **job 非零退出** → GitHub 会给**仓库管理员发失败邮件**（免费方案里最实用的通道）。
+# 想主动看：Actions 页面 → 左侧 `watchdog` → 最近一次运行的日志；失败行以 `::error::` 开头。
+# 本 workflow **不会**自动创建 Issue（避免污染 issue 列表）。
+#
+# ── 手动触发（含"故意制造一次失败"的做法）──
+#   gh workflow run watchdog.yml                     # 正常跑一次（预期全绿）
+#   gh workflow run watchdog.yml -f api_base=https://bad.example.invalid   # 让 ①④⑤ 失败（直连基址换坏域名）
+#   gh workflow run watchdog.yml -f proxy_base=https://bad.example.invalid # 让 ②③ 失败（反代基址换坏域名）
+#   两个输入都**不是硬编码**：缺省（空）时回落到下面 env 里的真实线上地址，只有手动传入才覆盖。
+#
+# ── 重试策略（避免网络抖动造成的假告警）──
+# 每个探测最多尝试 3 次（仅当上一次不是 2xx 才重试，间隔 3 秒），且**只保留最后一次**的响应体
+# （curl 的 --retry 会把多次尝试的 body 连在一起，会让 jq 解析出错，故重试放在脚本里做）。
+#
+# ── 为什么不会误伤 ──
+# 每 30 分钟只有几千字节的请求（3 次匿名 + 2 次管理读），远低于任何分档限流阈值；
+# ①③⑤ 一律**不带 Authorization**（保持"匿名可用"这条链路被真实覆盖）。
+
+name: watchdog
+
+on:
+  schedule:
+    # 每 30 分钟（UTC 对齐整点/半点；GitHub 的定时任务在高峰期可能延迟数分钟，属正常）
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      api_base:
+        description: "覆盖直连 Worker 基址（默认线上地址；填坏域名可演练失败）"
+        type: string
+        default: ""
+      proxy_base:
+        description: "覆盖反代基址（默认线上地址；填坏域名可演练失败）"
+        type: string
+        default: ""
+
+# 同一时刻只跑一个（探活很轻，纯粹避免手动触发与定时撞车时日志交叉）
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # 直连 Worker（*.workers.dev）：① /healthz、④ key 池、⑤ 摄取历史
+      API_BASE: ${{ inputs.api_base || 'https://transhelper-prism-backend.transprism.workers.dev' }}
+      # 经 Pages 反代（墙内可达）：② /corpora、③ 一次真实匿名检索
+      PROXY_BASE: ${{ inputs.proxy_base || 'https://search.chengxi.moe' }}
+      # 只注入给 ④⑤；绝不 echo
+      ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+    steps:
+      - name: 五项探活
+        run: |
+          set -uo pipefail
+
+          # ── 探测助手：最多 3 次尝试（仅非 2xx 才重试），只保留最后一次输出；末行是 HTTP 状态码 ──
+          fetch_retry() {
+            local attempt out code
+            for attempt in 1 2 3; do
+              out=$(curl -sS --max-time 40 -w '\n%{http_code}' "$@" 2>&1) || true
+              code=$(printf '%s' "$out" | tail -n1)
+              if printf '%s' "$code" | grep -qE '^2[0-9][0-9]$'; then printf '%s' "$out"; return 0; fi
+              [ "$attempt" -lt 3 ] && sleep 3
+            done
+            printf '%s' "$out"
+          }
+
+          api_base="${API_BASE%/}"
+          proxy_base="${PROXY_BASE%/}"
+          problems=()
+          notes=()
+
+          echo "探活目标：直连=${api_base} 反代=${proxy_base}"
+          echo "开始时间（UTC）：$(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "──────────────────────────────────────────────"
+
+          # ── ① GET /healthz（直连 Worker）→ 期望 {"ok":true} ──
+          resp=$(fetch_retry "$api_base/healthz")
+          code=$(printf '%s' "$resp" | tail -n1)
+          body=$(printf '%s' "$resp" | sed '$d')
+          if [ "$code" != "200" ] || ! printf '%s' "$body" | jq -e '.ok == true' >/dev/null 2>&1; then
+            problems+=("① 健康检查失败：GET $api_base/healthz → HTTP ${code:-无响应}，body=$(printf '%s' "$body" | head -c 200)（期望 200 且 body 为 {\"ok\":true}）")
+          else
+            notes+=("① /healthz OK（直连 Worker）")
+          fi
+
+          # ── ② GET /api/v1/corpora（经反代）→ 期望 200 且四库齐全 ──
+          resp=$(fetch_retry "$proxy_base/api/v1/corpora")
+          code=$(printf '%s' "$resp" | tail -n1)
+          body=$(printf '%s' "$resp" | sed '$d')
+          if [ "$code" != "200" ]; then
+            problems+=("② 反代 corpora 失败：GET $proxy_base/api/v1/corpora → HTTP ${code:-无响应}（期望 200；反代或 Pages 可能挂了）")
+          else
+            missing=$(printf '%s' "$body" | jq -r '[.corpora[]?.id] as $ids | ["mtf-wiki","ftm-wiki","rle-wiki","miomtfwiki"] | map(select(. as $x | $ids | index($x) | not)) | join(",")' 2>/dev/null || echo "解析失败")
+            if [ -n "$missing" ]; then
+              problems+=("② 知识库不齐：缺少 [${missing}]（期望四库 mtf-wiki / ftm-wiki / rle-wiki / miomtfwiki 全在）")
+            else
+              notes+=("② /corpora OK（四库齐全，经反代）")
+            fi
+          fi
+
+          # ── ③ 一次真实匿名检索（经反代，**不带 Authorization**）→ 期望 200 且 hits ≥ 1 ──
+          #    这是唯一能发现"检索链路断了"的检查：embed → Qdrant → （可选 rerank）整条真跑一遍。
+          resp=$(fetch_retry -X POST "$proxy_base/api/v1/search" \
+                  -H 'Content-Type: application/json' \
+                  -d '{"query":"激素","corpora":["mtf-wiki"],"top_k":3}')
+          code=$(printf '%s' "$resp" | tail -n1)
+          body=$(printf '%s' "$resp" | sed '$d')
+          if [ "$code" != "200" ]; then
+            problems+=("③ 匿名检索失败：POST $proxy_base/api/v1/search → HTTP ${code:-无响应}（期望 200；429 说明被限流、5xx 说明后端或上游挂了）")
+          else
+            hits=$(printf '%s' "$body" | jq -r '.hits | length' 2>/dev/null || echo "0")
+            if [ "${hits:-0}" -lt 1 ]; then
+              problems+=("③ 检索返回 0 条命中：query=激素 corpora=[mtf-wiki] → hits=0（检索链路可能断了：embed / Qdrant / 语料为空）")
+            else
+              fb=$(printf '%s' "$body" | jq -r 'if .fallback then "回退模式" else "向量检索" end' 2>/dev/null || echo "?")
+              notes+=("③ 匿名检索 OK（hits=${hits}，${fb}）")
+            fi
+          fi
+
+          # ── ④ key 池补货（plan.md §8.4：configured < 2 就通知补货）──
+          if [ -z "${ADMIN_API_KEY:-}" ]; then
+            echo "::warning::未配置 ADMIN_API_KEY secret → 跳过 ④ key 池 与 ⑤ 摄取历史 检查（健康检查不受影响）"
+          else
+            resp=$(fetch_retry "$api_base/api/v1/admin/keys" -H "Authorization: Bearer ${ADMIN_API_KEY}")
+            code=$(printf '%s' "$resp" | tail -n1)
+            body=$(printf '%s' "$resp" | sed '$d')
+            if [ "$code" != "200" ]; then
+              problems+=("④ key 池读取失败：GET $api_base/api/v1/admin/keys → HTTP ${code:-无响应}（期望 200；401 = secret 与 Worker 不一致，503 = D1 异常）")
+            else
+              low=$(printf '%s' "$body" | jq -r '[.pools[]? | select((.configured|tonumber) < 2) | "\(.pool)(\(.configured))"] | join(", ")' 2>/dev/null || echo "")
+              summary=$(printf '%s' "$body" | jq -r '[.pools[]? | "\(.pool)=\(.configured)"] | join(" ")' 2>/dev/null || echo "解析失败")
+              if [ -n "$low" ]; then
+                problems+=("④ key 池可用 key 不足 2 把：${low} → 请补货（单把 key 被限流/失效时只能降级；EMBED_POOL_KEYS / LLM_POOL_KEYS 逗号分隔配 ≥2 把）")
+              else
+                notes+=("④ key 池 OK（${summary}）")
+              fi
+            fi
+
+            # ── ⑤ 摄取历史（最新一条：finished_at 距今 > 36h 或 status != success → 告警）──
+            resp=$(fetch_retry "$api_base/api/v1/admin/ingest/runs?limit=1" -H "Authorization: Bearer ${ADMIN_API_KEY}")
+            code=$(printf '%s' "$resp" | tail -n1)
+            body=$(printf '%s' "$resp" | sed '$d')
+            if [ "$code" != "200" ]; then
+              problems+=("⑤ 摄取历史读取失败：GET $api_base/api/v1/admin/ingest/runs?limit=1 → HTTP ${code:-无响应}（期望 200）")
+            else
+              count=$(printf '%s' "$body" | jq -r '.runs | length' 2>/dev/null || echo 0)
+              if [ "${count:-0}" -lt 1 ]; then
+                problems+=("⑤ 摄取历史为空：从未收到过上报 → 每日增量摄取可能一直没跑成功（检查 .github/workflows/ingest.yml 与其 ADMIN_API_KEY）")
+              else
+                status=$(printf '%s' "$body" | jq -r '.runs[0].status // "?"')
+                wiki=$(printf '%s' "$body" | jq -r '.runs[0].wiki_id // "?"')
+                fin=$(printf '%s' "$body" | jq -r '.runs[0].finished_at // 0')
+                now_ms=$(jq -n 'now * 1000 | floor')
+                age_h=$(jq -n --argjson now "$now_ms" --argjson fin "${fin:-0}" '((($now - $fin) / 3600000) | floor)')
+                if [ "${fin:-0}" -eq 0 ]; then
+                  problems+=("⑤ 摄取记录缺少 finished_at（最新一条 wiki=${wiki} status=${status}）→ 无法判断新鲜度，请检查上报链路")
+                elif [ "$age_h" -gt 36 ]; then
+                  problems+=("⑤ 摄取最近的完成时间是 ${age_h} 小时前（wiki=${wiki} status=${status}，阈值 36 小时）→ 每日增量摄取没在跑或一直在失败")
+                elif [ "$status" != "success" ]; then
+                  problems+=("⑤ 摄取最新一条不是成功：wiki=${wiki} status=${status}（${age_h} 小时前）→ 查看 Actions 的 ingest 运行日志")
+                else
+                  notes+=("⑤ 摄取历史 OK（最新：${wiki} ${status}，${age_h} 小时前）")
+                fi
+              fi
+            fi
+          fi
+
+          # ── 结论 ──
+          echo "──────────────────────────────────────────────"
+          for n in "${notes[@]:-}"; do [ -n "$n" ] && echo "✅ $n"; done
+          if [ "${#problems[@]}" -gt 0 ]; then
+            for p in "${problems[@]}"; do echo "::error::$p"; done
+            echo "❌ 探活失败：${#problems[@]} 项不达标（详见上面每一条 ::error::）"
+            echo "   排查顺序：先看①直连是否通（不通=Worker/账号问题）→ ②③反代（不通=Pages 或域名）→ ④⑤用 ADMIN_API_KEY 手工 curl 复核。"
+            exit 1
+          fi
+          echo "✅ 五项探活全部通过（$(date -u '+%Y-%m-%d %H:%M:%S') UTC）"

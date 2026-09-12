@@ -190,6 +190,36 @@ export interface AdminRateLimitResponse {
   [key: string]: unknown
 }
 
+/**
+ * 摄取历史一行（GET /api/v1/admin/ingest/runs，M4·W4）。
+ * 形状与后端 `src/ingestruns.ts` 的 `IngestRunRecord` 对齐；字段全部可选 + 索引签名
+ * （后端加字段不会让前端炸，缺失字段一律显示「—」）。
+ */
+export interface AdminIngestRun {
+  id?: string
+  wiki_id?: string
+  commit_sha?: string
+  status?: string
+  files_added?: number
+  files_updated?: number
+  files_deleted?: number
+  points_upserted?: number
+  points_deleted?: number
+  tokens_used?: number
+  duration_ms?: number | null
+  error?: string | null
+  started_at?: number
+  finished_at?: number | null
+  [key: string]: unknown
+}
+
+/** GET /api/v1/admin/ingest/runs 返回体 */
+export interface AdminIngestRunsResponse {
+  runs?: AdminIngestRun[]
+  limit?: number
+  [key: string]: unknown
+}
+
 export interface AdminBanRequest {
   account_id: string
   banned: boolean
@@ -561,6 +591,15 @@ export function useApi() {
   }
 
   /**
+   * 管理端：最近若干条摄取记录（GET /api/v1/admin/ingest/runs?limit=N，M4·W4）。
+   * 后端由 GitHub Actions 在摄取结束后上报（Worker 代笔写 D1），按 finished_at 倒序返回。
+   * limit 缺省 20（后端夹到 [1,200]）；老部署没有该路由 → 404（页面显示「接口未实现」）。
+   */
+  async function adminIngestRuns(limit = 10): Promise<AdminIngestRunsResponse> {
+    return request<AdminIngestRunsResponse>("/v1/admin/ingest/runs", { params: { limit } })
+  }
+
+  /**
    * 管理端：封禁/解封。
    * 实际后端路径为 `POST /v1/admin/accounts/:id/ban?unban=1`；若 404 再回落到契约草案 `POST /v1/admin/ban`。
    */
@@ -651,6 +690,7 @@ export function useApi() {
     adminRatelimit,
     adminAudit,
     adminKeys,
+    adminIngestRuns,
     adminBan,
     adminQuota,
     saveModelSettings,

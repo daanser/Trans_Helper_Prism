@@ -194,6 +194,31 @@
           </div>
         </div>
 
+        <!-- 补货提示（plan.md §8.4「可用 key 数 < 2 就通知补货」）：**警示**不是错误，故用警示色而非 danger -->
+        <div
+          v-if="understockedPools.length"
+          class="mb-4 flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50 p-3.5 dark:border-amber-900/40 dark:bg-amber-950/30"
+          role="status"
+        >
+          <span class="rounded bg-amber-200 px-1.5 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-900/60 dark:text-amber-200">
+            需补货
+          </span>
+          <div class="min-w-0 space-y-1">
+            <p class="text-xs font-medium leading-relaxed text-amber-900 dark:text-amber-100">
+              <template v-for="(p, i) in understockedPools" :key="p.pool">
+                <span v-if="i > 0">、</span><span class="font-semibold">{{ p.pool }}</span>
+              </template>
+              池可用 key 不足 2 把，请补货。
+            </p>
+            <p class="text-[11px] leading-relaxed text-amber-800 dark:text-amber-200">
+              池里只剩单把 key 时，这把 key 被上游限流或失效就只能降级：<b>AI 伴读会不可用</b>
+              （我们演练过这条路：AI 报错但<b>检索不受影响</b>，因为检索与 AI 用的不是一个池）。
+              建议每个池至少配 2 把（<code class="font-mono">EMBED_POOL_KEYS</code> /
+              <code class="font-mono">LLM_POOL_KEYS</code>，逗号分隔），换 key 时才有退路。
+            </p>
+          </div>
+        </div>
+
         <p v-if="keysState === 'loading'" class="text-xs text-ink-muted">加载中…</p>
         <p v-else-if="keysState === 'unimplemented'" class="text-xs leading-relaxed text-ink-sub">
           接口未实现（后端返回 404/501）。接入后这里会显示每把 key 的池别、状态与用量（key 值本身不显示）。
@@ -323,6 +348,65 @@
       </div>
 
       <!-- 审计日志（GET /api/v1/admin/audit，已实现但需 ADMIN_API_KEY） -->
+      <!-- 摄取历史（M4·W4）：数据由 GitHub Actions 在摄取结束后上报，Worker 代笔写 D1 -->
+      <section class="rounded-2xl border border-surface-border bg-surface p-5 shadow-card sm:p-6">
+        <div class="mb-4 flex flex-wrap items-center justify-between gap-2 border-b border-surface-border pb-3">
+          <div>
+            <h2 class="text-sm font-semibold text-ink-title">摄取历史</h2>
+            <p class="mt-0.5 text-xs text-ink-muted">
+              GET /api/v1/admin/ingest/runs?limit=10 · 由 GitHub Actions 摄取收尾时上报（最近 10 条）
+            </p>
+          </div>
+          <div class="flex items-center gap-2">
+            <StatusBadge :state="ingestState" />
+            <button
+              type="button"
+              class="rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-xs font-medium text-ink-sub transition-colors hover:border-surface-border-hover hover:text-ink-title"
+              @click="loadIngestRuns"
+            >
+              刷新
+            </button>
+          </div>
+        </div>
+
+        <p v-if="ingestState === 'loading'" class="text-xs text-ink-muted">加载中…</p>
+        <p v-else-if="ingestState === 'unimplemented'" class="text-xs leading-relaxed text-ink-sub">
+          接口未实现（后端返回 404/501）。
+        </p>
+        <p v-else-if="ingestState === 'error'" class="text-xs text-danger">{{ ingestMessage }}</p>
+        <div v-else-if="ingestRows.length" class="overflow-x-auto">
+          <table class="w-full border-collapse text-xs">
+            <thead>
+              <tr class="border-b border-surface-border text-left text-ink-muted">
+                <th class="py-2 pr-3 font-medium">知识库</th>
+                <th class="py-2 pr-3 font-medium">状态</th>
+                <th class="py-2 pr-3 font-medium">变动文件</th>
+                <th class="py-2 pr-3 font-medium">写入 chunk</th>
+                <th class="py-2 font-medium">完成时间</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(row, i) in ingestRows" :key="i" class="border-b border-surface-border/60 text-ink-body">
+                <td class="py-2 pr-3">{{ text(row.wiki_id) }}</td>
+                <td class="py-2 pr-3">
+                  <span
+                    class="rounded px-1.5 py-0.5 text-[11px] font-medium"
+                    :class="ingestStatusClass(row.status)"
+                  >{{ ingestStatusText(row.status) }}</span>
+                </td>
+                <td class="py-2 pr-3 tabular-nums">{{ fmt(row.files_updated) }}</td>
+                <td class="py-2 pr-3 tabular-nums">{{ fmt(row.points_upserted) }}</td>
+                <td class="py-2">{{ timeText(row.finished_at) }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <p v-if="ingestRows.some((r) => r.error)" class="mt-3 text-[11px] leading-relaxed text-danger">
+            有失败记录：{{ ingestRows.find((r) => r.error)?.error }}
+          </p>
+        </div>
+        <p v-else class="text-xs text-ink-muted">暂无摄取记录。</p>
+      </section>
+
       <section class="rounded-2xl border border-surface-border bg-surface p-5 shadow-card sm:p-6">
         <div class="mb-4 flex flex-wrap items-center justify-between gap-2 border-b border-surface-border pb-3">
           <div>
@@ -376,14 +460,14 @@
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue"
-import { useApi, isUnimplemented, type AdminRateLimitResponse } from "~/composables/useApi"
+import { useApi, isUnimplemented, type AdminIngestRun, type AdminRateLimitResponse } from "~/composables/useApi"
 import { useToast } from "~/composables/useToast"
 
 useHead({ title: "管理后台 · TransHelper Prism" })
 
 type LoadState = "idle" | "loading" | "ok" | "unimplemented" | "error"
 
-const { adminUsage, adminRatelimit, adminKeys, adminAudit, adminBan, adminQuota } = useApi()
+const { adminUsage, adminRatelimit, adminKeys, adminIngestRuns, adminAudit, adminBan, adminQuota } = useApi()
 const { pushToast } = useToast()
 const { isLoggedIn, isAdmin, user, loadMe, init } = useAuth()
 
@@ -393,6 +477,9 @@ const usageData = ref<Record<string, unknown> | null>(null)
 const keysState = ref<LoadState>("idle")
 const keysMessage = ref("")
 const keysData = ref<Record<string, unknown> | null>(null)
+const ingestState = ref<LoadState>("idle")
+const ingestMessage = ref("")
+const ingestRows = ref<AdminIngestRun[]>([])
 const auditState = ref<LoadState>("idle")
 const auditMessage = ref("")
 const auditRows = ref<Record<string, unknown>[]>([])
@@ -498,6 +585,18 @@ const ratelimitGlobalTone = computed(() => {
   if (state === "hard") return "text-danger"
   if (state === "soft") return "text-amber-600 dark:text-amber-400"
   return "text-ink-title"
+})
+
+/**
+ * 可用 key 不足 2 把的池（plan.md §8.4：`configured < 2` 就提示补货）。
+ * 纯前端判断，数据来自 `/admin/keys` 的 `pools[].configured`（后端从 env secrets 推导，不依赖 D1）。
+ */
+const understockedPools = computed<Array<{ pool: string; configured: number }>>(() => {
+  const pools = keysData.value?.pools
+  if (!Array.isArray(pools)) return []
+  return pools
+    .map((p) => ({ pool: String((p as Record<string, unknown>)?.pool ?? "?"), configured: Number((p as Record<string, unknown>)?.configured ?? 0) }))
+    .filter((p) => Number.isFinite(p.configured) && p.configured < 2)
 })
 
 const keyRows = computed<Record<string, unknown>[]>(() => {
@@ -619,6 +718,40 @@ async function loadKeys() {
   }
 }
 
+async function loadIngestRuns() {
+  ingestState.value = "loading"
+  ingestMessage.value = ""
+  try {
+    const data = await adminIngestRuns(10)
+    ingestRows.value = Array.isArray(data.runs) ? data.runs : []
+    ingestState.value = "ok"
+  } catch (err: unknown) {
+    ingestRows.value = []
+    if (isUnimplemented(err)) ingestState.value = "unimplemented"
+    else {
+      ingestState.value = "error"
+      ingestMessage.value = adminErrorText(err)
+    }
+  }
+}
+
+/** 摄取状态的中文与配色：success 绿 / failed 红 / 其它（started、skipped）中性 */
+function ingestStatusText(status: unknown): string {
+  const s = String(status ?? "")
+  if (s === "success") return "成功"
+  if (s === "failed") return "失败"
+  if (s === "skipped") return "无变更"
+  if (s === "started") return "进行中"
+  return s || "—"
+}
+
+function ingestStatusClass(status: unknown): string {
+  const s = String(status ?? "")
+  if (s === "success") return "bg-primary-subtle text-primary"
+  if (s === "failed") return "bg-danger-subtle text-danger"
+  return "bg-canvas-subtle text-ink-muted"
+}
+
 /** 管理接口是服务端 ADMIN_API_KEY 保护的运维接口：401/403 说明浏览器会话无权调用 */
 function adminErrorText(err: unknown): string {
   const status = (err as { status?: number })?.status
@@ -701,6 +834,7 @@ onMounted(async () => {
     void loadUsage()
     void loadRatelimit()
     void loadKeys()
+    void loadIngestRuns()
     void loadAudit()
   }
 })
