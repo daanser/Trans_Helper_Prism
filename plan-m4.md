@@ -105,7 +105,8 @@
   - 剩余构成：检索管线 ~1.9s（embed/Qdrant/rerank 跨境调用）+ 闸门 0.25s + 配额 0.3s + 边缘网络 0.7s；
   - 诊断手段保留：响应里的 `handler_ms`/`gate_ms`/`gate_*_ms` 打点 + `GET /admin/d1bench`（临时 D1/KV 基准端点）。
 
-### W3 · 成本与月账
+### W3 · 成本与月账（进行中：**用量侧已自动化，价格侧需你填**）
+
 
 | 项 | 内容 |
 |---|---|
@@ -113,6 +114,32 @@
 | **月账** | 硅基流动（embedding/rerank/LLM）、Cloudflare（Workers/Pages/D1/KV/Queues）、Qdrant Cloud、域名；记入 `history.md` 或独立账目页 |
 | **上限护栏** | 明确"每月可承受上限"，与 W2 的日活上限对齐；触线时先收紧哪一档（顺序：境外/机房 → CN 其它 → CN 家宽）|
 | **验收** | 有一张"用量 → 费用"的表；对下月用量给出预测与上限动作 |
+
+#### ✅ 已完成：用量汇总端点（2026-09-11）
+`GET /api/v1/admin/usage/summary?days=30`（admin 鉴权，**只读聚合、不写库、不占配额**）：
+```jsonc
+{ "days":30, "since":…, "until":…,
+  "by_endpoint":[ {"endpoint":"embeddings","calls":93,"ok":92,"failed":1,"tokens_in":1066,"tokens_out":0,"avg_latency_ms":781},
+                  {"endpoint":"rerank","calls":63,"ok":63,"failed":0,"tokens_in":0,"tokens_out":0,"avg_latency_ms":743},
+                  {"endpoint":"chat","calls":15,"ok":15,"failed":0,"tokens_in":54987,"tokens_out":9931,"avg_latency_ms":6452} ],
+  "by_day":[ {"day":"2026-09-11","calls":108,"tokens_in":13343,"tokens_out":2205} ],
+  "totals":{ "calls":171,"tokens_in":56053,"tokens_out":9931,"failed":1 },
+  "quota_window":{ "accounts":2,"used_tokens":11387,"limit_tokens":300000 },
+  "ingest":{ "runs":13,"failed":0,"points_upserted":3,"last_success_at":1789125176473 } }
+```
+**当前实测规模**（30 天，绝大多数是开发期自测流量）：上游调用 **171 次**、chat token **≈6.5 万**。
+**口径注意**（写月账时别搞错）：
+- `embeddings.tokens_in` 是**我们自己的估算**（`estimateTokens`），不是上游账单口径 → **按调用次数计价更准**；
+- `rerank` 上游不返回 token → **只能按调用次数计**；
+- `chat` token 在流式且上游未回 `usage` 时也是**估算**（`estimated:true`）→ 以硅基流动控制台为准；
+- 结论：**本端点用于"知道打了多少量"**，**费用以两个控制台的账单为准**。
+
+#### 待你（或控制台）补齐的部分
+| 项 | 需要什么 |
+|---|---|
+| 单价 | 硅基流动 embedding / rerank / chat 的单价；CF（Workers/Pages/D1/KV/Queues）与 Qdrant Cloud 的当期用量 |
+| 月上限 | 你愿意每月最多花多少；触线时按 **境外/机房 → CN 其它 → CN 家宽** 的顺序收紧档位（`plan-ratelimit.md` §4 的 env） |
+| 模板 | 费用 ≈ `embeddings 调用数 × 单价 + rerank 调用数 × 单价 + chat tokens × token 单价 + 固定项（域名/Qdrant）` |
 | **谁做** | 我（拉数、建模）；你（账单核对）|
 | **预估** | 2 小时 |
 
