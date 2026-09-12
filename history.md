@@ -192,6 +192,21 @@
    **教训**：加检查时必须确认它**位于汇总/退出之前**，并且**造一次失败验证它真的会让 job 红**
    （本次用 `-f daily_call_limit=1` 造错验证）；只看"代码写了"不算数。
 
+49. **密钥池合并为单池 + `POOL_KEYS_<n>` 分变量（2026-09-12）**：
+   动机是"CF Secret 写入后不可读回 → 加一把 key 要把整串逗号列表重打一遍，多了极易出错"。
+   - **只认 `POOL_KEYS_<n>`**（按前缀扫描 env、数字升序、不要求连续）；旧的 `EMBED_`/`LLM_`/`RERANK_POOL_KEYS`
+     **彻底删除、不写兼容读取**（用户明确要求"不留兼容、激进一点"，并接受迁移窗口的短暂降级）。
+   - **ref 由变量名派生**（`POOL_KEYS_3` → `pool-key-3`）：旧实现是 `${pool}-key-${索引}`，
+     **删掉中间一把会让后面所有 ref 移位**，而禁用集与 `provider_keys` 表都按 ref 记录 → 会误伤/误放。这是本次最值钱的修复。
+   - 对外**单池 `keys`**，但 `pickKey("embed"|"llm"|"rerank")` 三入口**共享同一份 key 列表** →
+     调用点零改动，且 `key_usage.pool` **仍按能力记录**（embedding/rerank/chat 的分能力用量统计没丢）。
+   - **禁用一把 key = 全能力禁用**（KV 只写 `keydeny:keys`）；顺带修掉 `applyDenied()` 逐个能力写入会**互相清空**禁用集的真 bug。
+   - **负载均衡改 LRU**：旧实现并列时排序稳定 → 顺序请求**全打在 key#1**、第二把闲置；现在严格交替
+     （10 次顺序取用 → 5/5）。**顺带把请求量摊到两个账号上（各减半），正对"防封号"这个真实目标。**
+   - **首次做成"真·自动换 key"演练**（以前只有 1 把 key 做不到）：下架 `pool-key-0` → 检索仍走向量、AI 仍正常出 delta、
+     **零降级**；对比单 key 时代的同一演练是 `llm-unavailable` + `rerank-fallback`。watchdog ④ 也由"报错"转为 `✅ keys=2`。
+   - 迁移窗口实测：加 CF 变量前 `configured=0` → 检索返回 `fallback=true / warning=embedding-unavailable`（关键词回退可用、AI 不可用），**不崩**。
+
 ## 6. 前端现状（2026-09-08 全量重写 UI/UX；2026-09-09 已上线 Pages）
 - **设计语言已彻底换掉**：不再是照搬 `vitepress-theme-project-trans` 的 indigo 色板。现为自定「温润学术检索」风——浅底 `#F8FAFC` / 深底 `#0B1120`，品牌蓝 `#2563EB`（深 `#3B82F6`），token 全走 `assets/css/main.css` 的 CSS 变量（`--bg-canvas/--bg-surface/--text-*/--primary*`），`tailwind.config.ts` 只做语义映射（`canvas/surface/primary/ink`）。
 - **用户明确否决过的方向（别再走回头路）**：① 高饱和四色彩虹 wiki 徽章（粉/天蓝/紫/翠绿）——太 AI 味；② 纯黑 `bg-slate-900` 实色选中块——太凝重死寂；③ 全大写英文终端风标签（`ARCHIVE RETRIEVAL //`、`SEARCH`、`PERF //`）——读不懂。现方案：四库**统一中性**选中态（淡蓝底 `bg-blue-50/80` + 勾选 `✓`，无彩色区分），中文标签，`max-w-7xl` 宽屏。

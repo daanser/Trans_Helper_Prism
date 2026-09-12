@@ -164,7 +164,7 @@ _最后更新：2026-09-09_
 改完告诉我 → 我验证 `/admin/keys` 各池 `configured=2` → watchdog ④ 转绿 → **并补做 W6 里唯一没做成的演练：真·自动换 key**
 （下架 `llm-key-0`，看它自动切到 `llm-key-1` 而不是降级）。
 
-### 1. key 管理方式改造 —— ✅ **代码已实施并部署（2026-09-12）**，⏳ **只差你在 CF 加两个变量**
+### 1. key 管理方式改造 —— ✅ **全部完成（2026-09-12）**：代码已上线 + CF 变量已加 + 演练通过
 
 **已上线**（commit `0ee92ea`，649 用例全绿 / tsc 0 错）：
 - 只认 `POOL_KEYS_<n>`（前缀扫描、数字升序、不要求连续）；**ref = `pool-key-<n>` 由变量名派生** →
@@ -174,11 +174,8 @@ _最后更新：2026-09-09_
 - **负载均衡**：并列时按 **LRU**（旧实现并列恒选第一把 → 顺序请求全打 key#1）
 - 旧三变量（`EMBED_/LLM_/RERANK_POOL_KEYS`）**彻底删除**、无兼容代码；GitHub Secret `EMBED_POOL_KEYS` 已删
 
-**⏳ 待你**：CF 控制台 → `transhelper-prism-backend` → Settings → Variables and Secrets → **新增**
-`POOL_KEYS_0`（第一把）与 `POOL_KEYS_1`（第二把，另一个账号）。
-**在加之前，线上处于降级态**（实测 `hits=10 但 fallback=true / warning=embedding-unavailable`：关键词回退可用、AI 不可用、无重排）。
-
-**加完后我会验**：`/admin/keys` 显示 `pool=keys configured=2` → 真实检索恢复向量、AI 恢复 → watchdog ④ 转绿 → 补做 W6 缺失的 **真·自动换 key 演练**。
+**已验证**：`/admin/keys` → `pool=keys configured=2 refs=[pool-key-0, pool-key-1]`；匿名检索恢复向量（无 fallback）；AI 240 deltas；
+**真·自动换 key 演练通过**（下架 pool-key-0 → 检索与 AI 零降级，自动切到 pool-key-1）；watchdog ④ = `✅ keys=2`。
 
 ### 2. 多 key 要做负载均衡（**现状确实没做**）
 **实测代码事实**：`pickKey()` 的排序是 `inFlightCount ↑`，并列时 `cooldownUntil ↑`；
