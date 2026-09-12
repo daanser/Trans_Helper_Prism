@@ -57,15 +57,14 @@
       </button>
     </div>
 
-    <!-- 下层过滤控制：轻盈微质感知识库选择 + 开关选项 -->
-    <div class="mt-5 flex flex-col gap-4 border-t border-slate-100 pt-4 dark:border-slate-800 md:flex-row md:items-center md:justify-between">
-      <!-- 知识源筛选：去除死寂纯黑，改为轻盈透气的微质感选中态 -->
-      <!-- 布局要点（2026-09-12）：四个知识库按钮必须**始终成组同行**。
-           右侧「返回条数 / 精准重排 / AI 伴读」变宽后，曾把 RLE/Mio 挤到第二行 ——
-           故把 4 个 button 包进一个 `sm:flex-nowrap` 的独立组：宽度不够时**整组换行**，
-           而不是逐个按钮被挤散；手机（<sm）允许组内换行，自然排成对齐的 2×2。 -->
-      <div class="flex flex-wrap items-center gap-x-2 gap-y-2" role="group" aria-label="知识库范围">
-        <span class="text-xs font-medium text-slate-500 dark:text-slate-400">知识库：</span>
+    <!-- 下层过滤控制：**确定性的两行**（不再依赖 flex 自动换行 —— 那会把标签挤成孤行、
+         把控件顶出卡片、并让按钮错位，三次翻车的根因）
+         第一行 = 知识库（标签 + 四个按钮，独占整行因此永远不会被挤压）
+         第二行 = 参数控件（返回条数 / 精准重排 / AI 伴读，靠右） -->
+    <div class="mt-5 space-y-3 border-t border-slate-100 pt-4 dark:border-slate-800">
+      <!-- 第一行：知识源筛选（四个按钮与标签**同一行**，且四个按钮本身永不拆行） -->
+      <div class="flex flex-wrap items-center gap-x-3 gap-y-2" role="group" aria-label="知识库范围">
+        <span class="shrink-0 text-xs font-medium text-slate-500 dark:text-slate-400">知识库：</span>
 
         <div class="flex flex-wrap items-center gap-2 sm:flex-nowrap">
           <button
@@ -99,9 +98,8 @@
         </div>
       </div>
 
-      <!-- 参数开关（返回条数 & 精准重排 & AI伴读） -->
-      <!-- md:ml-auto：控件组换到第二行时**靠右**（与上方知识库按钮左侧对齐形成整齐的两行） -->
-      <div class="flex shrink-0 flex-wrap items-center gap-x-6 gap-y-3 md:ml-auto md:justify-end">
+      <!-- 第二行：参数开关（返回条数 & 精准重排 & AI 伴读），整行内靠右 -->
+      <div class="flex flex-wrap items-center justify-end gap-x-6 gap-y-3">
         <!-- 返回条数（plan-topk.md §3.4）：登录 1–50；未登录只允许 1–5，并提示登录后可用 50 -->
         <div class="flex items-center gap-2">
           <label for="prism-topk" class="text-xs font-medium text-slate-500 dark:text-slate-400">返回条数</label>
