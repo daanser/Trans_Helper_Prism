@@ -36,24 +36,6 @@
         </SearchBox>
 
 
-        <!-- 移动端 AI 伴读卡位 -->
-        <div v-if="hasSearched" class="mt-6 lg:hidden">
-          <AiCompanionCard
-            :answer="aiAnswer"
-            :citations="aiCitations"
-            :model="aiModel"
-            :streaming="loading || aiStreaming"
-            :status="aiStatus"
-            :notice="aiNotice"
-            :followup-busy="aiStreaming"
-            :followup-enabled="llmEnabled && results.length > 0"
-            :enabled="llmEnabled"
-            @update:enabled="onLlmToggle"
-            @cite="onCite"
-            @followup="onFollowUp"
-          />
-        </div>
-
         <!-- 429 分档限流提示（**不清空已有结果**；有 retry_after 时做倒计时并禁用提交） -->
         <div
           v-if="rateLimit"
@@ -217,7 +199,7 @@
         </template>
       </div>
 
-      <!-- 桌面右侧：AI 伴读与引用视窗 -->
+      <!-- 桌面（≥lg）右侧栏：「本次检索要点」；<lg 时整栏隐藏，改由底部抽屉承载（见文件末尾） -->
       <aside class="hidden w-80 shrink-0 lg:block xl:w-96">
         <AiCompanionCard
           :answer="aiAnswer"
@@ -229,12 +211,71 @@
           :followup-busy="aiStreaming"
           :followup-enabled="llmEnabled && results.length > 0"
           :enabled="llmEnabled"
+          :collapsed="aiCollapsed"
           @update:enabled="onLlmToggle"
+          @update:collapsed="onAiCollapsedChange"
           @cite="onCite"
           @followup="onFollowUp"
         />
       </aside>
     </div>
+
+    <!-- <lg 的「本次检索要点」抽屉（布局改造 2026-09-12）：
+         选择抽屉而不是 Tab —— 结果列表与要点经常要对照着看（点 [来源n] 要能滚到对应卡片），
+         Tab 会把两者变成互斥视图，对照就得来回切；抽屉浮在结果之上、关掉即回到原滚动位置。
+         触发按钮只在「有要点，或 AI 已开启且有结果」时出现。 -->
+    <button
+      v-if="showAiDrawerTrigger"
+      type="button"
+      class="fixed bottom-4 right-4 z-40 inline-flex items-center gap-2 rounded-full bg-primary px-4 py-2.5 text-xs font-medium text-white shadow-floating transition-transform active:scale-[0.98] lg:hidden"
+      aria-haspopup="dialog"
+      :aria-expanded="aiDrawerOpen"
+      @click="aiDrawerOpen = true"
+    >
+      <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+      </svg>
+      <span>本次检索要点</span>
+      <span v-if="aiStatus === 'done'" class="rounded bg-white/20 px-1.5 py-0.5 text-[10px]">已生成</span>
+    </button>
+
+    <Teleport to="body">
+      <div v-if="aiDrawerOpen" class="fixed inset-0 z-50 lg:hidden" role="dialog" aria-modal="true" aria-label="本次检索要点">
+        <!-- 遮罩：点击关闭 -->
+        <div class="absolute inset-0 bg-slate-900/40" @click="aiDrawerOpen = false"></div>
+        <!-- 底部抽屉：内容就是同一张 AiCompanionCard（不再有内联副本） -->
+        <div class="absolute inset-x-0 bottom-0 max-h-[82vh] overflow-y-auto overscroll-contain rounded-t-2xl bg-canvas p-3 shadow-floating">
+          <div class="mb-2 flex items-center justify-between px-1">
+            <span class="text-xs font-medium text-ink-muted">本次检索要点</span>
+            <button
+              type="button"
+              class="flex h-7 w-7 items-center justify-center rounded-md text-ink-muted transition-colors hover:bg-canvas-subtle hover:text-ink-title"
+              aria-label="关闭"
+              @click="aiDrawerOpen = false"
+            >
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M18 6 6 18" /><path d="m6 6 12 12" />
+              </svg>
+            </button>
+          </div>
+          <AiCompanionCard
+            :answer="aiAnswer"
+            :citations="aiCitations"
+            :model="aiModel"
+            :streaming="loading || aiStreaming"
+            :status="aiStatus"
+            :notice="aiNotice"
+            :followup-busy="aiStreaming"
+            :followup-enabled="llmEnabled && results.length > 0"
+            :enabled="llmEnabled"
+            :collapsed="false"
+            @update:enabled="onLlmToggle"
+            @cite="onCiteFromDrawer"
+            @followup="onFollowUp"
+          />
+        </div>
+      </div>
+    </Teleport>
 
     <!-- AI 伴读二次确认（说明配额消耗，可取消） -->
     <ConfirmDialog
@@ -273,6 +314,8 @@ type AiStatus = "idle" | "streaming" | "done" | "unavailable"
 const { search, searchStream, chat } = useApi()
 const { pushToast } = useToast()
 const { prefs, load: loadPrefs, save: savePrefs } = usePrefs()
+/** 「本次检索要点」是否收起（持久化在 usePrefs.aiCollapsed；≥lg 的侧栏卡片用它） */
+const aiCollapsed = ref(false)
 const { isLoggedIn, loadMe, isExceeded: authQuotaExceeded, resetInHours: authResetInHours, resetAtLabel: authResetAtLabel } =
   useAuth()
 
@@ -496,6 +539,31 @@ function scrollToHit(citationRef: string) {
 
 function onCite(ref: string) {
   scrollToHit(ref)
+}
+
+// ── <lg 的「本次检索要点」抽屉（布局改造 2026-09-12）──
+/** 抽屉开合（**不持久化**：它是移动端的临时视图，不是偏好） */
+const aiDrawerOpen = ref(false)
+/** 触发按钮出现条件：已有要点/正在生成，**或** AI 已开启且本次有结果 */
+const showAiDrawerTrigger = computed(
+  () => Boolean(aiAnswer.value) || aiStreaming.value || (llmEnabled.value && results.value.length > 0),
+)
+
+/** 抽屉里的 [来源n]：先收抽屉再滚动，否则抽屉盖住目标卡片看不到高亮 */
+function onCiteFromDrawer(ref: string) {
+  aiDrawerOpen.value = false
+  window.setTimeout(() => scrollToHit(ref), 0)
+}
+
+/** 收起状态持久化（usePrefs.aiCollapsed；与设置页共用同一个偏好对象） */
+function onAiCollapsedChange(v: boolean) {
+  aiCollapsed.value = v
+  savePrefs({ aiCollapsed: v })
+}
+
+/** 抽屉开着时按 Esc 关闭（遮罩点击已在模板里） */
+function onDrawerKeydown(ev: KeyboardEvent) {
+  if (ev.key === "Escape" && aiDrawerOpen.value) aiDrawerOpen.value = false
 }
 
 /** AI 伴读开关：开启必须先过二次确认（说明配额消耗） */
@@ -737,15 +805,19 @@ async function doSearch(payload: Pick<SearchRequest, "query" | "corpora" | "use_
 onMounted(() => {
   const saved = loadPrefs()
   llmEnabled.value = saved.llm
+  aiCollapsed.value = saved.aiCollapsed === true
+  window.addEventListener("keydown", onDrawerKeydown)
 })
 
 onBeforeUnmount(() => {
   cancelAiStream()
   stopCooldownTicker()
+  window.removeEventListener("keydown", onDrawerKeydown)
 })
 
 // 偏好变更后同步（设置页可能在同一 SPA 会话里改过）
 watch(prefs, (next) => {
   llmEnabled.value = next.llm
+  aiCollapsed.value = next.aiCollapsed === true
 })
 </script>

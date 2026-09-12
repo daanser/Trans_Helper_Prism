@@ -98,41 +98,73 @@
         </div>
       </div>
 
-      <!-- 第二行：**只放检索参数**（返回条数 + 精准重排）。
-           「AI 伴读」属于生成类，**整个搜索区都不再出现它的开关或徽章** ——
-           唯一主开关在右侧卡片；结果区只以一行文字提示"已生成要点"，不产生"这里也能开"的误解。 -->
-      <div class="flex flex-wrap items-center gap-x-6 gap-y-3">
-        <!-- 返回条数（plan-topk.md §3.4）：登录 1–50；未登录只允许 1–5，并提示登录后可用 50 -->
-        <div class="flex items-center gap-2">
-          <label for="prism-topk" class="text-xs font-medium text-slate-500 dark:text-slate-400">返回条数</label>
-          <input
-            id="prism-topk"
-            v-model.number="topK"
-            type="number"
-            :min="1"
-            :max="topKMax"
-            step="1"
-            inputmode="numeric"
-            :aria-describedby="topKHintId"
-            class="w-16 rounded-lg border border-slate-200 bg-slate-50 px-2 py-1 text-center text-xs tabular-nums text-slate-700 transition-colors focus:border-blue-600 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
-            @blur="normalizeTopK()"
-            @change="onTopKChange()"
-          />
-          <span class="text-xs text-slate-400 dark:text-slate-500">/ {{ topKMax }}</span>
-          <span v-if="!loggedIn" :id="topKHintId" class="text-[11px] leading-snug text-amber-600 dark:text-amber-400">
-            登录后可返回最多 {{ TOP_K_MAX }} 条
-          </span>
-          <span v-else :id="topKHintId" class="sr-only">允许范围 1 到 {{ TOP_K_MAX }} 条</span>
+      <!-- 第二行：**只放一个「高级」折叠按钮**（返回条数 + 精准重排收进面板，默认收起）。
+           首屏因此只有：搜索框 + 知识库 + 高级；参数不抢视线。 -->
+      <div class="flex items-center justify-end">
+        <button
+          type="button"
+          class="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-800 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:border-slate-600"
+          :aria-expanded="advancedOpen"
+          aria-controls="prism-advanced-panel"
+          @click="toggleAdvanced"
+        >
+          <span>高级</span>
+          <svg
+            class="h-3 w-3 transition-transform"
+            :class="advancedOpen ? 'rotate-180' : ''"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="m6 9 6 6 6-6" />
+          </svg>
+        </button>
+      </div>
+
+      <!-- 高级面板（默认收起；展开状态持久化在 usePrefs.advancedOpen）：
+           返回条数 + 精准重排 + 一句短提示（**只在精准重排开启时出现**） -->
+      <div
+        v-show="advancedOpen"
+        id="prism-advanced-panel"
+        class="rounded-xl border border-slate-100 bg-slate-50/60 p-3.5 dark:border-slate-800 dark:bg-slate-900/40"
+      >
+        <div class="flex flex-wrap items-center gap-x-6 gap-y-3">
+          <!-- 返回条数（plan-topk.md §3.4）：登录 1–50；未登录只允许 1–5，并提示登录后可用 50 -->
+          <div class="flex items-center gap-2">
+            <label for="prism-topk" class="text-xs font-medium text-slate-500 dark:text-slate-400">返回条数</label>
+            <input
+              id="prism-topk"
+              v-model.number="topK"
+              type="number"
+              :min="1"
+              :max="topKMax"
+              step="1"
+              inputmode="numeric"
+              :aria-describedby="topKHintId"
+              class="w-16 rounded-lg border border-slate-200 bg-white px-2 py-1 text-center text-xs tabular-nums text-slate-700 transition-colors focus:border-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500/20 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+              @blur="normalizeTopK()"
+              @change="onTopKChange()"
+            />
+            <span class="text-xs text-slate-400 dark:text-slate-500">/ {{ topKMax }}</span>
+            <span v-if="!loggedIn" :id="topKHintId" class="text-[11px] leading-snug text-amber-600 dark:text-amber-400">
+              登录后可返回最多 {{ TOP_K_MAX }} 条
+            </span>
+            <span v-else :id="topKHintId" class="sr-only">允许范围 1 到 {{ TOP_K_MAX }} 条</span>
+          </div>
+
+          <ToggleMini v-model="useReranker" label="精准重排" hint="已激活 BAAI/bge-reranker-v2-m3 二次重排序" />
         </div>
 
-        <ToggleMini v-model="useReranker" label="精准重排" hint="已激活 BAAI/bge-reranker-v2-m3 二次重排序" />
+        <!-- 一句短提示：只在开了会额外消耗额度的功能时出现（命名统一用「精准重排」） -->
+        <p v-if="costHint" class="mt-2.5 text-[11px] leading-relaxed text-slate-400 dark:text-slate-500">
+          {{ costHint }}
+        </p>
       </div>
     </div>
-
-    <!-- 短提示：**只在打开了会额外消耗额度的功能时出现**，且一行说完 ——
-         长文案会打断「筛选区 → 大家常搜」的视觉流（截图反馈 #5）。
-         命名统一用「精准重排」，不再出现第二名字（截图反馈 #2）。 -->
-    <p v-if="costHint" class="mt-2.5 text-[11px] leading-relaxed text-ink-muted">{{ costHint }}</p>
 
     <!-- 快捷建议插槽 -->
     <slot name="examples" />
@@ -174,6 +206,16 @@ const query = ref("")
 const searchInput = ref<HTMLInputElement | null>(null)
 const selectedCorpora = ref<string[]>(["mtf-wiki", "ftm-wiki", "rle-wiki", "miomtfwiki"])
 const useReranker = ref(true)
+
+/**
+ * 「高级」折叠区开合状态（默认收起）。持久化在 `usePrefs.advancedOpen`：
+ * 挂载后按本地偏好校正；用户点击时立即写回（与返回条数同一个偏好对象）。
+ */
+const advancedOpen = ref(false)
+function toggleAdvanced() {
+  advancedOpen.value = !advancedOpen.value
+  savePrefs({ advancedOpen: advancedOpen.value })
+}
 
 /** 一句短提示：只在开了精准重排时出现；**不重复讲 AI 伴读的额度**（那些细节归右侧卡片） */
 const costHint = computed(() =>

@@ -8,7 +8,7 @@
     <header class="sticky top-0 z-50 border-b border-surface-border bg-surface/90 backdrop-blur-md">
       <div class="mx-auto flex h-16 max-w-7xl items-center justify-between px-4 sm:px-6">
         <!-- 品牌标识 -->
-        <NuxtLink to="/" class="group flex items-center gap-3 select-none" aria-label="TransHelper Prism 首页">
+        <NuxtLink to="/" class="group flex min-w-0 items-center gap-3 select-none" aria-label="TransHelper Prism 首页">
           <!-- 工作区 logo（六边形线框 + TP 字母）：深色徽底保证浅/暗色模式下白线框均清晰 -->
           <div class="flex h-9 w-9 items-center justify-center rounded-xl border border-slate-700/50 bg-slate-900 p-1 shadow-sm transition-transform group-hover:scale-95">
             <svg viewBox="0 0 500 500" class="h-full w-full" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -31,90 +31,57 @@
           </div>
         </NuxtLink>
 
-        <!-- 右侧外链与操作 -->
-        <div class="flex items-center gap-3">
-          <a
-            href="https://transprism.chengxi.moe"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="hidden rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-xs font-medium text-ink-sub transition-colors hover:border-surface-border-hover hover:text-ink-title sm:inline-flex sm:items-center sm:gap-1"
-          >
-            <span>TransPrism</span>
-            <svg class="h-3.5 w-3.5 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-              <polyline points="15 3 21 3 21 9" />
-              <line x1="10" y1="14" x2="21" y2="3" />
-            </svg>
-          </a>
-
-          <a
-            href="https://transhelper.org"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="hidden rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-xs font-medium text-ink-sub transition-colors hover:border-surface-border-hover hover:text-ink-title sm:inline-flex sm:items-center sm:gap-1"
-          >
-            <span>TransHelper</span>
-            <svg class="h-3.5 w-3.5 opacity-60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-              <polyline points="15 3 21 3 21 9" />
-              <line x1="10" y1="14" x2="21" y2="3" />
-            </svg>
-          </a>
-
-          <!-- 站内导航：设置 / 管理（管理仅管理员可见；真实权限由后端 T3.3 兜底） -->
+        <!-- 右侧操作区（布局改造 2026-09-12）：**常驻只留「设置」+「主题」**；
+             外链、额度、退出、管理都收进下面的账号菜单（未登录 → 「更多 ⋯」菜单只放外链）。 -->
+        <!-- 右侧操作区 `shrink-0`：窄屏时先让品牌区收缩，操作按钮永不被压变形（确定性布局） -->
+        <div class="flex shrink-0 items-center gap-2">
           <NuxtLink
             to="/settings"
-            class="hidden rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-xs font-medium text-ink-sub transition-colors hover:border-surface-border-hover hover:text-ink-title sm:inline-flex"
+            class="inline-flex h-9 items-center rounded-lg border border-surface-border bg-surface px-3 text-xs font-medium text-ink-sub transition-colors hover:border-surface-border-hover hover:text-ink-title"
           >
             设置
           </NuxtLink>
-          <NuxtLink
-            v-if="isAdmin"
-            to="/admin"
-            class="hidden rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-xs font-medium text-ink-sub transition-colors hover:border-surface-border-hover hover:text-ink-title sm:inline-flex"
-          >
-            管理
-          </NuxtLink>
 
-          <!-- 账号区：未登录 → 登录入口；已登录 → @handle + 剩余配额 + 退出 -->
-          <div class="flex items-center gap-2">
-            <NuxtLink
-              v-if="!isLoggedIn"
-              to="/login"
-              class="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
+          <!-- 账号菜单（点击触发器开合；Esc / 点空白处关闭；role=menu + aria-expanded） -->
+          <div ref="menuRoot" class="relative">
+            <button
+              type="button"
+              class="inline-flex h-9 max-w-[10rem] items-center gap-1.5 rounded-lg border border-surface-border bg-surface px-2.5 text-xs font-medium text-ink-title transition-colors hover:border-surface-border-hover"
+              :aria-label="isLoggedIn ? `账号菜单（${user ? '@' + user.handle : '已登录'}）` : '更多'"
+              aria-haspopup="menu"
+              :aria-expanded="menuOpen"
+              @click="menuOpen = !menuOpen"
             >
-              <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
-                <circle cx="12" cy="7" r="4" />
+              <template v-if="isLoggedIn">
+                <span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary-subtle text-[10px] font-semibold text-primary">
+                  {{ userInitial }}
+                </span>
+                <span class="truncate">{{ user ? `@${user.handle}` : "已登录" }}</span>
+              </template>
+              <template v-else>
+                <span>更多</span>
+              </template>
+              <svg class="h-3 w-3 shrink-0 text-ink-muted transition-transform" :class="menuOpen ? 'rotate-180' : ''" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="m6 9 6 6 6-6" />
               </svg>
-              <span>登录</span>
-            </NuxtLink>
+            </button>
 
-            <template v-else>
-              <NuxtLink
-                to="/settings"
-                class="max-w-[7.5rem] truncate rounded-lg border border-surface-border bg-surface px-2.5 py-1.5 text-xs font-medium text-ink-title transition-colors hover:border-surface-border-hover"
-                :title="user ? `@${user.handle}` : '已登录'"
-              >
-                {{ user ? `@${user.handle}` : "已登录" }}
-              </NuxtLink>
-
-              <!-- 配额：百分比 + 距重置时间（滚动窗口按注册时间网格锚定 → 重置时刻可预测）；
-                   低于 10% 用警示色，字段缺失则整块隐藏（重置字段缺失时只少"· x 小时后重置"半句） -->
-              <div
-                v-if="hasQuotaInfo"
-                class="hidden flex-col items-end gap-1 sm:flex"
-                :title="quotaTitle"
-              >
-                <div class="flex items-center gap-1.5 text-xs tabular-nums" :class="quotaToneClass">
-                  <span
-                    class="h-1.5 w-1.5 shrink-0 rounded-full"
-                    :class="isExceeded || isLowQuota ? 'bg-danger' : 'bg-primary'"
-                  ></span>
-                  <span>{{ quotaLabel }}</span>
-                  <span v-if="quotaResetHint" class="text-ink-muted">· {{ quotaResetHint }}</span>
+            <div
+              v-if="menuOpen"
+              role="menu"
+              aria-label="账号菜单"
+              class="absolute right-0 z-50 mt-2 w-60 overflow-hidden rounded-xl border border-surface-border bg-surface shadow-floating"
+            >
+              <!-- 额度（已登录且有数据时才有这一块）：百分比 + 距重置 -->
+              <div v-if="isLoggedIn && hasQuotaInfo" class="border-b border-surface-border px-3 py-2.5" :title="quotaTitle">
+                <div class="flex items-center justify-between gap-2 text-xs tabular-nums" :class="quotaToneClass">
+                  <span class="flex items-center gap-1.5">
+                    <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="isExceeded || isLowQuota ? 'bg-danger' : 'bg-primary'"></span>
+                    <span>{{ quotaLabel }}</span>
+                  </span>
+                  <span v-if="quotaResetHint" class="text-ink-muted">{{ quotaResetHint }}</span>
                 </div>
-                <div class="h-1 w-24 overflow-hidden rounded-full bg-canvas-subtle">
+                <div class="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-canvas-subtle">
                   <div
                     class="h-full rounded-full transition-all"
                     :class="isExceeded || isLowQuota ? 'bg-danger' : 'bg-primary'"
@@ -123,15 +90,66 @@
                 </div>
               </div>
 
+              <!-- 管理（仅管理员；原来平铺在顶栏，布局改造后收进菜单） -->
+              <NuxtLink
+                v-if="isAdmin"
+                to="/admin"
+                role="menuitem"
+                class="block px-3 py-2 text-xs font-medium text-ink-sub transition-colors hover:bg-canvas-subtle hover:text-ink-title"
+                @click="menuOpen = false"
+              >
+                管理后台
+              </NuxtLink>
+
+              <!-- 外链（未登录也在这里，不再平铺顶栏） -->
+              <a
+                href="https://transprism.chengxi.moe"
+                target="_blank"
+                rel="noopener noreferrer"
+                role="menuitem"
+                class="flex items-center justify-between px-3 py-2 text-xs font-medium text-ink-sub transition-colors hover:bg-canvas-subtle hover:text-ink-title"
+                @click="menuOpen = false"
+              >
+                <span>TransPrism</span>
+                <span class="text-ink-muted" aria-hidden="true">↗</span>
+              </a>
+              <a
+                href="https://transhelper.org"
+                target="_blank"
+                rel="noopener noreferrer"
+                role="menuitem"
+                class="flex items-center justify-between border-b border-surface-border px-3 py-2 text-xs font-medium text-ink-sub transition-colors hover:bg-canvas-subtle hover:text-ink-title"
+                @click="menuOpen = false"
+              >
+                <span>TransHelper</span>
+                <span class="text-ink-muted" aria-hidden="true">↗</span>
+              </a>
+
+              <!-- 退出（仅登录态） -->
               <button
+                v-if="isLoggedIn"
                 type="button"
-                class="rounded-lg border border-surface-border bg-surface px-2.5 py-1.5 text-xs font-medium text-ink-sub transition-colors hover:border-surface-border-hover hover:text-ink-title"
+                role="menuitem"
+                class="block w-full px-3 py-2 text-left text-xs font-medium text-ink-sub transition-colors hover:bg-canvas-subtle hover:text-danger"
                 @click="onLogout"
               >
-                退出
+                退出登录
               </button>
-            </template>
+            </div>
           </div>
+
+          <!-- 未登录：保留「登录」按钮（顶栏常驻的第三个元素） -->
+          <NuxtLink
+            v-if="!isLoggedIn"
+            to="/login"
+            class="inline-flex h-9 items-center gap-1.5 rounded-lg bg-primary px-3.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
+          >
+            <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+              <circle cx="12" cy="7" r="4" />
+            </svg>
+            <span>登录</span>
+          </NuxtLink>
 
           <!-- 深浅色主题切换按钮 -->
           <button
@@ -209,7 +227,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted } from "vue"
+import { computed, onBeforeUnmount, onMounted, ref } from "vue"
 import { useDarkMode } from "~/composables/useDarkMode"
 import { describeAuthError } from "~/composables/useAuth"
 import DisclaimerDialog from "~/components/DisclaimerDialog.vue"
@@ -232,6 +250,34 @@ const {
 } = useAuth()
 const { pushToast } = useToast()
 const route = useRoute()
+
+// ── 账号菜单（布局改造）：点击开合；Esc 与"点空白处"关闭 ──
+const menuOpen = ref(false)
+const menuRoot = ref<HTMLElement | null>(null)
+
+/** 头像里的首字母（handle 为空时退化为「我」） */
+const userInitial = computed(() => (user.value?.handle ?? "").trim().charAt(0).toUpperCase() || "我")
+
+function onDocPointerDown(ev: MouseEvent) {
+  if (!menuOpen.value) return
+  const root = menuRoot.value
+  if (root && ev.target instanceof Node && root.contains(ev.target)) return // 点在菜单内部 → 不关
+  menuOpen.value = false
+}
+function onDocKeydown(ev: KeyboardEvent) {
+  if (ev.key === "Escape" && menuOpen.value) menuOpen.value = false
+}
+
+onMounted(() => {
+  if (typeof window === "undefined") return
+  window.addEventListener("pointerdown", onDocPointerDown)
+  window.addEventListener("keydown", onDocKeydown)
+})
+onBeforeUnmount(() => {
+  if (typeof window === "undefined") return
+  window.removeEventListener("pointerdown", onDocPointerDown)
+  window.removeEventListener("keydown", onDocKeydown)
+})
 
 /** 顶栏配额文案：只出现百分比（绝不出现绝对 token 数） */
 const quotaLabel = computed(() => {
@@ -268,6 +314,7 @@ const quotaTitle = computed(() => {
 })
 
 function onLogout() {
+  menuOpen.value = false
   logout()
   pushToast("已退出登录", "info")
   if (route.path === "/settings" || route.path === "/admin") {

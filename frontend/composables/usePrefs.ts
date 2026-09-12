@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// TransHelper Prism — 检索偏好（tasks.md T3.6 /settings；plan-topk.md 增"返回条数"）
+// TransHelper Prism — 检索偏好（tasks.md T3.6 /settings；plan-topk.md 增"返回条数"；UI 布局改造增两个折叠状态）
 // 只存 localStorage（键 `prism_prefs`），不涉账号数据、不涉任何 key。
-// 覆盖：默认知识库 / 精准重排默认开 / AI 伴读默认开 / 返回条数（top_k）。
+// 覆盖：默认知识库 / 精准重排默认开 / AI 伴读默认开 / 返回条数（top_k）/ 高级面板展开 / 右侧要点卡收起。
 
 import { ALL_CORPUS_IDS } from "~/composables/useApi"
 
@@ -18,15 +18,25 @@ export interface PrismPrefs {
    */
   topK: number
   /**
+   * 搜索卡「高级」折叠区是否展开（返回条数 + 精准重排）。默认收起（false）。
+   */
+  advancedOpen: boolean
+  /**
+   * 右侧「本次检索要点」卡片是否收起（收起时只剩标题行）。默认展开（false = 不收起）。
+   */
+  aiCollapsed: boolean
+  /**
    * 偏好结构版本。
    * · v1（无该字段）/v2：曾把"未登录被夹到 5"或更早的默认 2 持久化下来（bug 产物）；
-   * · v3（当前）：迁移时把 <8 的历史值一次性提升到默认 10；**≥8 的值视为用户真实偏好并保留**。
+   * · v3：迁移时把 <8 的历史值一次性提升到默认 10；**≥8 的值视为用户真实偏好并保留**；
+   * · v4（当前）：只**新增** advancedOpen / aiCollapsed 两个布局字段，**不改动 topK 的任何迁移逻辑**
+   *   （迁移条件仍是 `storedVersion < 3`，见 sanitize）。
    */
   version: number
 }
 
-/** 当前偏好结构版本（<2 的历史数据会在 sanitize 里一次性修正） */
-export const PREFS_VERSION = 3
+/** 当前偏好结构版本（<3 的历史数据会在 sanitize 里一次性修正 topK；v4 只新增布局字段） */
+export const PREFS_VERSION = 4
 
 export const PREFS_KEY = "prism_prefs"
 
@@ -37,7 +47,15 @@ export const TOP_K_DEFAULT = 10
 export const TOP_K_ANON_MAX = 5
 
 export function defaultPrefs(): PrismPrefs {
-  return { corpora: [...ALL_CORPUS_IDS], reranker: true, llm: false, topK: TOP_K_DEFAULT, version: PREFS_VERSION }
+  return {
+    corpora: [...ALL_CORPUS_IDS],
+    reranker: true,
+    llm: false,
+    topK: TOP_K_DEFAULT,
+    advancedOpen: false, // 高级区默认收起（首屏只留知识库 + AI 开关）
+    aiCollapsed: false, // 要点卡默认展开
+    version: PREFS_VERSION,
+  }
 }
 
 /** 夹到 [1, 50] 的整数；非法 → 默认 10。 */
@@ -65,6 +83,9 @@ function sanitize(raw: unknown): PrismPrefs {
     reranker: typeof obj.reranker === "boolean" ? obj.reranker : base.reranker,
     llm: typeof obj.llm === "boolean" ? obj.llm : base.llm,
     topK,
+    // v4 新增的两个布局字段：老数据没有 → 取默认（不触发任何 topK 改写）
+    advancedOpen: typeof obj.advancedOpen === "boolean" ? obj.advancedOpen : base.advancedOpen,
+    aiCollapsed: typeof obj.aiCollapsed === "boolean" ? obj.aiCollapsed : base.aiCollapsed,
     version: PREFS_VERSION,
   }
 }

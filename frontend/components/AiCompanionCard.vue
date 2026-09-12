@@ -1,5 +1,6 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-<!-- TransHelper Prism — AI 伴读卡片（AiCompanionCard）
+<!-- TransHelper Prism — 「本次检索要点」卡片（AiCompanionCard；原「AI 伴读与要点总结」）
+     - **可收起**：header 右侧的 chevron 收起后整张卡只剩标题行（布局改造 2026-09-12），状态由父组件持久化
      - 流式渲染 POST /api/v1/search/stream 的增量文本（tasks.md T3.4）
      - 正文中的 `[来源n]` 渲染为可点击引用，点击回跳对应命中卡片
      - 追问面板：同一 session_id 多轮（桌面右栏 / 移动端结果上方） -->
@@ -16,7 +17,7 @@
           </svg>
         </div>
         <h3 class="text-sm font-semibold text-ink-title">
-          AI 伴读与要点总结
+          本次检索要点
         </h3>
         <span
           v-if="statusLabel"
@@ -27,7 +28,7 @@
         </span>
       </div>
       <div class="flex shrink-0 items-center gap-3">
-        <span v-if="model" class="max-w-[8rem] truncate font-mono text-xs text-ink-muted" :title="model">{{ model }}</span>
+        <span v-if="model && !collapsed" class="max-w-[8rem] truncate font-mono text-xs text-ink-muted" :title="model">{{ model }}</span>
         <!-- 主开关：AI 伴读唯一入口（搜索面板那边只做被动状态展示） -->
         <ToggleMini
           :model-value="active"
@@ -35,9 +36,33 @@
           hide-label
           @update:model-value="(v: boolean) => emit('update:enabled', v)"
         />
+        <!-- 收起/展开：收起后整张卡只剩这一行标题（状态由父组件写进 usePrefs.aiCollapsed 持久化） -->
+        <button
+          type="button"
+          class="flex h-6 w-6 items-center justify-center rounded-md text-ink-muted transition-colors hover:bg-canvas-subtle hover:text-ink-title"
+          :aria-label="collapsed ? '展开要点' : '收起要点'"
+          :aria-expanded="!collapsed"
+          aria-controls="prism-ai-body"
+          @click="emit('update:collapsed', !collapsed)"
+        >
+          <svg
+            class="h-3.5 w-3.5 transition-transform"
+            :class="collapsed ? '' : 'rotate-180'"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="m6 9 6 6 6-6" />
+          </svg>
+        </button>
       </div>
     </div>
 
+    <div v-show="!collapsed" id="prism-ai-body">
     <!-- 未出结果前：**整张卡只剩一行**——标题 + 状态 + 右上开关（用户反馈 #3）。
          说明与额度提示都不在这里，等检索完成后再随正文一起展开，避免首屏堆文字。 -->
 
@@ -123,6 +148,7 @@
         </label>
       </div>
     </slot>
+    </div><!-- /v-show 主体 -->
   </div>
 </template>
 
@@ -148,6 +174,8 @@ const props = defineProps<{
    * 加这个 prop 之前，卡片只按 `status` 判断"未开启"，导致开关已开、卡片仍显示未开启（截图反馈 #1）。
    */
   enabled?: boolean
+  /** 是否收起（收起 = 只留标题行）；状态由父组件持久化在 usePrefs.aiCollapsed */
+  collapsed?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -155,6 +183,8 @@ const emit = defineEmits<{
   (e: "followup", question: string): void
   /** 卡片内的主开关（开启仍需父组件走二次确认） */
   (e: "update:enabled", v: boolean): void
+  /** 收起/展开（父组件负责持久化） */
+  (e: "update:collapsed", v: boolean): void
 }>()
 
 const question = ref("")

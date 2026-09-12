@@ -2,7 +2,8 @@
 <!-- TransHelper Prism — 搜索结果卡片（HitCard）
      - 人文与专业并重，层次分明的卡片阅览体验
      - 统一中性知识库徽章（彻底去除四个彩色），清晰自然的中文信息排版
-     - 明确的重点与高可读性 Markdown 摘要 -->
+     - **摘要默认折叠 4 行**（line-clamp），点「展开全文」看完整片段与底部操作行（布局改造 2026-09-12）
+     - `id="hit-<id>"` 是 AI 引用回跳的锚点，**必须保留** -->
 <template>
   <article
     :id="`hit-${hit.id}`"
@@ -53,16 +54,43 @@
       </a>
     </h3>
 
-    <!-- 原文片段 -->
+    <!-- 原文片段：默认只显示 4 行（line-clamp-4，Tailwind 3.4 内置），点标题行右侧的「展开全文」看完整片段 -->
     <div
       v-if="richSnippet"
+      :id="`hit-snippet-${hit.id}`"
       class="snippet-reading mt-3 rounded-lg bg-canvas-subtle/60 p-3.5"
+      :class="expanded ? '' : 'line-clamp-4'"
       v-html="richSnippet"
     />
     <p v-else class="mt-2 text-xs text-ink-muted">暂无提取正文</p>
 
-    <!-- 卡片底部：文档查阅操作 -->
-    <div class="mt-4 flex items-center justify-between border-t border-surface-border pt-3 text-xs">
+    <!-- 展开 / 收起（摘要够长时才出现，避免短摘要上挂一个死按钮） -->
+    <button
+      v-if="canExpand"
+      type="button"
+      class="mt-2 inline-flex items-center gap-1 text-xs font-medium text-primary transition-colors hover:text-primary-hover hover:underline"
+      :aria-expanded="expanded"
+      :aria-controls="`hit-snippet-${hit.id}`"
+      @click="expanded = !expanded"
+    >
+      <span>{{ expanded ? "收起" : "展开全文" }}</span>
+      <svg
+        class="h-3 w-3 transition-transform"
+        :class="expanded ? 'rotate-180' : ''"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        aria-hidden="true"
+      >
+        <path d="m6 9 6 6 6-6" />
+      </svg>
+    </button>
+
+    <!-- 卡片底部：文档查阅操作（展开全文后出现） -->
+    <div v-if="expanded" class="mt-4 flex items-center justify-between border-t border-surface-border pt-3 text-xs">
       <span class="font-mono text-[11px] text-ink-muted">
         编号 #{{ hit.id.slice(0, 8) }}
       </span>
@@ -81,7 +109,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from "vue"
+import { computed, ref } from "vue"
 import type { SearchHit } from "~/composables/useApi"
 import { renderSnippetMarkdown, stripMarkdown } from "~/utils/renderSnippet"
 
@@ -90,6 +118,18 @@ const props = defineProps<{
   query?: string
   highlight?: boolean
 }>()
+
+/**
+ * 摘要折叠状态（默认折叠为 4 行）。
+ * **判定"要不要给展开按钮"用纯文本长度**（不用 offsetHeight 量 DOM）：
+ * 逐条渲染时量 DOM 会触发同步布局（几十条结果 = 几十次 reflow），且首屏 SSR 量不到。
+ * 阈值 120 字符 ≈ 4 行的中文排布（每行约 30 字），短摘要就不显示这个按钮。
+ */
+const SNIPPET_EXPAND_MIN_CHARS = 120
+const expanded = ref(false)
+
+const plainSnippet = computed(() => stripMarkdown(props.hit.snippet ?? "").trim())
+const canExpand = computed(() => plainSnippet.value.length > SNIPPET_EXPAND_MIN_CHARS)
 
 const plainTitle = computed(() => stripMarkdown(props.hit.title ?? "") || "未命名文档")
 const richSnippet = computed(() => renderSnippetMarkdown(props.hit.snippet ?? "", props.query ?? ""))
