@@ -64,8 +64,8 @@
     //   > HARD → 匿名 429（登录用户不受影响）
     // ⚠️ 两者**不能设成同值**：硬熔断先扣名额，软熔断要 count > SOFT 才降级，
     //    同值会让"优雅降级带"消失、超限直接全站匿名 429（比现在更硬）。
-    "ANON_GLOBAL_PER_MIN": "3",   // ⚠️ 临时压到 3 用于验证熔断路径，验完立刻改回 300
-    "ANON_GLOBAL_HARD_PER_MIN": "6",   // ⚠️ 临时 6，验完改回 600
+    "ANON_GLOBAL_PER_MIN": "300",
+    "ANON_GLOBAL_HARD_PER_MIN": "600",
     "LLM_MODEL": "Qwen/Qwen3.5-4B",
     "LLM_ENDPOINT": "https://api.siliconflow.cn/v1/chat/completions",
     "LLM_TIMEOUT_MS": "20000",
