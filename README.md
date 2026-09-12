@@ -7,7 +7,7 @@
 [![ingest](https://github.com/daanser/Trans_Helper_Prism/actions/workflows/ingest.yml/badge.svg)](https://github.com/daanser/Trans_Helper_Prism/actions/workflows/ingest.yml)
 [![watchdog](https://github.com/daanser/Trans_Helper_Prism/actions/workflows/watchdog.yml/badge.svg)](https://github.com/daanser/Trans_Helper_Prism/actions/workflows/watchdog.yml)
 
-- **线上站点**：<https://search.chengxi.moe>（冗余域名 <https://search.transhelper.org>）
+- **线上站点**：<https://search.chengxi.moe>，<https://search.transhelper.org>
 - **浏览器访问的一切都在自有域名下**：`/api/*` 由 Pages Function 同源反代到 Worker（`*.workers.dev` 在墙内被拦，仅用于服务端内部调用）
 - **使用说明与免责**：<https://search.chengxi.moe/about>
 - **许可证**：[GPL-3.0-or-later](./LICENSE)
