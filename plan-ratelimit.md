@@ -480,6 +480,10 @@ window_start = registration_time + floor((now - registration_time) / window_ms) 
 4. **熔断**：全局软熔断触发后匿名只拿到关键词回退（上游 embedding 调用量为 0）；硬熔断后匿名 429、登录用户仍可用。
 5. **边缘规则**：命中期间 Worker 请求量下降（可用 CF 分析或 Worker 日志验证）。
 6. **重置可预测**：给定注册时间，`reset_at` 与手算网格一致；跨窗口后 `used_tokens` 归零。
+6b. **✅ 全局熔断实测（2026-09-11，首次真触发）**：把阈值临时压到 软 3 / 硬 6 后连打 9 次匿名请求 ——
+   `#1–3` 200 正常；`#4–6` **200 + `fallback:true` + `warning: global-soft-break`**（降级关键词回退，不调 embedding/rerank）；
+   `#7–9` **429 `scope: global-hard`**。验完已改回 **软 300 / 硬 600**（线上 `/admin/ratelimit` 确认 `soft=300 hard=600 state=normal`）。
+6c. **✅ 突发层实测**：25 并发 → 第 21 次 `scope=burst`、随后 `scope=blocked`（`Retry-After`≈60），见 `TODO.md` 记录。
 7. 全量测试与 `tsc --noEmit` 保持全绿（当前基线 404 用例）。
 
 ---
