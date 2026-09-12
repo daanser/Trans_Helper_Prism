@@ -22,7 +22,7 @@
           type="text"
           :disabled="loading"
           enterkeyhint="search"
-          placeholder="搜索药物剂量、证件变更流程、嗓音训练、心理评估等…"
+          placeholder="搜索关键词…"
           class="w-full rounded-xl border border-slate-200 bg-slate-50/70 py-3.5 pl-11 pr-10 text-sm text-slate-900 placeholder:text-slate-400 transition-all focus:border-blue-600 focus:bg-white focus:outline-none focus:ring-4 focus:ring-blue-500/15 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:focus:border-blue-500"
           @keydown.enter="submit"
         />
