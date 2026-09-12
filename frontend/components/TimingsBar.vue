@@ -40,9 +40,10 @@
       </template>
     </span>
 
+    <!-- 命中缓存：**弱样式徽章**（中性描边 + 小一号字，不再用绿色实底抢视线 —— 截图反馈 #4） -->
     <span
       v-if="timings.cached"
-      class="ml-1.5 inline-flex items-center rounded-md bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300"
+      class="ml-1 inline-flex items-center rounded border border-surface-border bg-canvas-subtle px-1.5 py-0.5 text-[10px] font-normal text-ink-muted"
     >
       命中缓存
     </span>

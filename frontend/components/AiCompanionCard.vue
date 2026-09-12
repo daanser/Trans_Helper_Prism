@@ -16,7 +16,7 @@
             <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
           </svg>
         </div>
-        <h3 class="text-sm font-semibold text-ink-title">
+        <h3 class="truncate text-sm font-semibold text-ink-title">
           本次检索要点
         </h3>
         <span
@@ -28,7 +28,6 @@
         </span>
       </div>
       <div class="flex shrink-0 items-center gap-3">
-        <span v-if="model && !collapsed" class="max-w-[8rem] truncate font-mono text-xs text-ink-muted" :title="model">{{ model }}</span>
         <!-- 主开关：AI 伴读唯一入口（搜索面板那边只做被动状态展示） -->
         <ToggleMini
           :model-value="active"
@@ -63,6 +62,9 @@
     </div>
 
     <div v-show="!collapsed" id="prism-ai-body">
+    <!-- 模型名：**放进可折叠主体**（截图反馈 #5：header 里它把标题挤换行了）。
+         弱样式小字，收起时随主体一起隐藏。 -->
+    <p v-if="model" class="mb-2 truncate font-mono text-[10px] text-ink-muted" :title="model">模型：{{ model }}</p>
     <!-- 未出结果前：**整张卡只剩一行**——标题 + 状态 + 右上开关（用户反馈 #3）。
          说明与额度提示都不在这里，等检索完成后再随正文一起展开，避免首屏堆文字。 -->
 
@@ -230,7 +232,13 @@ const renderedAnswer = computed(() => renderAnswer(props.answer))
 // 消息区自己滚（`overflow-y-auto` + CSS `overscroll-behavior: contain`，容器上见模板类名），
 // 并且**只在用户贴着底部时才自动跟随**；用户往上翻读历史时绝不把他拽回去。
 const scrollEl = ref<HTMLElement | null>(null)
-const stickToBottom = ref(true)
+/**
+ * 是否跟随底部。
+ * **默认 false（贴顶）**：要点总结必须从第一条读起 —— 之前默认跟随底部，长总结一进来
+ * 视窗就停在末尾，"第一条"被滚出可视区（截图反馈 #3：看起来像被标题挡住）。
+ * 只有用户自己滚到底部时才跟随（`onAnswerScroll`），此时新到达的文字才会自动续上。
+ */
+const stickToBottom = ref(false)
 /** 距底部小于该值视为「贴着底部」 */
 const BOTTOM_EPS = 48
 
@@ -246,17 +254,48 @@ function scrollToBottom(smooth = false) {
   el.scrollTo({ top: el.scrollHeight, behavior: smooth ? "smooth" : "auto" })
 }
 
+/** 回到顶部（新一轮生成开始时调用：保证第一条要点完整可见） */
+function scrollToTop() {
+  const el = scrollEl.value
+  if (!el) return
+  el.scrollTo({ top: 0, behavior: "auto" })
+}
+
 watch(
   () => props.answer,
-  async () => {
+  async (now, was) => {
+    const prev = was ?? ""
+    // 新一份要点（不是上一份的续写）→ 解除跟随并回到顶部：保证第一条完整可见
+    const isContinuation = prev.length > 0 && typeof now === "string" && now.startsWith(prev)
+    if (!isContinuation) {
+      stickToBottom.value = false
+      await nextTick()
+      scrollToTop()
+      return
+    }
+    // 同一份要点的流式续写：只在用户已经贴着底部时才跟随（不把他从第一条拽走）
     if (!stickToBottom.value) return
     await nextTick()
     scrollToBottom()
   },
 )
 
+// 新一轮生成开始（streaming false→true）→ 解除跟随并回到顶部：
+// 这一轮的要点从第一条开始读，而不是停在上一轮的滚动位置。
+watch(
+  () => props.streaming,
+  async (now, was) => {
+    if (now && !was) {
+      stickToBottom.value = false
+      await nextTick()
+      scrollToTop()
+    }
+  },
+)
+
 onMounted(() => {
-  if (props.answer) scrollToBottom()
+  // 刻意**不**自动滚到底：首次进来停在顶部（第一条完整可见）
+  scrollToTop()
 })
 
 /** 引用按钮走**事件委托**（v-html 内容无法绑 Vue 事件），点击回跳命中卡片。 */

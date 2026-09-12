@@ -111,7 +111,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue"
 import type { SearchHit } from "~/composables/useApi"
-import { renderSnippetMarkdown, stripMarkdown } from "~/utils/renderSnippet"
+import { SNIPPET_COLLAPSE_CHARS, renderSnippetMarkdown, stripLeadingTitle, stripMarkdown, truncateAtBoundary } from "~/utils/renderSnippet"
 
 const props = defineProps<{
   hit: SearchHit
@@ -120,19 +120,30 @@ const props = defineProps<{
 }>()
 
 /**
- * 摘要折叠状态（默认折叠为 4 行）。
+ * 摘要折叠状态（默认折叠）。
  * **判定"要不要给展开按钮"用纯文本长度**（不用 offsetHeight 量 DOM）：
  * 逐条渲染时量 DOM 会触发同步布局（几十条结果 = 几十次 reflow），且首屏 SSR 量不到。
- * 阈值 120 字符 ≈ 4 行的中文排布（每行约 30 字），短摘要就不显示这个按钮。
  */
-const SNIPPET_EXPAND_MIN_CHARS = 120
 const expanded = ref(false)
 
-const plainSnippet = computed(() => stripMarkdown(props.hit.snippet ?? "").trim())
-const canExpand = computed(() => plainSnippet.value.length > SNIPPET_EXPAND_MIN_CHARS)
-
 const plainTitle = computed(() => stripMarkdown(props.hit.title ?? "") || "未命名文档")
-const richSnippet = computed(() => renderSnippetMarkdown(props.hit.snippet ?? "", props.query ?? ""))
+
+/**
+ * 摘要原文：**去掉开头与标题重复的那一行**（截图反馈 #1：卡片已有大标题，
+ * 摘要第一行又是同一个标题 —— wiki 的 chunk 常以页面标题开头）。
+ */
+const snippetSource = computed(() => stripLeadingTitle(props.hit.snippet ?? "", plainTitle.value))
+
+/** 折叠态在句末标点处截断（截图反馈 #2：不要从《性别鉴定证…》中间断开） */
+const collapsedSource = computed(() => truncateAtBoundary(snippetSource.value, SNIPPET_COLLAPSE_CHARS))
+
+const plainSnippet = computed(() => stripMarkdown(snippetSource.value).trim())
+/** 只有"完整摘要确实比折叠版长"时才给展开按钮（避免短摘要挂一个死按钮） */
+const canExpand = computed(() => plainSnippet.value.length > collapsedSource.value.length)
+
+const richSnippet = computed(() =>
+  renderSnippetMarkdown(expanded.value ? snippetSource.value : collapsedSource.value, props.query ?? ""),
+)
 
 const pct = computed(() => Math.max(0, Math.min(100, (props.hit.rerank_score ?? props.hit.score ?? 0) * 100)))
 const pctText = computed(() => pct.value.toFixed(1) + "%")

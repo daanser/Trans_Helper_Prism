@@ -288,6 +288,138 @@ export function renderSnippetMarkdown(src: string, query = ""): string {
 /**
  * 剥离 markdown 修饰得到纯文本（用于标题等纯文本插值场景，Vue 会自动转义）。
  */
+// ─────────────────────────────────────────────────────────────────────────────
+// 折叠摘要用的纯文本处理（布局改造 2026-09-12）
+//   · `stripLeadingTitle()`：结果卡的摘要常常以"页面标题"开头，而卡片已有一行大标题
+//     → 去掉摘要开头与标题重复的那一行，避免"标题下再来一遍同一行标题"。
+//   · `truncateAtBoundary()`：折叠态在**句末标点（或逗号）处**截断，并且**绝不从《…》等
+//     成对符号中间断开**（截图反馈："《性别鉴定证…" 被腰斩）。
+//   · 两者都只处理纯文本，**不产出任何工具类**（tailwind content globs 不含 utils/）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 折叠态摘要的目标长度。
+ * 取 120：窄屏（≈30 字/行）刚好 4 行、桌面（≈40 字/行）约 3 行 —— 都落在"2–4 行"内，
+ * 因此容器上的 `line-clamp-4` 只是**兜底安全网**，正常不会再去腰斩一次文本。
+ */
+export const SNIPPET_COLLAPSE_CHARS = 120
+
+/**
+ * 去掉摘要开头与卡片标题重复的行（只处理**开头区域**的重复，正文中间的同名小节不动）。
+ *
+ * 逐行比对时两边都先 `stripMarkdown`，因此 `# 申请材料争议` 与标题 `申请材料争议` 视为同一行。
+ * ⚠️ 必须**跨空行**继续扫描：wiki chunk 的实际形状是
+ *   `# 标题` ⟨空行⟩ `标题` ⟨空行⟩ 正文
+ * —— 只在第一行判定会留下第二行的同名标题（实测过：标题在卡片里出现两遍）。
+ */
+export function stripLeadingTitle(rawSnippet: string, title: string): string {
+  const wanted = stripMarkdown(title)
+  if (!rawSnippet || !wanted) return rawSnippet
+  const lines = rawSnippet.replace(/\r\n?/g, "\n").split("\n")
+  const kept: string[] = []
+  let dropped = 0
+  let scanning = true // 仍处于"开头区域"（遇到真正的正文行就停止判定）
+  for (const line of lines) {
+    if (!scanning) {
+      kept.push(line)
+      continue
+    }
+    const trimmed = line.trim()
+    if (trimmed === "" || SHORTCODE_LINE.test(trimmed)) {
+      kept.push(line) // 空行/短码行先留着；若真丢了标题，末尾再清掉开头空行
+      continue
+    }
+    if (dropped < 2 && stripMarkdown(line) === wanted) {
+      dropped++ // 与卡片标题重复 → 丢掉（最多两行：`# 标题` + 裸标题）
+      continue
+    }
+    scanning = false
+    kept.push(line)
+  }
+  if (dropped === 0) return rawSnippet
+  while (kept.length > 0 && kept[0].trim() === "") kept.shift() // 清掉因丢行留下的开头空行
+  return kept.join("\n").trim()
+}
+
+/** 成对符号（截断点落在这类符号内部时，退回到开符号之前） */
+const PAIRS: ReadonlyArray<readonly [string, string]> = [
+  ["《", "》"],
+  ["〈", "〉"],
+  ["「", "」"],
+  ["『", "』"],
+  ["“", "”"],
+  ["‘", "’"],
+  ["（", "）"],
+  ["(", ")"],
+  ["【", "】"],
+  ["[", "]"],
+  ["`", "`"],
+]
+
+/** 把截断点往后挪到成对符号之外（未闭合 → 退回到该开符号之前） */
+function avoidUnclosedPairs(text: string, cut: number): number {
+  let end = cut
+  for (let pass = 0; pass < 8; pass++) {
+    const head = text.slice(0, end)
+    let moved = false
+    for (const [open, close] of PAIRS) {
+      const opens = head.split(open).length - 1
+      const closes = head.split(close).length - 1
+      if (opens > closes) {
+        const lastOpen = head.lastIndexOf(open)
+        if (lastOpen > 0) {
+          end = lastOpen
+          moved = true
+        }
+      }
+    }
+    // markdown 加粗：奇数个 `**` 表示落在加粗内部 → 退回到最后一处 `**`
+    const bold = (head.match(/\*\*/g) ?? []).length
+    if (bold % 2 === 1) {
+      const lastBold = head.lastIndexOf("**")
+      if (lastBold > 0) {
+        end = lastBold
+        moved = true
+      }
+    }
+    if (!moved) break
+  }
+  return end
+}
+
+/**
+ * 在句末标点（。！？…；）处截断；找不到就退而求其次在逗号（，、,）处截断（**不含逗号本身**）；
+ * 再找不到就在最后一个空格处截断；都不行才硬截到 maxChars。
+ * 最后再保证不落在成对符号内部。
+ */
+export function truncateAtBoundary(raw: string, maxChars = SNIPPET_COLLAPSE_CHARS): string {
+  const text = (raw ?? "").replace(/\r\n?/g, "\n").trim()
+  if (text.length <= maxChars) return text
+  const head = text.slice(0, maxChars)
+
+  let cut = 0
+  // ① 句末标点：连标点一起保留
+  for (const mark of ["。", "！", "？", "…", "；", "!", "?", ";"]) {
+    const at = head.lastIndexOf(mark)
+    if (at + 1 > cut) cut = at + 1
+  }
+  // ② 逗号/顿号：**丢掉逗号本身**（以「，」结尾读起来像没写完）
+  if (cut === 0) {
+    for (const mark of ["，", "、", ",", "："]) {
+      const at = head.lastIndexOf(mark)
+      if (at > cut) cut = at
+    }
+  }
+  // ③ 空白
+  if (cut === 0) cut = head.lastIndexOf(" ")
+  // ④ 兜底硬截
+  if (cut <= 0) cut = head.length
+
+  cut = avoidUnclosedPairs(text, cut)
+  const out = text.slice(0, cut).trimEnd()
+  return out.length > 0 ? out : text.slice(0, maxChars)
+}
+
 export function stripMarkdown(src: string): string {
   if (!src) return ""
   return src
