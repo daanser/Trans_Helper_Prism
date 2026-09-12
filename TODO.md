@@ -164,29 +164,21 @@ _最后更新：2026-09-09_
 改完告诉我 → 我验证 `/admin/keys` 各池 `configured=2` → watchdog ④ 转绿 → **并补做 W6 里唯一没做成的演练：真·自动换 key**
 （下架 `llm-key-0`，看它自动切到 `llm-key-1` 而不是降级）。
 
-### 1. key 管理方式要改 —— **⏸ 半成品已停在分支 `wip/keypool-refactor`**（2026-09-12）
-**设计稿：[`plan-keypool.md`](./plan-keypool.md)**（已按"不留兼容、激进"定稿：只认 `POOL_KEYS_<n>`，旧三个变量全删）
-**为什么停下**：用户出门前要求"超 5 分钟就停"。中断时进度 ≈ 50%：
-- ✅ 已改：`src/keypool.ts`（前缀扫描 + `pool-key-<n>` ref + 单池）、`types.ts`、`keyadmin.ts`、`embeddings.ts`、`llm.ts`、`rerank.ts`、`index.ts`
-- ❌ 未改：**13 个测试文件只改了 1 个**、3 个脚本（`ingest-incremental` / `one-shot-import` / `bench_search`）、2 个 workflow（`ingest.yml` / `watchdog.yml`）、`plan-keypool.md` 状态行
-**续做方式**：`git checkout wip/keypool-refactor` → 把剩余的跑完 → 复验（tsc + 640+ 全绿）→ 部署
-**⚠️ 部署顺序（务必遵守）**：新代码上线的**同时/之前**，CF 里必须已有 `POOL_KEYS_0` / `POOL_KEYS_1`，
-否则上游 0 把 key → 检索降级为关键词回退、AI 不可用（不崩，但是降级）。
-**当前状态：线上跑的还是旧代码 → CF 里的 `EMBED_POOL_KEYS`/`LLM_POOL_KEYS` 还不能删。**
-已就绪：`backend-cf/.dev.vars` 同时写了新旧变量名；GitHub Secrets 已建 `POOL_KEYS_0`/`POOL_KEYS_1`（`EMBED_POOL_KEYS` 待 workflow 改完后再删）。
-**现状痛点**：`EMBED_POOL_KEYS` / `LLM_POOL_KEYS` 是 CF Secret，**写入后不可读回** →
-每加一把 key 都要把整串重打一遍，加第 5 把时很容易出错。
+### 1. key 管理方式改造 —— ✅ **代码已实施并部署（2026-09-12）**，⏳ **只差你在 CF 加两个变量**
 
-**方案 A（推荐，成本最低）**：支持**按前缀扫描多个 env**——
-代码把 `env` 里匹配 `^(EMBED|LLM|RERANK)_POOL_KEYS(_\d+)?$` 的变量全部收集起来拼成池。
-- 加一把 key = 新建一个 `EMBED_POOL_KEYS_2` 密钥（**不用重打已有的**）
-- 轮换/删除 = 只动那一个变量
-- 无新表、无加密、约 1–2 小时
+**已上线**（commit `0ee92ea`，649 用例全绿 / tsc 0 错）：
+- 只认 `POOL_KEYS_<n>`（前缀扫描、数字升序、不要求连续）；**ref = `pool-key-<n>` 由变量名派生** →
+  修掉旧实现按位置生成 ref（删中间一把会移位，而禁用集/`provider_keys` 按 ref 记录）的隐患
+- 对外**单池 `keys`**；`pickKey(embed|llm|rerank)` 三入口共享同一份 key → `key_usage.pool` **仍按能力记录**（分能力统计没丢）
+- **禁用一把 key = 全能力禁用**；顺带修掉 `applyDenied` 逐个能力写入互相清空的真 bug
+- **负载均衡**：并列时按 **LRU**（旧实现并列恒选第一把 → 顺序请求全打 key#1）
+- 旧三变量（`EMBED_/LLM_/RERANK_POOL_KEYS`）**彻底删除**、无兼容代码；GitHub Secret `EMBED_POOL_KEYS` 已删
 
-**方案 B（终态，可选）**：key 密文存 D1（AES-GCM，主密钥放 CF Secret，与"用户自定义模型"同一套做法），
-`POST /admin/keys` 直接收明文 key 入库 → **加/删/轮换全在管理端完成，完全不碰控制台**。
-- 代价：密钥材料进 D1（加密），多一层主密钥管理；需内存缓存避免每次选 key 都读 D1
-- 建议：key 数量长到 5+ 把再做
+**⏳ 待你**：CF 控制台 → `transhelper-prism-backend` → Settings → Variables and Secrets → **新增**
+`POOL_KEYS_0`（第一把）与 `POOL_KEYS_1`（第二把，另一个账号）。
+**在加之前，线上处于降级态**（实测 `hits=10 但 fallback=true / warning=embedding-unavailable`：关键词回退可用、AI 不可用、无重排）。
+
+**加完后我会验**：`/admin/keys` 显示 `pool=keys configured=2` → 真实检索恢复向量、AI 恢复 → watchdog ④ 转绿 → 补做 W6 缺失的 **真·自动换 key 演练**。
 
 ### 2. 多 key 要做负载均衡（**现状确实没做**）
 **实测代码事实**：`pickKey()` 的排序是 `inFlightCount ↑`，并列时 `cooldownUntil ↑`；
