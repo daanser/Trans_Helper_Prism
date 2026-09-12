@@ -98,9 +98,9 @@
         </div>
       </div>
 
-      <!-- 第二行：**检索参数**（返回条数 + 精准重排）—— 只保留"数量"与"排序"两类设置。
-           「AI 伴读」属于"生成"，主开关在右侧卡片；这里**只做被动状态展示**，
-           杜绝同一功能两处开关不同步（截图反馈 #1 / #6）。 -->
+      <!-- 第二行：**只放检索参数**（返回条数 + 精准重排）。
+           「AI 伴读」属于生成类，**整个搜索区都不再出现它的开关或徽章** ——
+           唯一主开关在右侧卡片；结果区只以一行文字提示"已生成要点"，不产生"这里也能开"的误解。 -->
       <div class="flex flex-wrap items-center gap-x-6 gap-y-3">
         <!-- 返回条数（plan-topk.md §3.4）：登录 1–50；未登录只允许 1–5，并提示登录后可用 50 -->
         <div class="flex items-center gap-2">
@@ -126,14 +126,6 @@
         </div>
 
         <ToggleMini v-model="useReranker" label="精准重排" hint="已激活 BAAI/bge-reranker-v2-m3 二次重排序" />
-
-        <!-- AI 伴读：被动状态（不可交互）→ 唯一主开关在右侧「AI 伴读与要点总结」卡片里 -->
-        <span
-          v-if="useLlm"
-          class="inline-flex items-center gap-1.5 rounded-lg bg-primary-subtle px-2 py-1 text-xs font-medium text-primary"
-        >
-          <span class="h-1.5 w-1.5 rounded-full bg-primary"></span>AI 伴读已开启
-        </span>
       </div>
     </div>
 
@@ -183,13 +175,10 @@ const searchInput = ref<HTMLInputElement | null>(null)
 const selectedCorpora = ref<string[]>(["mtf-wiki", "ftm-wiki", "rle-wiki", "miomtfwiki"])
 const useReranker = ref(true)
 
-/** 一行短提示：只在开了"会多耗额度"的功能时出现（命名统一为「精准重排」） */
-const costHint = computed(() => {
-  const parts: string[] = []
-  if (useReranker.value) parts.push("精准重排会把更相关的结果提前，可能多消耗额度")
-  if (props.useLlm) parts.push("AI 伴读会在右侧卡片生成要点总结，每次总结与追问都消耗额度")
-  return parts.length ? parts.join("；") + "。" : ""
-})
+/** 一句短提示：只在开了精准重排时出现；**不重复讲 AI 伴读的额度**（那些细节归右侧卡片） */
+const costHint = computed(() =>
+  useReranker.value ? "精准重排会优先展示更相关的结果，可能额外消耗额度。" : "",
+)
 const corporaOptions: CorpusOption[] = DEFAULT_CORPORA_OPTIONS
 
 /**
@@ -198,8 +187,20 @@ const corporaOptions: CorpusOption[] = DEFAULT_CORPORA_OPTIONS
  * 挂载后再按"登录态 + 本地偏好"校正（登录用户恢复自己存的值）。
  */
 const topK = ref<number>(Math.min(TOP_K_ANON_MAX, TOP_K_DEFAULT))
+/**
+ * **用户偏好值**（设置/本地存储里的那条），与"当前上限内的显示值"分开存。
+ * 为什么必须分开：`onMounted` 时登录态往往还没加载（`topKMax=5`），若直接
+ * `topK = min(topKMax, 偏好)` 就会被压到 5，而登录态变化时只做"夹取"不会升回来 ——
+ * 结果登录用户永远停在 5 条（实测反馈 #4）。
+ */
+const preferredTopK = ref<number>(TOP_K_DEFAULT)
 const topKMax = computed(() => (props.loggedIn ? TOP_K_MAX : TOP_K_ANON_MAX))
 const topKHintId = "prism-topk-hint"
+
+/** 按当前上限把偏好值投射到显示值（登录 → 恢复偏好；登出 → 夹到 5） */
+function syncTopKFromPreferred() {
+  topK.value = Math.min(topKMax.value, Math.max(TOP_K_MIN, Math.round(preferredTopK.value)))
+}
 
 /** 输入框失焦/回车后归一：夹到 [1, topKMax] 的整数（手输 999 不会静默发出去） */
 /** 只夹取、**不写偏好**（登录态变化/失焦/提交前调用：这些都不是"用户表达偏好"） */
@@ -213,6 +214,7 @@ function normalizeTopK() {
  */
 function onTopKChange() {
   normalizeTopK()
+  preferredTopK.value = topK.value
   if (prefs.value.topK !== topK.value) savePrefs({ topK: topK.value })
 }
 
@@ -256,13 +258,14 @@ onMounted(() => {
   const saved = loadPrefs()
   selectedCorpora.value = [...saved.corpora]
   useReranker.value = saved.reranker
-  topK.value = Math.min(topKMax.value, clampTopK(saved.topK))
+  preferredTopK.value = clampTopK(saved.topK)
+  syncTopKFromPreferred()
 })
 
 // 登录态变化（登录/登出）后重新夹取：未登录时必须回到 ≤5，避免把 50 发出去被后端夹
 watch(
   () => props.loggedIn,
-  () => normalizeTopK(),
+  () => syncTopKFromPreferred(),
 )
 
 defineExpose({

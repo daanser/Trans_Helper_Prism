@@ -18,14 +18,15 @@ export interface PrismPrefs {
    */
   topK: number
   /**
-   * 偏好结构版本。v1（无该字段）曾把"未登录被夹到 5"或用户手输的过小值持久化下来
-   * （实测有人停在 2 条）→ v2 起做一次性修正：旧版本一律回到默认 10。
+   * 偏好结构版本。
+   * · v1（无该字段）/v2：曾把"未登录被夹到 5"或更早的默认 2 持久化下来（bug 产物）；
+   * · v3（当前）：迁移时把 <8 的历史值一次性提升到默认 10；**≥8 的值视为用户真实偏好并保留**。
    */
   version: number
 }
 
 /** 当前偏好结构版本（<2 的历史数据会在 sanitize 里一次性修正） */
-export const PREFS_VERSION = 2
+export const PREFS_VERSION = 3
 
 export const PREFS_KEY = "prism_prefs"
 
@@ -54,9 +55,11 @@ function sanitize(raw: unknown): PrismPrefs {
     ? obj.corpora.filter((c): c is string => typeof c === "string" && ALL_CORPUS_IDS.includes(c))
     : []
   const storedVersion = typeof obj.version === "number" ? obj.version : 0
-  // v1 及更早（无版本号）：topK 可能残留过小值（实测 2 条）→ 一次性提升到默认 10；
-  // 之后用户再手动改小就是他的明确选择，不再干预。
-  const topK = storedVersion < PREFS_VERSION ? base.topK : obj.topK === undefined ? base.topK : clampTopK(obj.topK)
+  const storedTopK = obj.topK === undefined ? base.topK : clampTopK(obj.topK)
+  // 迁移历史：v1（无版本号）与 v2 都曾被"匿名上限夹取"或旧默认污染过 topK（实测残留 2 与 5）。
+  // 这类值不是用户的明确选择、而是 bug 产物 → 一次性提升到默认 10；
+  // **≥8 的值视为用户真实偏好，一律保留**（例如有人就想要 20 条）。
+  const topK = storedVersion < 3 && storedTopK < 8 ? base.topK : storedTopK
   return {
     corpora: corpora.length ? corpora : base.corpora,
     reranker: typeof obj.reranker === "boolean" ? obj.reranker : base.reranker,

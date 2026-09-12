@@ -212,6 +212,10 @@
             <TimingsBar :timings="resultsTimings" />
             <span class="text-xs text-ink-muted">
               共返回 <b class="font-medium text-ink-title">{{ results.length }}</b> 条文献
+              <!-- AI 伴读的成果**只在结果区留一行纯文字**：不产生"这里也能开关"的误解 -->
+              <template v-if="aiStatus === 'done'">
+                <span aria-hidden="true"> · </span><span class="text-primary">已生成要点</span>
+              </template>
             </span>
           </div>
 
