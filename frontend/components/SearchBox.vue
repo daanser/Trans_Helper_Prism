@@ -100,7 +100,8 @@
       </div>
 
       <!-- 参数开关（返回条数 & 精准重排 & AI伴读） -->
-      <div class="flex shrink-0 flex-wrap items-center gap-x-6 gap-y-3 md:justify-end">
+      <!-- md:ml-auto：控件组换到第二行时**靠右**（与上方知识库按钮左侧对齐形成整齐的两行） -->
+      <div class="flex shrink-0 flex-wrap items-center gap-x-6 gap-y-3 md:ml-auto md:justify-end">
         <!-- 返回条数（plan-topk.md §3.4）：登录 1–50；未登录只允许 1–5，并提示登录后可用 50 -->
         <div class="flex items-center gap-2">
           <label for="prism-topk" class="text-xs font-medium text-slate-500 dark:text-slate-400">返回条数</label>
