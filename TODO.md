@@ -164,7 +164,16 @@ _最后更新：2026-09-09_
 改完告诉我 → 我验证 `/admin/keys` 各池 `configured=2` → watchdog ④ 转绿 → **并补做 W6 里唯一没做成的演练：真·自动换 key**
 （下架 `llm-key-0`，看它自动切到 `llm-key-1` 而不是降级）。
 
-### 1. key 管理方式要改 —— **设计稿已出：[`plan-keypool.md`](./plan-keypool.md)**（待你确认 4 个取舍后实施）
+### 1. key 管理方式要改 —— **⏸ 半成品已停在分支 `wip/keypool-refactor`**（2026-09-12）
+**设计稿：[`plan-keypool.md`](./plan-keypool.md)**（已按"不留兼容、激进"定稿：只认 `POOL_KEYS_<n>`，旧三个变量全删）
+**为什么停下**：用户出门前要求"超 5 分钟就停"。中断时进度 ≈ 50%：
+- ✅ 已改：`src/keypool.ts`（前缀扫描 + `pool-key-<n>` ref + 单池）、`types.ts`、`keyadmin.ts`、`embeddings.ts`、`llm.ts`、`rerank.ts`、`index.ts`
+- ❌ 未改：**13 个测试文件只改了 1 个**、3 个脚本（`ingest-incremental` / `one-shot-import` / `bench_search`）、2 个 workflow（`ingest.yml` / `watchdog.yml`）、`plan-keypool.md` 状态行
+**续做方式**：`git checkout wip/keypool-refactor` → 把剩余的跑完 → 复验（tsc + 640+ 全绿）→ 部署
+**⚠️ 部署顺序（务必遵守）**：新代码上线的**同时/之前**，CF 里必须已有 `POOL_KEYS_0` / `POOL_KEYS_1`，
+否则上游 0 把 key → 检索降级为关键词回退、AI 不可用（不崩，但是降级）。
+**当前状态：线上跑的还是旧代码 → CF 里的 `EMBED_POOL_KEYS`/`LLM_POOL_KEYS` 还不能删。**
+已就绪：`backend-cf/.dev.vars` 同时写了新旧变量名；GitHub Secrets 已建 `POOL_KEYS_0`/`POOL_KEYS_1`（`EMBED_POOL_KEYS` 待 workflow 改完后再删）。
 **现状痛点**：`EMBED_POOL_KEYS` / `LLM_POOL_KEYS` 是 CF Secret，**写入后不可读回** →
 每加一把 key 都要把整串重打一遍，加第 5 把时很容易出错。
 
