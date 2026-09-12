@@ -60,10 +60,15 @@
     <!-- 下层过滤控制：轻盈微质感知识库选择 + 开关选项 -->
     <div class="mt-5 flex flex-col gap-4 border-t border-slate-100 pt-4 dark:border-slate-800 md:flex-row md:items-center md:justify-between">
       <!-- 知识源筛选：去除死寂纯黑，改为轻盈透气的微质感选中态 -->
-      <div class="flex flex-wrap items-center gap-2" role="group" aria-label="知识库范围">
+      <!-- 布局要点（2026-09-12）：四个知识库按钮必须**始终成组同行**。
+           右侧「返回条数 / 精准重排 / AI 伴读」变宽后，曾把 RLE/Mio 挤到第二行 ——
+           故把 4 个 button 包进一个 `sm:flex-nowrap` 的独立组：宽度不够时**整组换行**，
+           而不是逐个按钮被挤散；手机（<sm）允许组内换行，自然排成对齐的 2×2。 -->
+      <div class="flex flex-wrap items-center gap-x-2 gap-y-2" role="group" aria-label="知识库范围">
         <span class="text-xs font-medium text-slate-500 dark:text-slate-400">知识库：</span>
 
-        <button
+        <div class="flex flex-wrap items-center gap-2 sm:flex-nowrap">
+          <button
           v-for="c in corporaOptions"
           :key="c.id"
           type="button"
@@ -89,12 +94,13 @@
           >
             <polyline points="20 6 9 17 4 12" />
           </svg>
-          <span>{{ c.name }}</span>
-        </button>
+            <span>{{ c.name }}</span>
+          </button>
+        </div>
       </div>
 
       <!-- 参数开关（返回条数 & 精准重排 & AI伴读） -->
-      <div class="flex shrink-0 flex-wrap items-center gap-x-6 gap-y-3">
+      <div class="flex shrink-0 flex-wrap items-center gap-x-6 gap-y-3 md:justify-end">
         <!-- 返回条数（plan-topk.md §3.4）：登录 1–50；未登录只允许 1–5，并提示登录后可用 50 -->
         <div class="flex items-center gap-2">
           <label for="prism-topk" class="text-xs font-medium text-slate-500 dark:text-slate-400">返回条数</label>
