@@ -164,7 +164,7 @@ _最后更新：2026-09-09_
 改完告诉我 → 我验证 `/admin/keys` 各池 `configured=2` → watchdog ④ 转绿 → **并补做 W6 里唯一没做成的演练：真·自动换 key**
 （下架 `llm-key-0`，看它自动切到 `llm-key-1` 而不是降级）。
 
-### 1. key 管理方式要改（现在的逗号串密钥只能轮换、多了很麻烦）
+### 1. key 管理方式要改 —— **设计稿已出：[`plan-keypool.md`](./plan-keypool.md)**（待你确认 4 个取舍后实施）
 **现状痛点**：`EMBED_POOL_KEYS` / `LLM_POOL_KEYS` 是 CF Secret，**写入后不可读回** →
 每加一把 key 都要把整串重打一遍，加第 5 把时很容易出错。
 
