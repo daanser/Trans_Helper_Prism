@@ -143,10 +143,18 @@ jobs:
             if [ "$code" != "200" ]; then
               problems+=("④ key 池读取失败：GET $api_base/api/v1/admin/keys → HTTP ${code:-无响应}（期望 200；401 = secret 与 Worker 不一致，503 = D1 异常）")
             else
-              low=$(printf '%s' "$body" | jq -r '[.pools[]? | select((.configured|tonumber) < 2) | "\(.pool)(\(.configured))"] | join(", ")' 2>/dev/null || echo "")
+              # 严重级别有意区分（2026-09-12）：
+              #   · 某池 **0 把** key → 该能力真的没了 → ::error::（job 失败 → 邮件）
+              #   · 某池 **1 把** key → 能用但无冗余，属"已知的非故障状态" → ::warning::（日志可见，不触发邮件）
+              # 理由：每 30 分钟为一件"不紧急且已知"的事发邮件会造成告警疲劳，反而让人忽略真正的故障。
+              zero=$(printf '%s' "$body" | jq -r '[.pools[]? | select((.configured|tonumber) == 0) | .pool] | join(", ")' 2>/dev/null || echo "")
+              low=$(printf '%s' "$body" | jq -r '[.pools[]? | select(((.configured|tonumber) > 0) and ((.configured|tonumber) < 2)) | "\(.pool)(\(.configured))"] | join(", ")' 2>/dev/null || echo "")
               summary=$(printf '%s' "$body" | jq -r '[.pools[]? | "\(.pool)=\(.configured)"] | join(" ")' 2>/dev/null || echo "解析失败")
-              if [ -n "$low" ]; then
-                problems+=("④ key 池可用 key 不足 2 把：${low} → 请补货（单把 key 被限流/失效时只能降级；EMBED_POOL_KEYS / LLM_POOL_KEYS 逗号分隔配 ≥2 把）")
+              if [ -n "$zero" ]; then
+                problems+=("④ key 池**没有可用 key**：${zero} → 该能力已不可用，必须立刻补货（EMBED_POOL_KEYS / LLM_POOL_KEYS，逗号分隔）")
+              elif [ -n "$low" ]; then
+                echo "::warning::④ key 池无冗余：${low} → 建议补到 ≥2 把（单把 key 被限流/失效时只能降级，AI 伴读会不可用但检索不受影响）"
+                notes+=("④ key 池可用但无冗余（${low}；建议补到 ≥2 把）")
               else
                 notes+=("④ key 池 OK（${summary}）")
               fi
