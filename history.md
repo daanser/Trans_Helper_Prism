@@ -186,6 +186,12 @@
    之后用 `git log --oneline origin/main..HEAD`（**必须为空**）或 `git status -sb` 复核"真的推上去了"。
    **原则：部署类操作要有正向证据（远端 ref 比对），不能靠"命令没报错"推断。**
 
+48. **"插在结论之后的检查"等于假监控**（2026-09-12 自己踩到）：给 watchdog 加第 ⑥ 项时，我把代码块插到了
+   "打印所有 notes → 有问题就 exit 1" 的**结论块之后** —— 结果 ⑥ **执行了也不显示、失败也不让 job 变红**。
+   这类 bug 比"没有监控"更危险：日志看着一切正常，你以为有人在盯。
+   **教训**：加检查时必须确认它**位于汇总/退出之前**，并且**造一次失败验证它真的会让 job 红**
+   （本次用 `-f daily_call_limit=1` 造错验证）；只看"代码写了"不算数。
+
 ## 6. 前端现状（2026-09-08 全量重写 UI/UX；2026-09-09 已上线 Pages）
 - **设计语言已彻底换掉**：不再是照搬 `vitepress-theme-project-trans` 的 indigo 色板。现为自定「温润学术检索」风——浅底 `#F8FAFC` / 深底 `#0B1120`，品牌蓝 `#2563EB`（深 `#3B82F6`），token 全走 `assets/css/main.css` 的 CSS 变量（`--bg-canvas/--bg-surface/--text-*/--primary*`），`tailwind.config.ts` 只做语义映射（`canvas/surface/primary/ink`）。
 - **用户明确否决过的方向（别再走回头路）**：① 高饱和四色彩虹 wiki 徽章（粉/天蓝/紫/翠绿）——太 AI 味；② 纯黑 `bg-slate-900` 实色选中块——太凝重死寂；③ 全大写英文终端风标签（`ARCHIVE RETRIEVAL //`、`SEARCH`、`PERF //`）——读不懂。现方案：四库**统一中性**选中态（淡蓝底 `bg-blue-50/80` + 勾选 `✓`，无彩色区分），中文标签，`max-w-7xl` 宽屏。
