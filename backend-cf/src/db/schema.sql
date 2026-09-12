@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS quotas (
 -- ─────────────────────────────────────────────
 -- Key Pool（provider_keys）：硅基流动 key 池。
 -- 绝不存明文 key：本表只存 key 的引用名（ref）、所归属池、状态、计量计数。
--- 真实 key 只活在各 Workers secret（EMBED_POOL_KEYS / LLM_POOL_KEYS，逗号分隔）。
+-- 真实 key 只活在各 Workers secret（POOL_KEYS_0 / POOL_KEYS_1 / ……，一个变量一把，见 src/keypool.ts）。
 -- ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS provider_keys (
   id            TEXT PRIMARY KEY,

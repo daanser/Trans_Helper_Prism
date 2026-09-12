@@ -1,8 +1,10 @@
 # ── 必填：Worker 运行所需的环境变量 / secrets ──────────────────
 # keypool 复用这两组 secrets（Key 一律来自 secrets，绝不硬编码/落日志）。
 # embed_pool 与 llm_pool 各放一批 key，逗号分隔（key 只存 secret，不落库明文）。
-EMBED_POOL_KEYS=sk-xxxx,sk-yyyy
-LLM_POOL_KEYS=sk-aaaa,sk-bbbb
+# 密钥（合并池，plan-keypool.md）：一个变量一把，数字递增、不要求连续。
+# embed / rerank / LLM 共用同一批 key；至少放 2 把（一把被限流/失效时才有退路）。
+POOL_KEYS_0=sk-xxxx
+POOL_KEYS_1=sk-yyyy
 
 # ── Qdrant Cloud（可选，M0 探测用）──────────────────────────
 QDRANT_URL=https://your-cluster.cloud.qdrant.io:6333

@@ -212,9 +212,9 @@
             </p>
             <p class="text-[11px] leading-relaxed text-amber-800 dark:text-amber-200">
               池里只剩单把 key 时，这把 key 被上游限流或失效就只能降级：<b>AI 伴读会不可用</b>
-              （我们演练过这条路：AI 报错但<b>检索不受影响</b>，因为检索与 AI 用的不是一个池）。
-              建议每个池至少配 2 把（<code class="font-mono">EMBED_POOL_KEYS</code> /
-              <code class="font-mono">LLM_POOL_KEYS</code>，逗号分隔），换 key 时才有退路。
+              （我们演练过这条路：AI 报错但<b>检索不受影响</b>，会自动回退关键词检索）。
+              建议至少配 2 把（<code class="font-mono">POOL_KEYS_0</code> /
+              <code class="font-mono">POOL_KEYS_1</code>，一把一个变量），换 key 时才有退路。
             </p>
           </div>
         </div>

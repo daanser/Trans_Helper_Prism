@@ -7,6 +7,7 @@ import { app } from "../src/index"
 import { issueSession } from "../src/auth"
 import { withBatch } from "./d1MockBatch"
 import type { Env, SearchResponse } from "../src/types"
+import { poolKeysEnv } from "./poolKeysEnv"
 
 const JWT_SECRET = "t".repeat(64)
 const PROXY_SECRET = "proxy-shared-secret"
@@ -108,8 +109,7 @@ function makeEnv(db: D1Database, over: Partial<Env> = {}): Env {
     INGEST_QUEUE: undefined as never,
     JWT_SECRET,
     PROXY_SHARED_SECRET: PROXY_SECRET,
-    EMBED_POOL_KEYS: "sk-embed-a",
-    LLM_POOL_KEYS: "sk-llm-a", // rerank 并入 llm_pool
+    ...poolKeysEnv(["sk-embed-a", "sk-llm-a"]), // 合并池：embed/rerank/llm 共用同一批 key
     QDRANT_URL: "https://qdrant.example",
     EMBEDDING_DIM: "1024",
     REQUIRE_LOGIN: "0", // 匿名也走完整检索（本文件要测匿名夹取对**实际检索**的影响）

@@ -6,18 +6,23 @@
 //   ② readDeniedPools / setKeyDenied 的 fail-open（KV 缺失、读失败、写失败、脏值）；
 //   ③ KeyPool 的 denied 过滤（构造注入 + 运行中热更新）与池耗尽；
 //   ④ 运行时效端到端：工厂入参剔除被禁 ref（embedding 用的是另一把 key）；
-//   ⑤ 真路由 /api/v1/search 在「禁用 embed-key-0」后仍可用且不用被禁 key，KV 抛错时不动任何 key。
+//   ⑤ 真路由 /api/v1/search 在「禁用 pool-key-0」后仍可用且不用被禁 key，KV 抛错时不动任何 key。
+//
+// 2026-09-12 合并池重构（plan-keypool.md）：密钥只认 `POOL_KEYS_<n>`，ref 形如 `pool-key-<n>[#k]`，
+// 禁用集**只有一个 KV 键** `keydeny:keys`，且"禁用一把 key = 全能力禁用"。
 import { describe, it, expect, vi, afterEach } from "vitest"
 import {
   ADMIN_KEY_ROW_LIMIT,
+  KEY_DENY_KEY,
   KEY_DENY_PREFIX,
+  POOL_CAPABILITIES,
   buildPoolInfos,
   fetchProviderKeyRows,
   isPoolName,
   isSafeKeyRef,
   denyCacheTtlSec,
   kvDenyStore,
-  mapPoolRefs,
+  normalizePoolName,
   parseDenyList,
   poolRefsFromEnv,
   readDeniedPools,
@@ -32,6 +37,8 @@ import { KeyPool, type KeyPoolDb } from "../src/keypool"
 import { createEmbeddingProvider } from "../src/embeddings"
 import { createRerankProvider } from "../src/rerank"
 import { app } from "../src/index"
+import { MERGED_POOL_NAME } from "../src/keypool"
+import { poolKeysEnv } from "./poolKeysEnv"
 import type { Env } from "../src/types"
 
 afterEach(() => {
@@ -41,6 +48,9 @@ afterEach(() => {
 /** 明显假的占位 secret（绝不是真 key）：只用于「不得泄漏」的断言与选 key 断言。 */
 const EMBED_SECRETS = ["sk-fake-embed-0001", "sk-fake-embed-0002"]
 const LLM_SECRETS = ["sk-fake-llm-0001", "sk-fake-llm-0002"]
+
+/** 合并池的 env 夹具：4 把 key → `pool-key-0` … `pool-key-3`（前两把 = 原 embed，后两把 = 原 llm）。 */
+const POOL_ENV = poolKeysEnv([...EMBED_SECRETS, ...LLM_SECRETS])
 
 const noopDb: KeyPoolDb = { async recordUsage() {} }
 
@@ -63,9 +73,10 @@ function makeKv(opts: { failGet?: boolean; failPut?: boolean; seed?: Record<stri
 // ─────────────────────────── ref 形状与 KV 值 ───────────────────────────
 
 describe("ref 形状与 KV 值解析", () => {
-  it("isSafeKeyRef 只认 <pool>-key-<n>，真 key 形状一律拒绝", () => {
-    expect(isSafeKeyRef("llm-key-0")).toBe(true)
-    expect(isSafeKeyRef("embed-key-12")).toBe(true)
+  it("isSafeKeyRef 只认 <name>-key-<n>[#k]，真 key 形状一律拒绝", () => {
+    expect(isSafeKeyRef("pool-key-0")).toBe(true)
+    expect(isSafeKeyRef("pool-key-12")).toBe(true)
+    expect(isSafeKeyRef("pool-key-2#3")).toBe(true) // 一个变量里逗号多把的第 k 把
     expect(isSafeKeyRef("sk-fake-embed-0001")).toBe(false) // 真 key 形状（绝不进 KV/审计）
     expect(isSafeKeyRef("llm-key")).toBe(false)
     expect(isSafeKeyRef("key-0")).toBe(false)
@@ -75,16 +86,21 @@ describe("ref 形状与 KV 值解析", () => {
     expect(isSafeKeyRef("a".repeat(60) + "-key-0")).toBe(false) // 超长
   })
 
-  it("refIndex / isPoolName", () => {
-    expect(refIndex("llm-key-7")).toBe(7)
+  it("refIndex / isPoolName（`keys` 与旧能力名都接受，统一映射到合并池）", () => {
+    expect(refIndex("pool-key-7")).toBe(7)
+    expect(refIndex("pool-key-7#2")).toBe(7) // `#k` 后缀不影响序号
     expect(refIndex("nope")).toBeNull()
+    expect(isPoolName("keys")).toBe(true)
     expect(isPoolName("embed")).toBe(true)
     expect(isPoolName("rerank")).toBe(true)
     expect(isPoolName("other")).toBe(false)
+    // 归一：四种写法 → 唯一池名 keys（旧能力名是"从哪个能力入口调进来"的标签，不再是对外池）
+    for (const v of ["keys", "embed", "llm", "rerank"]) expect(normalizePoolName(v)).toBe(MERGED_POOL_NAME)
+    expect(POOL_CAPABILITIES).toEqual(["embed", "llm", "rerank"])
   })
 
   it("parseDenyList：去空白/去重/丢弃非法与真 key 形状/稳定排序", () => {
-    expect(parseDenyList(" llm-key-2 , llm-key-0 ,llm-key-2, sk-fake-x, , ")).toEqual(["llm-key-0", "llm-key-2"])
+    expect(parseDenyList(" pool-key-2 , pool-key-0 ,pool-key-2, sk-fake-x, , ")).toEqual(["pool-key-0", "pool-key-2"])
     expect(parseDenyList("")).toEqual([])
     expect(parseDenyList(null)).toEqual([])
     expect(parseDenyList(undefined)).toEqual([])
@@ -92,84 +108,68 @@ describe("ref 形状与 KV 值解析", () => {
   })
 
   it("serializeDenyList ↔ parseDenyList 往返一致", () => {
-    expect(serializeDenyList(["llm-key-1", "llm-key-0", "llm-key-1"])).toBe("llm-key-0,llm-key-1")
-    expect(parseDenyList(serializeDenyList(["embed-key-3"]))).toEqual(["embed-key-3"])
+    expect(serializeDenyList(["pool-key-1", "pool-key-0", "pool-key-1"])).toBe("pool-key-0,pool-key-1")
+    expect(parseDenyList(serializeDenyList(["pool-key-3"]))).toEqual(["pool-key-3"])
+    expect(parseDenyList(serializeDenyList(["pool-key-2#3"]))).toEqual(["pool-key-2#3"])
     expect(serializeDenyList([])).toBe("")
     // 真 key 形状被过滤掉，绝不落进 KV 值
     expect(serializeDenyList(["sk-fake-embed-0001"])).toBe("")
   })
 
-  it("mapPoolRefs 按序号换池前缀，且只映射源池的 ref", () => {
-    expect(mapPoolRefs("llm", "rerank", ["llm-key-0", "llm-key-2"])).toEqual(["rerank-key-0", "rerank-key-2"])
-    expect(mapPoolRefs("llm", "rerank", ["embed-key-0", "garbage"])).toEqual([])
-  })
+  // 注：原 `mapPoolRefs()`（把 llm 池禁用按序号映射到 rerank 池）已随合并池删除 —— 一把 key 就是一个整体，
+  // 不存在"跨池映射"这回事；对应守卫见下面的 readDeniedPools 单键用例。
 })
 
 // ─────────────────────────── env 池 ref（只出 ref） ───────────────────────────
 
-describe("poolRefsFromEnv / buildPoolInfos", () => {
-  const env = {
-    EMBED_POOL_KEYS: EMBED_SECRETS.join(","),
-    LLM_POOL_KEYS: LLM_SECRETS.join(","),
-  }
+describe("poolRefsFromEnv / buildPoolInfos（合并池：只有一项 keys）", () => {
+  const env = POOL_ENV
 
-  it("只返回 ref，绝不返回 secret；rerank 未单独配则并入 llm", () => {
-    expect(poolRefsFromEnv(env, "embed")).toEqual(["embed-key-0", "embed-key-1"])
-    expect(poolRefsFromEnv(env, "llm")).toEqual(["llm-key-0", "llm-key-1"])
-    expect(poolRefsFromEnv(env, "rerank")).toEqual(["rerank-key-0", "rerank-key-1"])
+  it("只返回 ref，绝不返回 secret；三个能力入口看到同一份 ref", () => {
+    expect(poolRefsFromEnv(env)).toEqual(["pool-key-0", "pool-key-1", "pool-key-2", "pool-key-3"])
+    // 传能力名也一样（参数保留只为调用点零改动）
+    expect(poolRefsFromEnv(env, "embed")).toEqual(poolRefsFromEnv(env, "rerank"))
 
     const infos = buildPoolInfos(env)
-    expect(infos).toEqual([
-      { pool: "embed", configured: 2, refs: ["embed-key-0", "embed-key-1"] },
-      { pool: "llm", configured: 2, refs: ["llm-key-0", "llm-key-1"] },
-      { pool: "rerank", configured: 2, refs: ["rerank-key-0", "rerank-key-1"] },
-    ])
+    expect(infos).toEqual([{ pool: "keys", configured: 4, refs: ["pool-key-0", "pool-key-1", "pool-key-2", "pool-key-3"] }])
     const json = JSON.stringify(infos)
     expect(json).not.toMatch(/sk-/)
-    for (const s of [...EMBED_SECRETS, ...LLM_SECRETS]) expect(json).not.toContain(s)
+    for (const sec of [...EMBED_SECRETS, ...LLM_SECRETS]) expect(json).not.toContain(sec)
   })
 
-  it("env 缺池 → configured 0 / refs []（不抛错）", () => {
-    expect(buildPoolInfos({})).toEqual([
-      { pool: "embed", configured: 0, refs: [] },
-      { pool: "llm", configured: 0, refs: [] },
-      { pool: "rerank", configured: 0, refs: [] },
-    ])
+  it("env 未配 key → 单项 configured 0 / refs []（不抛错）—— watchdog ④ 据此告警补货", () => {
+    expect(buildPoolInfos({})).toEqual([{ pool: "keys", configured: 0, refs: [] }])
     expect(buildPoolInfos(undefined)[0].refs).toEqual([])
-  })
-
-  it("RERANK_POOL_KEYS 单独配置 → rerank 用自己的池", () => {
-    expect(poolRefsFromEnv({ ...env, RERANK_POOL_KEYS: "sk-fake-rerank-0" }, "rerank")).toEqual(["rerank-key-0"])
+    // 只有 `POOL_KEYS_<n>` 被识别：**其它名字一律忽略**（本次不留兼容）
+    expect(buildPoolInfos({ POOL_KEY_0: "sk-old", POOL_KEYS_X: "sk-old2", POOL_KEYS_0x: "sk-old3" })).toEqual([
+      { pool: "keys", configured: 0, refs: [] },
+    ])
   })
 })
 
 // ─────────────────────────── readDeniedPools / setKeyDenied（fail-open） ───────────────────────────
 
-describe("readDeniedPools（fail-open）", () => {
-  const env = { LLM_POOL_KEYS: LLM_SECRETS.join(",") }
+describe("readDeniedPools（合并池：单键 keydeny:keys，fail-open）", () => {
+  const env = POOL_ENV
 
   it("KV 缺失 → 全空（不抛错）", async () => {
     expect(await readDeniedPools(undefined, env)).toEqual({ embed: [], llm: [], rerank: [] })
   })
 
-  it("读到禁用集合，并把 llm 的禁用按序号映射到 rerank（默认并入 llm 池）", async () => {
-    const { kv } = makeKv({
-      seed: { [`${KEY_DENY_PREFIX}llm`]: "llm-key-0", [`${KEY_DENY_PREFIX}embed`]: "embed-key-1" },
-    })
+  it("读到禁用集合：**一个键**映射进三个能力槽位（禁用 = 全能力）", async () => {
+    const { kv } = makeKv({ seed: { [KEY_DENY_KEY]: "pool-key-0,pool-key-2" } })
     expect(await readDeniedPools(kvDenyStore(kv), env)).toEqual({
-      embed: ["embed-key-1"],
-      llm: ["llm-key-0"],
-      rerank: ["rerank-key-0"],
+      embed: ["pool-key-0", "pool-key-2"],
+      llm: ["pool-key-0", "pool-key-2"],
+      rerank: ["pool-key-0", "pool-key-2"],
     })
   })
 
-  it("单独配了 RERANK_POOL_KEYS → rerank 只认自己的 keydeny:rerank", async () => {
+  it("旧的三个键（keydeny:embed|llm|rerank）**被忽略**（线上是空集；不做兼容）", async () => {
     const { kv } = makeKv({
-      seed: { [`${KEY_DENY_PREFIX}llm`]: "llm-key-0", [`${KEY_DENY_PREFIX}rerank`]: "rerank-key-1" },
+      seed: { [`${KEY_DENY_PREFIX}llm`]: "llm-key-0", [`${KEY_DENY_PREFIX}embed`]: "embed-key-1" },
     })
-    const out = await readDeniedPools(kvDenyStore(kv), { ...env, RERANK_POOL_KEYS: "sk-fake-llm-0001" })
-    expect(out.llm).toEqual(["llm-key-0"])
-    expect(out.rerank).toEqual(["rerank-key-1"])
+    expect(await readDeniedPools(kvDenyStore(kv), env)).toEqual({ embed: [], llm: [], rerank: [] })
   })
 
   it("KV 读抛错 / 脏值 → 视为无禁用（fail-open，绝不抛错）", async () => {
@@ -185,24 +185,24 @@ describe("readDeniedPools（fail-open）", () => {
 })
 
 describe("readDeniedPoolsCached（性能优化第二轮 B：进程内缓存）", () => {
-  const env = { LLM_POOL_KEYS: LLM_SECRETS.join(",") }
+  const env = POOL_ENV
 
   it("TTL 内只读一次 KV（第二次命中缓存，0 次 KV 读）", async () => {
     let gets = 0
     const kv: DenyKvStore = {
       get: async (k) => {
         gets++
-        return k === `${KEY_DENY_PREFIX}embed` ? "embed-key-1" : ""
+        return k === KEY_DENY_KEY ? "pool-key-1" : ""
       },
       put: async () => undefined,
     }
     const t0 = 1_800_000_000_000
     const first = await readDeniedPoolsCached(kv, env, t0)
-    expect(first.embed).toEqual(["embed-key-1"])
-    expect(gets).toBe(3) // 三个池各读一次（embed/llm/rerank）
+    expect(first.embed).toEqual(["pool-key-1"])
+    expect(gets).toBe(1) // 合并池后只读**一个**键（原先是三个池各读一次）
     const second = await readDeniedPoolsCached(kv, env, t0 + 29_000) // TTL 30s 内
     expect(second).toEqual(first)
-    expect(gets).toBe(3) // 没有新增 KV 读
+    expect(gets).toBe(1) // 没有新增 KV 读
   })
 
   it("TTL 过后会重读（禁用集变化最多滞后 30 秒）", async () => {
@@ -217,15 +217,15 @@ describe("readDeniedPoolsCached（性能优化第二轮 B：进程内缓存）",
     }
     const t0 = 1_800_000_000_000
     expect((await readDeniedPoolsCached(kv, env, t0)).embed).toEqual([])
-    expect(gets).toBe(3)
+    expect(gets).toBe(1) // 合并池：一次读只碰 keydeny:keys 一个键
 
-    value = "embed-key-1" // 管理端刚下架 embed-key-1
+    value = "pool-key-1" // 管理端刚下架 pool-key-1
     expect((await readDeniedPoolsCached(kv, env, t0 + 10_000)).embed).toEqual([]) // 仍在 TTL 内 → 旧值
-    expect(gets).toBe(3)
+    expect(gets).toBe(1)
 
     const refreshed = await readDeniedPoolsCached(kv, env, t0 + 30_000) // TTL 到期
-    expect(refreshed.embed).toEqual(["embed-key-1"])
-    expect(gets).toBe(6)
+    expect(refreshed.embed).toEqual(["pool-key-1"])
+    expect(gets).toBe(2)
   })
 
   it("env KEY_DENY_CACHE_TTL_SEC=0 → 关闭缓存（每次都读）", async () => {
@@ -240,7 +240,7 @@ describe("readDeniedPoolsCached（性能优化第二轮 B：进程内缓存）",
     const noCache = { ...env, KEY_DENY_CACHE_TTL_SEC: "0" }
     await readDeniedPoolsCached(kv, noCache, 1)
     await readDeniedPoolsCached(kv, noCache, 2)
-    expect(gets).toBe(6)
+    expect(gets).toBe(2)
   })
 
   it("KV 读失败 → 空集且不抛错（fail-open），并且失败结果也会被缓存住", async () => {
@@ -255,7 +255,7 @@ describe("readDeniedPoolsCached（性能优化第二轮 B：进程内缓存）",
     const t0 = 1_800_000_000_000
     expect(await readDeniedPoolsCached(kv, env, t0)).toEqual({ embed: [], llm: [], rerank: [] })
     expect(await readDeniedPoolsCached(kv, env, t0 + 1_000)).toEqual({ embed: [], llm: [], rerank: [] })
-    expect(gets).toBe(3) // 第二次没有再去撞 KV（等价于"这段时间视为无禁用"）
+    expect(gets).toBe(1) // 第二次没有再去撞 KV（等价于"这段时间视为无禁用"）
   })
 
   it("KV 缺失（无绑定）→ 空集；TTL 非法值回默认 30s", async () => {
@@ -267,72 +267,83 @@ describe("readDeniedPoolsCached（性能优化第二轮 B：进程内缓存）",
   })
 })
 
-describe("setKeyDenied", () => {
+describe("setKeyDenied（合并池：只写一个键 keydeny:keys）", () => {
   it("禁用加入、上架移除，KV 值只含 ref", async () => {
     const { kv, store } = makeKv()
-    let out = await setKeyDenied(kvDenyStore(kv), "llm", "llm-key-0", false)
-    expect(out).toEqual({ ok: true, refs: ["llm-key-0"] })
-    out = await setKeyDenied(kvDenyStore(kv), "llm", "llm-key-2", false)
-    expect(out.refs).toEqual(["llm-key-0", "llm-key-2"])
-    out = await setKeyDenied(kvDenyStore(kv), "llm", "llm-key-0", true)
-    expect(out).toEqual({ ok: true, refs: ["llm-key-2"] })
+    let out = await setKeyDenied(kvDenyStore(kv), "pool-key-0", false)
+    expect(out).toEqual({ ok: true, refs: ["pool-key-0"] })
+    out = await setKeyDenied(kvDenyStore(kv), "pool-key-2", false)
+    expect(out.refs).toEqual(["pool-key-0", "pool-key-2"])
+    out = await setKeyDenied(kvDenyStore(kv), "pool-key-0", true)
+    expect(out).toEqual({ ok: true, refs: ["pool-key-2"] })
 
-    expect(store.get(`${KEY_DENY_PREFIX}llm`)).toBe("llm-key-2")
+    expect(store.get(KEY_DENY_KEY)).toBe("pool-key-2")
+    // 只写这一个键（旧的三键不再产生）
+    expect([...store.keys()]).toEqual([KEY_DENY_KEY])
     expect(JSON.stringify([...store.entries()])).not.toMatch(/sk-/)
   })
 
   it("KV 缺失 / 写失败 / ref 非法 → ok:false（fail-open，不抛错、不写入）", async () => {
-    expect(await setKeyDenied(undefined, "llm", "llm-key-0", false)).toEqual({ ok: false, refs: [] })
+    expect(await setKeyDenied(undefined, "pool-key-0", false)).toEqual({ ok: false, refs: [] })
 
     const { kv, store } = makeKv({ failPut: true })
-    expect(await setKeyDenied(kvDenyStore(kv), "llm", "llm-key-0", false)).toEqual({ ok: false, refs: [] })
+    expect(await setKeyDenied(kvDenyStore(kv), "pool-key-0", false)).toEqual({ ok: false, refs: [] })
     expect(store.size).toBe(0)
 
     const { kv: good, store: goodStore } = makeKv()
-    expect(await setKeyDenied(kvDenyStore(good), "llm", "sk-fake-llm-0001", false)).toEqual({ ok: false, refs: [] })
+    expect(await setKeyDenied(kvDenyStore(good), "sk-fake-llm-0001", false)).toEqual({ ok: false, refs: [] })
     expect(goodStore.size).toBe(0)
   })
 })
 
 // ─────────────────────────── KeyPool denied 过滤 ───────────────────────────
 
-describe("KeyPool 的 denied 过滤（admin 下架 = 运行时效）", () => {
-  const env = { EMBED_POOL_KEYS: EMBED_SECRETS.join(",") }
+describe("KeyPool 的 denied 过滤（admin 下架 = 运行时效；合并池 = **全能力**禁用）", () => {
+  /** 两把 key（pool-key-0 / pool-key-1）的最小夹具 */
+  const env = poolKeysEnv(["sk-fake-a", "sk-fake-b"])
 
   it("构造注入 denied → pickKey 跳过被禁 ref，availableCount 同步，keys() 仍可查全部", () => {
-    const pool = new KeyPool(env, noopDb, { denied: { embed: ["embed-key-0"] } })
-    expect(pool.isDenied("embed", "embed-key-0")).toBe(true)
-    expect(pool.deniedRefs("embed")).toEqual(["embed-key-0"])
+    const pool = new KeyPool(env, noopDb, { denied: { embed: ["pool-key-0"] } })
+    expect(pool.isDenied("embed", "pool-key-0")).toBe(true)
+    expect(pool.deniedRefs("embed")).toEqual(["pool-key-0"])
     expect(pool.availableCount("embed")).toBe(1)
     expect(pool.keys("embed")).toHaveLength(2) // 池内仍在（便于 admin 展示/再上架）
-    expect(pool.pickKey("embed")!.ref).toBe("embed-key-1")
+    expect(pool.pickKey("embed")!.ref).toBe("pool-key-1")
+  })
+
+  it("**禁用即全能力**：禁 pool-key-0 后 embed/rerank/llm 三个入口都只剩 pool-key-1", () => {
+    const pool = new KeyPool(env, noopDb, { denied: { llm: ["pool-key-0"] } }) // 从 llm 入口禁
+    for (const ability of ["embed", "llm", "rerank"] as const) {
+      expect(pool.isDenied(ability, "pool-key-0"), ability).toBe(true)
+      expect(pool.pickKey(ability)!.ref, ability).toBe("pool-key-1")
+    }
+    // 三个能力槽位看到同一份禁用集
+    expect(pool.deniedRefs("embed")).toEqual(pool.deniedRefs("rerank"))
   })
 
   it("运行中热更新：setDenied 立刻生效；setDenied(null) 恢复", () => {
     const pool = new KeyPool(env, noopDb)
-    expect(pool.pickKey("embed")!.ref).toBe("embed-key-0")
-    pool.setDenied("embed", ["embed-key-0"])
-    expect(pool.pickKey("embed")!.ref).toBe("embed-key-1")
+    expect(pool.pickKey("embed")!.ref).toBe("pool-key-0") // LRU：首取第一把
+    pool.setDenied("embed", ["pool-key-0"])
+    expect(pool.pickKey("embed")!.ref).toBe("pool-key-1")
     pool.setDenied("embed", null)
     expect(pool.deniedRefs("embed")).toEqual([])
     expect(pool.availableCount("embed")).toBe(2)
   })
 
   it("全部被禁 → pickKey 返回 null（不抛错，交给上层降级）", () => {
-    const pool = new KeyPool(env, noopDb, { denied: { embed: ["embed-key-0", "embed-key-1"] } })
+    const pool = new KeyPool(env, noopDb, { denied: { embed: ["pool-key-0", "pool-key-1"] } })
     expect(pool.availableCount("embed")).toBe(0)
     expect(pool.pickKey("embed")).toBeNull()
   })
 
-  it("applyDenied 批量注入三个池；默认（不传）等于旧行为", () => {
-    const pool = new KeyPool({ ...env, LLM_POOL_KEYS: LLM_SECRETS.join(",") }, noopDb)
-    pool.applyDenied({ embed: ["embed-key-1"], llm: ["llm-key-0"], rerank: ["rerank-key-0"] })
-    expect(pool.deniedRefs("embed")).toEqual(["embed-key-1"])
-    expect(pool.deniedRefs("llm")).toEqual(["llm-key-0"])
-    expect(pool.deniedRefs("rerank")).toEqual(["rerank-key-0"])
-    expect(pool.pickKey("llm")!.ref).toBe("llm-key-1")
+  it("applyDenied 批量注入（三次写入的是同一个集合）；默认（不传）= 无禁用", () => {
+    const pool = new KeyPool(env, noopDb)
+    pool.applyDenied({ embed: ["pool-key-1"], llm: ["pool-key-1"], rerank: ["pool-key-1"] })
+    expect(pool.deniedRefs("embed")).toEqual(["pool-key-1"])
+    expect(pool.pickKey("llm")!.ref).toBe("pool-key-0")
 
-    const fresh = new KeyPool({ ...env, LLM_POOL_KEYS: LLM_SECRETS.join(",") }, noopDb)
+    const fresh = new KeyPool(env, noopDb)
     expect(fresh.deniedRefs("embed")).toEqual([])
     expect(fresh.availableCount("embed")).toBe(2)
   })
@@ -353,11 +364,13 @@ function makeEmbedFetch() {
 }
 
 describe("createEmbeddingProvider 的 denied 入参", () => {
-  const env = { EMBED_POOL_KEYS: EMBED_SECRETS.join(","), EMBEDDING_DIM: "8" }
+  const env = poolKeysEnv([EMBED_SECRETS[0], EMBED_SECRETS[1]])
 
-  it("被禁的 embed-key-0 不会被使用（换用 embed-key-1）", async () => {
+  it("被禁的 pool-key-0 不会被使用（换用 pool-key-1）", async () => {
     const { fetchImpl, auths } = makeEmbedFetch()
-    const { provider } = createEmbeddingProvider(env, noopDb, fetchImpl, { denied: { embed: ["embed-key-0"] } })
+    const { provider } = createEmbeddingProvider({ ...env, EMBEDDING_DIM: "8" }, noopDb, fetchImpl, {
+      denied: { embed: ["pool-key-0"] },
+    })
     const vec = await provider.embed("激素", { kind: "query" })
     expect(vec).toHaveLength(8)
     expect(auths).toEqual([`Bearer ${EMBED_SECRETS[1]}`])
@@ -367,29 +380,29 @@ describe("createEmbeddingProvider 的 denied 入参", () => {
     const { kv } = makeKv({ failGet: true })
     const denied = await readDeniedPools(kvDenyStore(kv), env)
     const { fetchImpl, auths } = makeEmbedFetch()
-    const { provider } = createEmbeddingProvider(env, noopDb, fetchImpl, { denied })
+    const { provider } = createEmbeddingProvider({ ...env, EMBEDDING_DIM: "8" }, noopDb, fetchImpl, { denied })
     await provider.embed("激素", { kind: "query" })
     expect(auths).toEqual([`Bearer ${EMBED_SECRETS[0]}`])
   })
 
   it("不传 options（旧调用）行为不变 → 用第一把 key", async () => {
     const { fetchImpl, auths } = makeEmbedFetch()
-    const { provider } = createEmbeddingProvider(env, noopDb, fetchImpl)
+    const { provider } = createEmbeddingProvider({ ...env, EMBEDDING_DIM: "8" }, noopDb, fetchImpl)
     await provider.embed("激素", { kind: "query" })
     expect(auths).toEqual([`Bearer ${EMBED_SECRETS[0]}`])
   })
 })
 
-describe("createRerankProvider 的 denied 入参", () => {
-  const env = { LLM_POOL_KEYS: LLM_SECRETS.join(",") }
+describe("createRerankProvider 的 denied 入参（与 embedding 同一个池）", () => {
+  const env = poolKeysEnv(LLM_SECRETS)
 
-  it("被禁的 rerank-key-0 不会被使用", async () => {
+  it("被禁的 pool-key-0 不会被 rerank 使用", async () => {
     const auths: string[] = []
     const fetchImpl = vi.fn(async (_url: unknown, init?: RequestInit): Promise<Response> => {
       auths.push(String((init?.headers as Record<string, string> | undefined)?.Authorization ?? ""))
       return new Response(JSON.stringify({ results: [{ index: 0, relevance_score: 0.9 }] }), { status: 200 })
     }) as unknown as typeof fetch
-    const { provider } = createRerankProvider(env, noopDb, fetchImpl, { denied: { rerank: ["rerank-key-0"] } })
+    const { provider } = createRerankProvider(env, noopDb, fetchImpl, { denied: { rerank: ["pool-key-0"] } })
     const scores = await provider.rerank("激素", ["doc"])
     expect(scores).toEqual([0.9])
     expect(auths).toEqual([`Bearer ${LLM_SECRETS[1]}`])
@@ -402,8 +415,8 @@ describe("toAdminKeyRow / fetchProviderKeyRows", () => {
   it("字段投影与类型兜底（enabled INTEGER → boolean，缺列不炸）", () => {
     expect(
       toAdminKeyRow({
-        key_ref: "llm-key-0",
-        pool: "llm",
+        key_ref: "pool-key-0",
+        pool: "keys",
         status: "active",
         success_count: 3,
         failure_count: 1,
@@ -412,21 +425,21 @@ describe("toAdminKeyRow / fetchProviderKeyRows", () => {
         updated_at: 123,
       }),
     ).toEqual({
-      key_ref: "llm-key-0",
-      pool: "llm",
+      key_ref: "pool-key-0",
+      pool: "keys",
       status: "active",
       success_count: 3,
       failure_count: 1,
       total_cost: 0.5,
       enabled: true,
       updated_at: 123,
-      key_id: "llm-key-0",
+      key_id: "pool-key-0",
       used: 0.5,
       last_used_at: 123,
     })
-    const sparse = toAdminKeyRow({ key_ref: "embed-key-0", enabled: 0 })
+    const sparse = toAdminKeyRow({ key_ref: "pool-key-0", enabled: 0 })
     expect(sparse.enabled).toBe(false)
-    expect(sparse.pool).toBe("embed")
+    expect(sparse.pool).toBe("keys") // 缺 pool 列时的默认值 = 合并池名
     expect(sparse.status).toBe("active")
     expect(sparse.total_cost).toBe(0)
   })
@@ -489,8 +502,8 @@ describe("真路由 /api/v1/search 上的运行时效", () => {
       INGEST_QUEUE: undefined as never,
       QDRANT_URL: "https://qdrant.example",
       QDRANT_API_KEY: "qdrant-test-key",
-      EMBED_POOL_KEYS: EMBED_SECRETS.join(","),
-      LLM_POOL_KEYS: LLM_SECRETS.join(","),
+      // 合并池：前两把是原 embed 的 key（本段断言"被禁的那把不会被用"）
+      ...poolKeysEnv([EMBED_SECRETS[0], EMBED_SECRETS[1]]),
       EMBEDDING_DIM: "8",
       REQUIRE_LOGIN: "0",
     } as unknown as Env
@@ -504,8 +517,8 @@ describe("真路由 /api/v1/search 上的运行时效", () => {
     }
   }
 
-  it("KV 里禁用 embed-key-0 后：搜索照常成功，且不再使用被禁 key", async () => {
-    const { kv } = makeKv({ seed: { [`${KEY_DENY_PREFIX}embed`]: "embed-key-0" } })
+  it("KV 里禁用 pool-key-0 后：搜索照常成功，且不再使用被禁 key", async () => {
+    const { kv } = makeKv({ seed: { [KEY_DENY_KEY]: "pool-key-0" } })
     const { fetchImpl, auths } = makeSearchFetch()
     vi.stubGlobal("fetch", fetchImpl)
 

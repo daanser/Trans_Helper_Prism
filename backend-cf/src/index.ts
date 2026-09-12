@@ -94,6 +94,7 @@ import {
   fetchProviderKeyRows,
   isPoolName,
   isSafeKeyRef,
+  normalizePoolName,
   kvDenyStore,
   poolRefsFromEnv,
   readDeniedPoolsCached,
@@ -1178,7 +1179,8 @@ api.post("/admin/keys", async (c) => {
   // 形状校验：只接受 `<pool>-key-<n>`，真 key（sk-…）无法进来（见 keyadmin.isSafeKeyRef）
   if (!isSafeKeyRef(keyRef)) return c.json({ error: "invalid-key-ref" }, 422)
   if (!isPoolName(poolRaw)) return c.json({ error: "invalid-pool" }, 422)
-  const pool = poolRaw
+  // 合并池（plan-keypool.md §2.6）：`pool` 接受 `keys`，也接受历史的 `embed|llm|rerank`（映射到同一池，零成本兼容）
+  const pool = normalizePoolName(poolRaw)
   const enabled = body.enabled !== false
 
   if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
@@ -1200,8 +1202,8 @@ api.post("/admin/keys", async (c) => {
   })
 
   // 运行时效（fail-open）：KV 缺失/读写失败 → runtime_applied:false，请求仍 200。
-  const runtime = await setKeyDenied(kvDenyStore(c.env.SEARCH_CACHE), pool, keyRef, enabled)
-  const configured = poolRefsFromEnv(c.env, pool).includes(keyRef)
+  const runtime = await setKeyDenied(kvDenyStore(c.env.SEARCH_CACHE), keyRef, enabled)
+  const configured = poolRefsFromEnv(c.env).includes(keyRef)
   return c.json({
     ok: true,
     key_ref: keyRef,

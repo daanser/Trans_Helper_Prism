@@ -10,13 +10,14 @@ import { describe, it, expect, vi } from "vitest"
 import { SiliconFlowReranker, RerankProvider } from "../src/rerank"
 import { KeyPool } from "../src/keypool"
 import type { KeyPoolDb } from "../src/keypool"
+import { poolKeysEnv } from "./poolKeysEnv"
 
 /** 最小 KeyPoolDb（记账空实现）。 */
 const noopDb: KeyPoolDb = { async recordUsage() {} }
 
 /** 构造一个带 llm_pool 单 key 的 pool。 */
 function makePool(): KeyPool {
-  return new KeyPool({ LLM_POOL_KEYS: "sk-rerank-a" }, noopDb)
+  return new KeyPool(poolKeysEnv(["sk-rerank-a"]), noopDb)
 }
 
 /** 空容器：keys 记录 simulation 里创建过的 provider 调用列表。 */
@@ -112,7 +113,7 @@ describe("SiliconFlowReranker.rerank", () => {
 describe("rerank 换 key 重试（withKeyRetry）", () => {
   it("第一个 key 401 → 自动换第二个 key 成功；换 key 后取到正确分数", async () => {
     let callNo = 0
-    const pool2 = new KeyPool({ LLM_POOL_KEYS: "sk-a,sk-b" }, noopDb)
+    const pool2 = new KeyPool(poolKeysEnv(["sk-a", "sk-b"]), noopDb)
     // 第一个 key 首次调用返回 401，第二次（换 key 后）成功
     const fetchImpl = vi.fn(async (): Promise<Response> => {
       callNo++

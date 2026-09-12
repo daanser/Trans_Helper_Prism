@@ -4,11 +4,13 @@
 
 /** Workers 运行时环境绑定。Key 一律来自 secrets，绝不硬编码。 */
 export interface Env {
-  // ── Key Pool secrets（逗号分隔的一组 key，只存 secret）──
-  EMBED_POOL_KEYS?: string
-  LLM_POOL_KEYS?: string
-  /** rerank 独立池（可选；缺省并入 LLM_POOL_KEYS，见 plan §2）。只影响 ref 命名与 key 禁用映射。 */
-  RERANK_POOL_KEYS?: string
+  // ── Key Pool secrets（2026-09-12 起**只认** `POOL_KEYS_<n>`，见 plan-keypool.md）──
+  // 密钥**动态命名**：`POOL_KEYS_0` / `POOL_KEYS_1` / `POOL_KEYS_2` ……（数字递增，不要求连续）。
+  // 代码按前缀扫描 env（`src/keypool.ts` 的 `scanPoolKeyVars()`），因此这里**不逐个声明**；
+  // 读取时统一按 `Record<string, string | undefined>` 断言（见 `KeyPool` 构造函数与 `envString()`）。
+  // 旧的三个按能力命名的池变量**已彻底移除**（用户决定不做过渡期兼容，历史见 plan-keypool.md §2.4）：
+  // 部署后到你在 CF 控制台补上 `POOL_KEYS_0` 之前会处于"无可用 key"状态 —— 这是接受的
+  // （embedding 失败→关键词回退、AI→llm-unavailable、rerank→rerank-fallback，都不崩）。
 
   // ── D1 / KV / Queue 绑定 ──
   DB: D1Database

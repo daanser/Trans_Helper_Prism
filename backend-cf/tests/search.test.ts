@@ -12,6 +12,7 @@ import type { FallbackResponse } from "../src/fallback"
 import type { CacheStore } from "../src/searchcache"
 import { app } from "../src/index"
 import type { Env, SearchResponse } from "../src/types"
+import { poolKeysEnv } from "./poolKeysEnv"
 
 /** 判别 FallbackResponse 与 SearchResponse 的联合类型守卫。 */
 function isFallback(res: RunSearchResult): res is FallbackResponse {
@@ -27,8 +28,7 @@ function asOk(res: RunSearchResult): SearchResponse {
 /** 最小 Env：embed/llm pool 各一个 key + Qdrant 连接 + embedding 维度。 */
 function makeEnv(overrides: Partial<Env> = {}): Env {
   return {
-    EMBED_POOL_KEYS: "sk-embed-a",
-    LLM_POOL_KEYS: "sk-llm-a", // rerank 并入 llm_pool
+    ...poolKeysEnv(["sk-embed-a", "sk-llm-a"]), // 合并池：embed/rerank/llm 共用同一批 key
     QDRANT_URL: "https://qdrant.example",
     QDRANT_API_KEY: "qdrant-test-key",
     EMBEDDING_DIM: "1024",
@@ -503,7 +503,8 @@ describe("runSearch 开启 rerank 开关", () => {
     expect(ok.hits.map((h) => h.id)).toEqual(["a", "b", "c"])
     expect(ok.warnings).toContain("rerank-fallback")
     expect(ok.quota.fallback).toBe(false) // 不是整体回退，只是 rerank 降级
-    expect(reranks).toHaveLength(1)
+    // 合并池后 rerank 也有 2 把 key（pool-key-0/1）→ 第一次失败会**换 key 重试一次**，两次都失败才降级
+    expect(reranks).toHaveLength(2)
   })
 })
 

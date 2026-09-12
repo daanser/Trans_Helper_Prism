@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest"
 import { gzipSync } from "node:zlib"
 import { ingestWiki, lastIngestedCommitSha, contentHash, type IngestResult } from "../src/ingest/incremental"
 import type { Env } from "../src/types"
+import { poolKeysEnv } from "./poolKeysEnv"
 
 /** 构造单个 tar 条目（512B header + 512 对齐 data）。 */
 function tarEntry(name: string, data: string, typeflag = "0"): Buffer {
@@ -141,7 +142,7 @@ function makeEnv(db: D1Database | undefined, qdrant = true): Env {
     DB: db as D1Database,
     SEARCH_CACHE: undefined as never,
     INGEST_QUEUE: undefined as never,
-    EMBED_POOL_KEYS: "sk-embed-a",
+    ...poolKeysEnv(["sk-embed-a"]),
     EMBEDDING_MODEL: "BAAI/bge-m3",
     EMBEDDING_DIM: "4",
     QDRANT_URL: qdrant ? "https://qdrant.example" : undefined,

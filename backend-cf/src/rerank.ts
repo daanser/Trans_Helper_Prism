@@ -6,7 +6,7 @@
 //   - 批量推理：一次 HTTP 塞多对 (query, document)，禁止逐条循环（Workers→国内往返贵，§5.2 第 2 条）；
 //   - rerankTopK 做成配置项（删旧魔法数字，§5.2 第 3 条）；
 //   - 401/403/429/余额不足/超时自动换 key 重试一次（复用 withKeyRetry）；池全灭/超时抛错给上层降级为向量序。
-import { KeyPool, withKeyRetry, PoolKey, type KeyPoolDb, type KeyPoolOptions } from "./keypool"
+import { KeyPool, withKeyRetry, PoolKey, envString, type KeyPoolDb, type KeyPoolOptions } from "./keypool"
 import { defaultFetch } from "./embeddings"
 
 /** 批量 rerank 的配置（批量大小/超时，均可配）。 */
@@ -152,13 +152,8 @@ export class SiliconFlowReranker implements RerankProvider {
 
 /** 用 env 构造 KeyPool 后实例化硅基流动 rerank provider 的工厂。rerank 并入 llm_pool（§2）。 */
 export function createRerankProvider(
-  env: {
-    EMBED_POOL_KEYS?: string
-    LLM_POOL_KEYS?: string
-    RERANK_POOL_KEYS?: string
-    RERANK_ENDPOINT?: string
-    RERANK_MODEL?: string
-  },
+  /** 任意 env 形状：密钥来自 `POOL_KEYS_<n>`（动态扫描，见 keypool.ts）；其余配置项用 envString 读。 */
+  env: unknown,
   db: KeyPoolDb,
   fetchImpl: typeof fetch = defaultFetch,
   /**
@@ -170,8 +165,8 @@ export function createRerankProvider(
   const pool = new KeyPool(env, db, options)
   const provider = new SiliconFlowReranker(
     {
-      model: env.RERANK_MODEL ?? "BAAI/bge-reranker-v2-m3",
-      endpoint: env.RERANK_ENDPOINT,
+      model: envString(env, "RERANK_MODEL") ?? "BAAI/bge-reranker-v2-m3",
+      endpoint: envString(env, "RERANK_ENDPOINT"),
     },
     pool,
     fetchImpl,

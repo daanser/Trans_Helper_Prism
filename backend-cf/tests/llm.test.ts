@@ -33,6 +33,7 @@ import {
   type LlmHit,
 } from "../src/llm"
 import { KeyPool, type KeyPoolDb, type UsageRecord } from "../src/keypool"
+import { poolKeysEnv } from "./poolKeysEnv"
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -164,7 +165,7 @@ describe("summarize：换 key 重试 + 用量记账", () => {
       return chatOk("HRT 需要医生指导 [来源1]")
     }) as unknown as typeof fetch
 
-    const env = { LLM_POOL_KEYS: `${KEY_A},${KEY_B}` }
+    const env = poolKeysEnv([KEY_A, KEY_B])
     const out = await summarize(env, db, makeHits(1), "HRT 是什么？", fetchImpl)
 
     expect(out.text).toBe("HRT 需要医生指导 [来源1]")
@@ -183,7 +184,7 @@ describe("summarize：换 key 重试 + 用量记账", () => {
     expect(ok).toHaveLength(1)
     expect(ok[0].pool).toBe("llm")
     expect(ok[0].endpoint).toBe("chat")
-    expect(ok[0].keyRef).toBe("llm-key-1")
+    expect(ok[0].keyRef).toBe("pool-key-1") // 合并池的 ref（能力仍记在 pool 字段里）
     expect(ok[0].tokensIn).toBe(11)
     expect(ok[0].tokensOut).toBe(22)
     // 上游给了 usage → 不标估算
@@ -192,10 +193,10 @@ describe("summarize：换 key 重试 + 用量记账", () => {
     expect(out.estimated).toBe(false)
   })
 
-  it("池全灭（未配置 LLM_POOL_KEYS）→ 抛 llm-unavailable，可识别降级", async () => {
+  it("池全灭（未配置任何 POOL_KEYS_<n>）→ 抛 llm-unavailable，可识别降级", async () => {
     const db = makeDb()
     const fetchImpl = vi.fn() as unknown as typeof fetch
-    await expect(summarize({ LLM_POOL_KEYS: "" }, db, makeHits(1), "问题", fetchImpl)).rejects.toMatchObject({
+    await expect(summarize({}, db, makeHits(1), "问题", fetchImpl)).rejects.toMatchObject({
       name: "LLMError",
       code: "llm-unavailable",
       degrade: true,
@@ -219,7 +220,7 @@ describe("summarize：换 key 重试 + 用量记账", () => {
     }) as unknown as typeof fetch
 
     const err = await summarize(
-      { LLM_POOL_KEYS: `${KEY_A},${KEY_B}`, LLM_TIMEOUT_MS: "20" },
+      { ...poolKeysEnv([KEY_A, KEY_B]), LLM_TIMEOUT_MS: "20" },
       db,
       makeHits(1),
       "问题",
@@ -242,7 +243,7 @@ describe("summarize：换 key 重试 + 用量记账", () => {
         json: async () => ({}),
       }) as unknown as Response) as unknown as typeof fetch
 
-    const err = await summarize({ LLM_POOL_KEYS: KEY_A }, db, makeHits(1), "问题", fetchImpl).catch((e) => e)
+    const err = await summarize(poolKeysEnv([KEY_A]), db, makeHits(1), "问题", fetchImpl).catch((e) => e)
     expect(err.code).toBe("llm-upstream")
     expect(err.status).toBe(400)
     expect(err.message).not.toContain(KEY_A)
@@ -258,7 +259,7 @@ describe("summarize：换 key 重试 + 用量记账", () => {
         json: async () => ({ choices: [{ message: { content: "   " } }] }),
         text: async () => "",
       }) as unknown as Response) as unknown as typeof fetch
-    const err = await summarize({ LLM_POOL_KEYS: KEY_A }, db, makeHits(1), "问题", fetchImpl).catch((e) => e)
+    const err = await summarize(poolKeysEnv([KEY_A]), db, makeHits(1), "问题", fetchImpl).catch((e) => e)
     expect(err.code).toBe("llm-empty")
   })
 
@@ -270,13 +271,13 @@ describe("summarize：换 key 重试 + 用量记账", () => {
       return chatOk("ok [来源1]")
     }) as unknown as typeof fetch
 
-    await summarize({ LLM_POOL_KEYS: KEY_A }, db, makeHits(1), "q", fetchImpl)
+    await summarize(poolKeysEnv([KEY_A]), db, makeHits(1), "q", fetchImpl)
     expect(bodies[0].enable_thinking).toBe(false)
     expect(bodies[0].max_tokens).toBe(LLM_MAX_TOKENS)
 
     // LLM_MAX_TOKENS 想放大也不许超过硬上限；enable_thinking=omit 时字段不出现
     await summarize(
-      { LLM_POOL_KEYS: KEY_A, LLM_MAX_TOKENS: "5000", LLM_ENABLE_THINKING: "omit" },
+      { ...poolKeysEnv([KEY_A]), LLM_MAX_TOKENS: "5000", LLM_ENABLE_THINKING: "omit" },
       db,
       makeHits(1),
       "q",
@@ -297,7 +298,7 @@ describe("summarize：换 key 重试 + 用量记账", () => {
         text: async () => "",
       }) as unknown as Response) as unknown as typeof fetch
 
-    const out = await summarize({ LLM_POOL_KEYS: KEY_A }, db, makeHits(1), "问题", fetchImpl)
+    const out = await summarize(poolKeysEnv([KEY_A]), db, makeHits(1), "问题", fetchImpl)
     expect(out.estimated).toBe(true)
     expect(out.tokens_in).toBeGreaterThan(0)
     expect(out.tokens_out).toBeGreaterThan(0)
@@ -325,7 +326,7 @@ describe("summarize：换 key 重试 + 用量记账", () => {
         json: async () => ({}),
       }) as unknown as Response) as unknown as typeof fetch
 
-    const s = streamSummary({ LLM_POOL_KEYS: KEY_A }, db, makeHits(1), "问题", fetchImpl)
+    const s = streamSummary(poolKeysEnv([KEY_A]), db, makeHits(1), "问题", fetchImpl)
     for await (const chunk of s) {
       expect(chunk).toBe("你好")
       break // 只消费第一块
@@ -337,7 +338,7 @@ describe("summarize：换 key 重试 + 用量记账", () => {
 
   it("流式失败 → usage promise 也 reject 同一个 LLMError", async () => {
     const db = makeDb()
-    const s = streamSummary({ LLM_POOL_KEYS: "" }, db, makeHits(1), "问题", (async () => {
+    const s = streamSummary({}, db, makeHits(1), "问题", (async () => {
       throw new Error("should-not-be-called")
     }) as unknown as typeof fetch)
     const usageRejected = s.usage.then(
@@ -364,9 +365,9 @@ describe("summarize：换 key 重试 + 用量记账", () => {
       return chatOk("ok [来源1]")
     }) as unknown as typeof fetch
 
-    await summarize({ LLM_POOL_KEYS: KEY_A }, db, makeHits(1), "q", fetchImpl)
+    await summarize(poolKeysEnv([KEY_A]), db, makeHits(1), "q", fetchImpl)
     await summarize(
-      { LLM_POOL_KEYS: KEY_A, LLM_ENDPOINT: "https://api.example.test/v1/chat/completions/", LLM_MODEL: "GLM-4-9B-0414" },
+      { ...poolKeysEnv([KEY_A]), LLM_ENDPOINT: "https://api.example.test/v1/chat/completions/", LLM_MODEL: "GLM-4-9B-0414" },
       db,
       makeHits(1),
       "q",
@@ -448,7 +449,7 @@ describe("SSE 解析与流式总结", () => {
       } as unknown as Response
     }) as unknown as typeof fetch
 
-    const s = streamSummary({ LLM_POOL_KEYS: KEY_A }, db, makeHits(2), "HRT 风险？", fetchImpl)
+    const s = streamSummary(poolKeysEnv([KEY_A]), db, makeHits(2), "HRT 风险？", fetchImpl)
     expect(s.citations).toHaveLength(2)
     const chunks: string[] = []
     for await (const c of s) chunks.push(c)
@@ -466,7 +467,7 @@ describe("SSE 解析与流式总结", () => {
 
   it("流式池全灭 → 迭代时抛 llm-unavailable（调用方推降级事件）", async () => {
     const db = makeDb()
-    const s = streamSummary({ LLM_POOL_KEYS: "" }, db, makeHits(1), "问题", (async () => {
+    const s = streamSummary({}, db, makeHits(1), "问题", (async () => {
       throw new Error("should-not-be-called")
     }) as unknown as typeof fetch)
     const err = await (async () => {
@@ -487,7 +488,7 @@ describe("SSE 解析与流式总结", () => {
     const db = makeDb()
     const fetchImpl = (async () =>
       ({ ok: false, status: 500, text: async () => `boom ${KEY_A}`, json: async () => ({}) }) as unknown as Response) as unknown as typeof fetch
-    const s = streamSummary({ LLM_POOL_KEYS: KEY_A }, db, makeHits(1), "问题", fetchImpl)
+    const s = streamSummary(poolKeysEnv([KEY_A]), db, makeHits(1), "问题", fetchImpl)
     const err = await (async () => {
       try {
         for await (const chunk of s) {
@@ -515,17 +516,19 @@ describe("redactSecrets：错误信息脱敏", () => {
 })
 
 describe("createChatProvider：pool 隔离在 llm 池", () => {
-  it("只使用 LLM_POOL_KEYS，且 provider.model 可被 env 覆盖", () => {
+  it("只用合并池的 key（能力标签为 llm），且 provider.model 可被 env 覆盖", () => {
     const db = makeDb()
     const { pool, provider } = createChatProvider(
-      { LLM_POOL_KEYS: `${KEY_A},${KEY_B}`, EMBED_POOL_KEYS: "embed-x" },
+      poolKeysEnv([KEY_A, KEY_B]),
       db,
     )
     expect(pool).toBeInstanceOf(KeyPool)
     expect(pool.keys("llm")).toHaveLength(2)
-    expect(pool.keys("embed")).toHaveLength(1)
+    // 合并池：三个能力入口是**同一批** key（不再有"embed 池只有 1 把"这回事）
+    expect(pool.keys("embed")).toHaveLength(2)
+    expect(pool.keys("embed")).toBe(pool.keys("llm"))
     expect(provider.model).toBe(LLM_DEFAULT_MODEL)
-    const { provider: p2 } = createChatProvider({ LLM_POOL_KEYS: KEY_A, LLM_MODEL: "THUDM/GLM-4-9B-0414" }, db)
+    const { provider: p2 } = createChatProvider({ ...poolKeysEnv([KEY_A]), LLM_MODEL: "THUDM/GLM-4-9B-0414" }, db)
     expect(p2.model).toBe("THUDM/GLM-4-9B-0414")
   })
 })

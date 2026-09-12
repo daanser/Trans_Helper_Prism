@@ -17,6 +17,7 @@ import { KEY_DENY_PREFIX } from "../src/keyadmin"
 import { SCHEMA_MIGRATIONS, SCHEMA_STATEMENTS } from "../src/db/schemaStatements"
 import { aggregateKeyUsage, resolveWindowStart } from "../src/adminstats"
 import type { Env } from "../src/types"
+import { poolKeysEnv } from "./poolKeysEnv"
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -110,8 +111,8 @@ function makeEnv(over: Partial<Env> = {}): Env {
     INGEST_QUEUE: undefined as never,
     ADMIN_API_KEY: "admin-secret",
     JWT_SECRET: "j".repeat(64),
-    EMBED_POOL_KEYS: EMBED_SECRETS.join(","),
-    LLM_POOL_KEYS: LLM_SECRETS.join(","),
+    // 合并池（plan-keypool.md）：密钥只来自 POOL_KEYS_<n>
+    ...poolKeysEnv([...EMBED_SECRETS, ...LLM_SECRETS]),
     QUOTA_WINDOW_TOKENS: "1000",
     QUOTA_WINDOW_HOURS: "5",
     ...over,
@@ -733,14 +734,12 @@ describe("GET /api/v1/admin/keys", () => {
       db_rows: number
     }
 
+    // 合并池（plan-keypool.md §2.2）：只有一个池 `keys`，ref 与"能力"无关
     expect(body.pools).toEqual([
-      { pool: "embed", configured: 2, refs: ["embed-key-0", "embed-key-1"] },
-      // rerank 未单独配置 → 并入 llm_pool（plan §2），ref 前缀改写为 rerank-key-N
-      { pool: "llm", configured: 1, refs: ["llm-key-0"] },
-      { pool: "rerank", configured: 1, refs: ["rerank-key-0"] },
+      { pool: "keys", configured: 3, refs: ["pool-key-0", "pool-key-1", "pool-key-2"] },
     ])
     expect(body.db_rows).toBe(2)
-    expect(body.keys.map((k) => k.key_ref)).toEqual(["embed-key-1", "llm-key-0"]) // ORDER BY pool, key_ref
+    expect(body.keys.map((k) => k.key_ref)).toEqual(["embed-key-1", "llm-key-0"]) // ORDER BY pool, key_ref（DB 里的历史行）
 
     const json = JSON.stringify(body)
     expect(json).not.toMatch(/sk-/)
@@ -758,7 +757,7 @@ describe("GET /api/v1/admin/keys", () => {
     const body = (await resp.json()) as { keys: unknown[]; db_rows: number; pools: unknown[] }
     expect(body.keys).toEqual([])
     expect(body.db_rows).toBe(0)
-    expect(body.pools).toHaveLength(3)
+    expect(body.pools).toHaveLength(1) // 合并池：只有一个池 `keys`
   })
 
   it("缺 D1 → 仍 200（pools 来自 env，不依赖 D1）", async () => {
@@ -771,15 +770,18 @@ describe("GET /api/v1/admin/keys", () => {
     const body = (await resp.json()) as { keys: unknown[]; db_rows: number; pools: Array<{ refs: string[] }> }
     expect(body.keys).toEqual([])
     expect(body.db_rows).toBe(0)
-    expect(body.pools[0].refs).toEqual(["embed-key-0", "embed-key-1"])
+    expect(body.pools[0].refs).toEqual(["pool-key-0", "pool-key-1", "pool-key-2"])
   })
 
-  it("RERANK_POOL_KEYS 单独配置时 rerank 用自己的 ref", async () => {
+  it("合并池：pools 只有一项 keys，旧能力名不再是池（ref 与能力无关）", async () => {
     const { db } = makeDb({ keyRows: [] })
-    const env = makeEnv({ DB: db, RERANK_POOL_KEYS: "sk-fake-rerank-0,sk-fake-rerank-1" })
+    const env = makeEnv({ DB: db })
     const resp = await app.request("/api/v1/admin/keys", { headers: { Authorization: "Bearer admin-secret" } }, env)
-    const body = (await resp.json()) as { pools: Array<{ pool: string; refs: string[] }> }
-    expect(body.pools.find((p) => p.pool === "rerank")!.refs).toEqual(["rerank-key-0", "rerank-key-1"])
+    const body = (await resp.json()) as { pools: Array<{ pool: string; configured: number; refs: string[] }> }
+    expect(body.pools).toEqual([
+      { pool: "keys", configured: 3, refs: ["pool-key-0", "pool-key-1", "pool-key-2"] },
+    ])
+    expect(body.pools.some((p) => ["embed", "llm", "rerank"].includes(p.pool))).toBe(false)
     expect(JSON.stringify(body)).not.toMatch(/sk-/)
   })
 })
@@ -798,7 +800,7 @@ describe("POST /api/v1/admin/keys", () => {
       {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ key_ref: "llm-key-0", pool: "llm", enabled: false }),
+        body: JSON.stringify({ key_ref: "pool-key-2", pool: "keys", enabled: false }),
       },
       env,
     )
@@ -806,20 +808,20 @@ describe("POST /api/v1/admin/keys", () => {
     const body = (await resp.json()) as Record<string, unknown>
     expect(body).toMatchObject({
       ok: true,
-      key_ref: "llm-key-0",
-      pool: "llm",
+      key_ref: "pool-key-2",
+      pool: "keys", // 合并池：归一后恒为 keys
       enabled: false,
       configured: true,
       runtime_applied: true,
       audit_written: true,
-      disabled_refs: ["llm-key-0"],
+      disabled_refs: ["pool-key-2"],
     })
 
     // ① upsert：单条 ON CONFLICT，bind 里只有 ref/pool（绝无 secret）
     const upsert = calls.find((c) => /INSERT INTO provider_keys/i.test(c.sql))!
     expect(upsert.sql).toContain("ON CONFLICT(pool, key_ref) DO UPDATE")
-    expect(upsert.args).toContain("llm-key-0")
-    expect(upsert.args).toContain("llm")
+    expect(upsert.args).toContain("pool-key-2")
+    expect(upsert.args).toContain("keys")
     expect(upsert.args).toContain(0) // enabled = 0
     expect(JSON.stringify(upsert.args)).not.toMatch(/sk-/)
 
@@ -828,18 +830,19 @@ describe("POST /api/v1/admin/keys", () => {
     expect(audit).toHaveLength(1)
     expect(audit[0].args[1]).toBe("acc-admin-9") // actor_id（JWT sub）
     expect(audit[0].args[2]).toBe("key_disable") // action
-    expect(audit[0].args[3]).toBe("llm-key-0") // target = key_ref，不是真 key
-    expect(audit[0].args[4]).toBe("pool=llm") // detail
+    expect(audit[0].args[3]).toBe("pool-key-2") // target = key_ref，不是真 key
+    expect(audit[0].args[4]).toBe("pool=keys") // detail
     expect(JSON.stringify(audit[0].args)).not.toMatch(/sk-/)
 
-    // ③ 运行时效：KV 记下禁用集合（只放 ref）
-    expect(store.get(`${KEY_DENY_PREFIX}llm`)).toBe("llm-key-0")
+    // ③ 运行时效：KV **只写一个键** keydeny:keys（只放 ref）
+    expect(store.get(`${KEY_DENY_PREFIX}keys`)).toBe("pool-key-2")
+    expect([...store.keys()]).toEqual([`${KEY_DENY_PREFIX}keys`])
     expect(JSON.stringify([...store.entries()])).not.toMatch(/sk-/)
   })
 
   it("上架：upsert（enabled=1）+ 审计 key_enable + 从 KV 禁用集移除", async () => {
     const { db, calls } = makeDb({ keyRows: keyRows() })
-    const { kv, store } = makeKv({ seed: { [`${KEY_DENY_PREFIX}llm`]: "llm-key-0,llm-key-2" } })
+    const { kv, store } = makeKv({ seed: { [`${KEY_DENY_PREFIX}keys`]: "pool-key-0,pool-key-2" } })
     const env = makeEnv({ DB: db, SEARCH_CACHE: kv })
 
     const resp = await app.request(
@@ -847,14 +850,16 @@ describe("POST /api/v1/admin/keys", () => {
       {
         method: "POST",
         headers: { Authorization: "Bearer admin-secret", "Content-Type": "application/json" },
-        body: JSON.stringify({ key_ref: "llm-key-0", pool: "llm", enabled: true }),
+        // 历史的 pool 名（embed|llm|rerank）仍接受并归一到 keys（§2.6 零成本兼容）
+        body: JSON.stringify({ key_ref: "pool-key-0", pool: "llm", enabled: true }),
       },
       env,
     )
     const body = (await resp.json()) as Record<string, unknown>
     expect(body.enabled).toBe(true)
-    expect(body.disabled_refs).toEqual(["llm-key-2"])
-    expect(store.get(`${KEY_DENY_PREFIX}llm`)).toBe("llm-key-2")
+    expect(body.pool).toBe("keys") // 旧 pool 名被归一
+    expect(body.disabled_refs).toEqual(["pool-key-2"])
+    expect(store.get(`${KEY_DENY_PREFIX}keys`)).toBe("pool-key-2")
 
     const upsert = calls.find((c) => /INSERT INTO provider_keys/i.test(c.sql))!
     expect(upsert.args).toContain(1) // enabled = 1

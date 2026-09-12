@@ -3,7 +3,7 @@
 //
 // 定位：Workers 服务端统一代理硅基流动中国站 chat/completions（OpenAI 兼容）。前端永不直连、永不碰 key。
 // 关键设计：
-//   - 所有 key 走 Key Pool 的 **llm 池**（`LLM_POOL_KEYS`，§8.5）；401/403/429/402/5xx/超时自动换 key 重试一次
+//   - 所有 key 走 Key Pool 的 **llm 能力**（合并池：`POOL_KEYS_<n>`，见 plan-keypool.md）；401/403/429/402/5xx/超时自动换 key 重试一次
 //     （复用 keypool.withKeyRetry）；池全灭/超时 → 抛可识别 `LLMError`，调用方降级为纯搜索 + `AI总结暂不可用`。
 //   - 默认模型 `Qwen/Qwen3.5-4B`（§8.1 实测 0.42s），可被 `LLM_MODEL` 覆盖；端点可被 `LLM_ENDPOINT` 覆盖。
 //   - `max_tokens` 上限 800（§8.4 成本控制）；超时 `LLM_TIMEOUT_MS`（默认 20s）；支持 `stream: true` SSE。
@@ -161,7 +161,7 @@ export interface LlmCallOptions {
 
 /** 可识别错误码：调用方按码降级，不必解析文案。 */
 export type LlmErrorCode =
-  /** 池全灭 / 未配置 LLM_POOL_KEYS：整体降级为纯搜索 + LLM_UNAVAILABLE_NOTICE */
+  /** 池全灭 / 未配置任何 POOL_KEYS_<n>：整体降级为纯搜索 + LLM_UNAVAILABLE_NOTICE */
   | "llm-unavailable"
   /** 上游超时（含流式空闲超时） */
   | "llm-timeout"
@@ -760,9 +760,7 @@ export class SiliconFlowChat implements ChatProvider {
  * 今天就能编译。等 captain 把字段补进 `Env` 后，可把签名收紧成 `env: LlmEnv` 并获得补全。
  */
 export interface LlmEnv {
-  LLM_POOL_KEYS?: string
-  EMBED_POOL_KEYS?: string
-  RERANK_POOL_KEYS?: string
+  // 密钥不再逐项声明：来自 `POOL_KEYS_<n>`（动态前缀扫描，见 keypool.ts 的 parseMergedKeys）。
   LLM_MODEL?: string
   LLM_ENDPOINT?: string
   LLM_TIMEOUT_MS?: string

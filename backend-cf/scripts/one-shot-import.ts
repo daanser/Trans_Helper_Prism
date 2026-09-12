@@ -389,7 +389,8 @@ export async function runImport(args: CliArgs, env: ImportEnv): Promise<{ result
   // 仅 dry-run 或需要 key 时构造 provider
   let provider: SiliconFlowEmbedding | null = null
   if (!args.dryRun) {
-    const pool = new KeyPool({ EMBED_POOL_KEYS: cfg.siliconflowKey, LLM_POOL_KEYS: cfg.siliconflowKey }, { recordUsage: async () => {} })
+    // 单池（plan-keypool.md）：命令行/配置里的那一把 key 就是 POOL_KEYS_0
+    const pool = new KeyPool({ POOL_KEYS_0: cfg.siliconflowKey }, { recordUsage: async () => {} })
     provider = new SiliconFlowEmbedding({ model: cfg.model, dim: cfg.dim, endpoint: cfg.endpoint }, pool, args.fetchImpl)
   }
 

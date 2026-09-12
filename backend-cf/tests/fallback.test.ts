@@ -15,6 +15,7 @@ import { runSearch } from "../src/search"
 import type { FallbackResponse } from "../src/fallback"
 import type { RunSearchResult } from "../src/search"
 import type { Env, SearchResponse } from "../src/types"
+import { poolKeysEnv } from "./poolKeysEnv"
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -148,8 +149,7 @@ describe("bigram 模块只做分词（不再有任何 D1 写入口）", () => {
 describe("runSearch 触发 fallback（embedding 抛错）", () => {
   it("embedding 抛错 → 整链路落 fallback：fallback:true、notice 含「关键词」", async () => {
     const env = {
-      EMBED_POOL_KEYS: "sk-embed-a",
-      LLM_POOL_KEYS: "sk-llm-a",
+      ...poolKeysEnv(["sk-embed-a", "sk-llm-a"]),
     } as Partial<Env> as Env
     const fetchImpl = vi.fn(async () => {
       throw new Error("embedding-upstream-down")

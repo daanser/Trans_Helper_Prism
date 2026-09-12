@@ -13,6 +13,7 @@ import { app } from "../src/index"
 import { issueSession } from "../src/auth"
 import { withBatch } from "./d1MockBatch"
 import type { Env } from "../src/types"
+import { poolKeysEnv } from "./poolKeysEnv"
 
 const JWT_SECRET = "k".repeat(64)
 const PROXY_SECRET = "proxy-shared-secret"
@@ -110,7 +111,7 @@ function makeEnv(kv: KVNamespace): Env {
     JWT_SECRET,
     PROXY_SHARED_SECRET: PROXY_SECRET,
     REQUIRE_LOGIN: "0", // 匿名也走完整检索（fetch 由各用例 stub，零真实网络）
-    EMBED_POOL_KEYS: "sk-test-embed", // 让 embed 阶段有 key 可用（网络由 stubVectorStage 拦下）
+    ...poolKeysEnv(["sk-test-embed"]), // 让 embed 阶段有 key 可用（网络由 stubVectorStage 拦下）
     QDRANT_URL: "https://qdrant.example",
     EMBEDDING_DIM: "1024",
   } as unknown as Env
@@ -176,7 +177,7 @@ describe("热路径 KV 守卫（/search 响应路径上不得有 KV put）", () 
     //    首次请求会读 3 个 `keydeny:*`（禁用集，之后走 30s 进程内缓存），这是唯一允许的非 vec 读。
     expect(puts.every((k) => k.startsWith("vec:"))).toBe(true)
     expect([...gets, ...puts].some((k) => k.startsWith("rl:"))).toBe(false)
-    expect(gets.filter((k) => k.startsWith("keydeny:"))).toHaveLength(3)
+    expect(gets.filter((k) => k.startsWith("keydeny:"))).toHaveLength(1) // keydeny:keys
     expect(gets.filter((k) => k.startsWith("vec:"))).toHaveLength(1) // 检索缓存读（未命中）
 
     release()
@@ -203,7 +204,7 @@ describe("热路径 KV 守卫（/search 响应路径上不得有 KV put）", () 
     expect(puts.every((k) => k.startsWith("vec:"))).toBe(true)
   })
 
-  it("禁用集第二次请求起 0 次 KV 读（进程内缓存生效）；此前最多 3 次 keydeny 读", async () => {
+  it("禁用集第二次请求起 0 次 KV 读（进程内缓存生效）；合并池后只读 1 个 keydeny:keys 键", async () => {
     stubVectorStage()
     const { kv, gets, release } = makeCountingKv()
     const env = makeEnv(kv)
@@ -211,7 +212,8 @@ describe("热路径 KV 守卫（/search 响应路径上不得有 KV put）", () 
 
     await (await search(env, { ctx })).json()
     const denyReadsFirst = gets.filter((k) => k.startsWith("keydeny:")).length
-    expect(denyReadsFirst).toBe(3) // embed / llm / rerank 三池
+    expect(denyReadsFirst).toBe(1) // 合并池：只有 keydeny:keys 一个键
+    expect(gets.filter((k) => k === "keydeny:keys")).toHaveLength(1)
 
     gets.length = 0 // 只看第二次请求
     await (await search(env, { ctx })).json()
@@ -239,7 +241,7 @@ describe("热路径 KV 守卫（/search 响应路径上不得有 KV put）", () 
     expect(typeof body.timings?.gate_burst_ms).toBe("number")
 
     // 首次请求：3 次 keydeny 读（禁用集，之后 30s 内不再读）+ 1 次 vec 读（检索缓存）+ 1 次 vec put（交给 waitUntil）
-    expect(gets.filter((k) => k.startsWith("keydeny:"))).toHaveLength(3)
+    expect(gets.filter((k) => k.startsWith("keydeny:"))).toHaveLength(1) // keydeny:keys
     expect(gets.filter((k) => k.startsWith("vec:"))).toHaveLength(1)
     expect([...gets, ...puts].some((k) => k.startsWith("rl:"))).toBe(false) // 限流器键彻底消失
     expect(puts).toHaveLength(1)

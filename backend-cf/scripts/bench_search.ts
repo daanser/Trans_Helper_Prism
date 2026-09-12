@@ -2,7 +2,7 @@
 // TransHelper Prism — 压测脚本 (tasks.md T1.4)
 // 目的：20 个真实 wiki query 对比 rerank 开/关的 P50 与首条相关率，终定 use_reranker 默认开关。
 // 复用生产链路 runSearch，跑在 Workers 外调线上 API（与部署同代码路径）。
-// key 只从 backend-cf/.dev.vars 读（QDRANT_URL/QDRANT_API_KEY/EMBED_POOL_KEYS/LLM_POOL_KEYS），
+// key 只从 backend-cf/.dev.vars 读（QDRANT_URL/QDRANT_API_KEY/POOL_KEYS_0…），
 // 脚本只打印 状态/延迟/命中相关度，绝不回显 key。
 // 用法：npx tsx scripts/bench_search.ts [--reruns N] [--topk K]
 import { readFileSync } from "node:fs"
@@ -70,9 +70,14 @@ async function main(): Promise<void> {
   const topK = parseInt(process.argv.find((a) => a.startsWith("--topk="))?.split("=")[1] ?? "10", 10)
   const corpora = ["mtf-wiki", "ftm-wiki", "rle-wiki", "miomtfwiki"]
 
+  // 密钥：把 .dev.vars 里所有 `POOL_KEYS_<n>` 原样带进 env（扫描/解析交给 src/keypool.ts）
+  const poolKeys = Object.fromEntries(Object.entries(dev).filter(([k]) => /^POOL_KEYS_\d+$/.test(k)))
+  if (Object.keys(poolKeys).length === 0) {
+    throw new Error("缺少密钥：请在 backend-cf/.dev.vars 里配置 POOL_KEYS_0=sk-...（多把再加 POOL_KEYS_1/2…）")
+  }
+
   const env = {
-    EMBED_POOL_KEYS: dev["EMBED_POOL_KEYS"],
-    LLM_POOL_KEYS: dev["LLM_POOL_KEYS"],
+    ...poolKeys,
     QDRANT_URL: dev["QDRANT_URL"],
     QDRANT_API_KEY: dev["QDRANT_API_KEY"],
     EMBEDDING_MODEL: "BAAI/bge-m3",

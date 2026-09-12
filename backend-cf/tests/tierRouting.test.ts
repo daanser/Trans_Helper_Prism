@@ -9,6 +9,7 @@ import { withBatch } from "./d1MockBatch"
 import { app } from "../src/index"
 import { issueSession } from "../src/auth"
 import type { Env } from "../src/types"
+import { poolKeysEnv } from "./poolKeysEnv"
 
 const SECRET = "proxy-shared-secret"
 
@@ -335,7 +336,7 @@ describe("全局匿名熔断（§6）：只掐匿名，登录用户不受影响"
   function breakerEnv(over: Partial<Env> = {}): Env {
     return makeEnv({
       REQUIRE_LOGIN: "0",
-      EMBED_POOL_KEYS: "test-embed-key",
+      ...poolKeysEnv(["test-embed-key"]),
       EMBEDDING_ENDPOINT: "https://embed.example/v1/embeddings",
       ANON_GLOBAL_PER_MIN: "2",
       ANON_GLOBAL_HARD_PER_MIN: "3",

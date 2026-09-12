@@ -8,6 +8,7 @@
 import { describe, it, expect, vi } from "vitest"
 import { SiliconFlowEmbedding, estimateTokens, chunkBatches } from "../src/embeddings"
 import { KeyPool } from "../src/keypool"
+import { poolKeysEnv } from "./poolKeysEnv"
 
 /** 内存版 KeyPool db mock。 */
 function makeDb() {
@@ -20,7 +21,7 @@ function makeDb() {
 /** 用两个 key 构造一个 embed provider + 可注入响应的 fetch mock。 */
 function makeProvider(fetchImpl: typeof fetch) {
   const db = makeDb()
-  const pool = new KeyPool({ EMBED_POOL_KEYS: "sk-first,sk-second", LLM_POOL_KEYS: "sk-llm", RERANK_POOL_KEYS: "" }, db)
+  const pool = new KeyPool(poolKeysEnv(["sk-first", "sk-second"]), db)
   const provider = new SiliconFlowEmbedding(
     { model: "BAAI/bge-m3", dim: 1024, endpoint: "https://api.siliconflow.cn/v1/embeddings" },
     pool,
@@ -111,7 +112,7 @@ describe("embedBatch", () => {
     const vecs = await provider.embedBatch(["x", "y"], { batch: { maxRetries: 3, sleep: noSleep } })
     expect(vecs).toHaveLength(2)
     // 触发过 429 后，第一个 key 进入冷却
-    const first = pool.keys("embed").find((k) => k.ref === "embed-key-0")!
+    const first = pool.keys("embed").find((k) => k.ref === "pool-key-0")!
     expect(first.consecutiveFailures).toBeGreaterThanOrEqual(1)
     // 重试发生了（specialFetch 被调用 >=2 次：一次 429 + 一次 200）
     expect(specialFetch).toHaveBeenCalledTimes(2)

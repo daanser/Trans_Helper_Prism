@@ -5,25 +5,31 @@
 //   ① `GET /admin/keys` 的数据面：provider_keys 行的**脱敏投影**（只出 `key_ref`/计数/成本，
 //      绝不出现 key 明文）+ env 池的 ref 清单（`parsePoolKeys` 推导，同样只出 ref）；
 //   ② `POST /admin/keys` 的写面：`provider_keys` upsert（enabled 字段）；
-//   ③ **运行时效**：禁用集合放 KV（`keydeny:<pool>` = 逗号分隔 ref），供 KeyPool 剔除被禁 ref。
+//   ③ **运行时效**：禁用集合放 KV（**单个** `keydeny:keys` = 逗号分隔 ref），供 KeyPool 剔除被禁 ref。
 //
 // ── 密钥底线（plan §9 / tasks.md 跨阶段硬性要求 2）──
-// 真 key 只活在 Workers secrets（`EMBED_POOL_KEYS` / `LLM_POOL_KEYS`，逗号分隔）里，
-// 本模块**从不**读取/返回/记录 secret 本身：对外一切标识都用 `key_ref`（形如 `llm-key-0`）。
-// `isSafeKeyRef()` 再兜一层：只有 `<pool>-key-<n>` 形状才允许进入 KV/审计，防止误把真 key 当 ref 传进来。
+// 真 key 只活在 Workers secrets（`POOL_KEYS_0` / `POOL_KEYS_1` / ……，见 keypool.ts）里，
+// 本模块**从不**读取/返回/记录 secret 本身：对外一切标识都用 `key_ref`（形如 `pool-key-0`）。
+// `isSafeKeyRef()` 再兜一层：只有 `<name>-key-<n>[#k]` 形状才允许进入 KV/审计，防止误把真 key 当 ref 传进来。
 //
 // ── fail-open（硬要求）──
 // 读 KV / 解析 / 写 KV 的任何异常 → **视为无禁用**（返回空集合或 ok:false），
 // 绝不抛错、绝不让搜索或 LLM 因管理面故障而失败。KV 缺失同理（返回空）。
 // D1 的读写异常则向上抛给路由（管理接口如实报 503），与检索路径无关。
 
-import { parsePoolKeys, type PoolName } from "./keypool"
+import { MERGED_POOL_NAME, parseMergedKeys, type PoolName } from "./keypool"
 
-/** 三个池的固定顺序（对外 pools[] 顺序稳定，便于前端渲染/测试断言）。 */
-export const POOL_NAMES: readonly PoolName[] = ["embed", "llm", "rerank"] as const
+/**
+ * 能力标签（embedding / 聊天 / rerank）：**不再是对外的池**，只用于"从哪个能力入口调进来"。
+ * 合并池（plan-keypool.md §2.2）后对外只有一个池 `keys`。
+ */
+export const POOL_CAPABILITIES: readonly PoolName[] = ["embed", "llm", "rerank"] as const
 
-/** KV 里禁用集合的 key 前缀：`keydeny:<pool>`。 */
+/** KV 里禁用集合的 key 前缀；合并池下**只有** `keydeny:keys` 一个键（旧的三键不再读，线上为空集）。 */
 export const KEY_DENY_PREFIX = "keydeny:"
+
+/** 禁用集在 KV 里的完整键名（单池）。 */
+export const KEY_DENY_KEY = `${KEY_DENY_PREFIX}${MERGED_POOL_NAME}`
 
 /** provider_keys 单页上限（防未知规模把 admin 响应撑爆）。 */
 export const ADMIN_KEY_ROW_LIMIT = 500
@@ -41,51 +47,44 @@ function envString(env: unknown, key: string): string | undefined {
   return typeof v === "string" ? v : undefined
 }
 
-/** 是否合法池名。 */
-export function isPoolName(v: unknown): v is PoolName {
-  return v === "embed" || v === "llm" || v === "rerank"
+/** 是否合法池名：`keys`（唯一真实池）或旧的能力名（兼容既有脚本，映射到同一池）。 */
+export function isPoolName(v: unknown): v is PoolName | typeof MERGED_POOL_NAME {
+  return v === MERGED_POOL_NAME || v === "embed" || v === "llm" || v === "rerank"
+}
+
+/** 把任意合法池名归一成唯一池名 `keys`（`embed|llm|rerank` 是历史写法，等价）。 */
+export function normalizePoolName(_v: unknown): typeof MERGED_POOL_NAME {
+  return MERGED_POOL_NAME
 }
 
 /**
- * key_ref 形状校验：`<pool>-key-<n>`（`parsePoolKeys` 生成的就是这个形状）。
+ * key_ref 形状校验：`<name>-key-<n>` 或 `<name>-key-<n>#k`（`parseMergedKeys` 生成的就是这两种形状；
+ * `#k` 是"同一变量里逗号分隔的第 k 把"）。
  * **刻意收紧**：真 key（`sk-…`）无法通过，避免把 secret 写进 KV / 审计 / 响应。
  */
 export function isSafeKeyRef(ref: unknown): boolean {
-  return typeof ref === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}-key-\d{1,4}$/.test(ref)
+  return typeof ref === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]{0,47}-key-\d{1,4}(#\d{1,2})?$/.test(ref)
 }
 
-/** 从 `*-key-<n>` 取序号；不匹配 → null。 */
+/** 从 `*-key-<n>[#k]` 取序号 n（忽略 `#k` 后缀）；不匹配 → null。 */
 export function refIndex(ref: string): number | null {
-  const m = /-key-(\d{1,4})$/.exec(ref)
+  const m = /-key-(\d{1,4})(?:#\d{1,2})?$/.exec(ref)
   if (!m) return null
   const n = Number(m[1])
   return Number.isFinite(n) ? n : null
 }
 
-/**
- * 把 ref 的池前缀从 from 换成 to（序号不变）：`llm-key-0` → `rerank-key-0`。
- * 只映射 `<from>-key-<n>` 形状的 ref（别的前缀原样丢弃），避免把不相关的 ref 误映射到本池。
- */
-export function mapPoolRefs(from: PoolName, to: PoolName, refs: readonly string[]): string[] {
-  const prefix = `${from}-key-`
-  const out: string[] = []
-  for (const r of refs) {
-    if (!r.startsWith(prefix)) continue
-    const idx = refIndex(r)
-    if (idx === null) continue
-    out.push(`${to}-key-${idx}`)
-  }
-  return dedupeSorted(out)
-}
+// 注：原 `mapPoolRefs()`（把 llm 池的禁用按序号映射到 rerank 池）在**合并池**后已无意义 ——
+// 一把 key 就是一个整体（禁用即全能力禁用），不再存在"跨池映射"。2026-09-12 随 plan-keypool.md §2.3 删除。
 
-/** 去重 + 稳定排序（KV 值可比对、测试可断言）。 */
+/** 去重 + 稳定排序（KV 值可比对、测试可断言）：同前缀按序号，其余按字典序。 */
 function dedupeSorted(refs: readonly string[]): string[] {
   return [...new Set(refs)].sort((a, b) => {
     const ia = refIndex(a)
     const ib = refIndex(b)
-    if (ia !== null && ib !== null && a.slice(0, a.lastIndexOf("-key-")) === b.slice(0, b.lastIndexOf("-key-"))) {
-      return ia - ib
-    }
+    const pa = a.replace(/-key-\d{1,4}(#\d{1,2})?$/, "")
+    const pb = b.replace(/-key-\d{1,4}(#\d{1,2})?$/, "")
+    if (ia !== null && ib !== null && pa === pb) return ia - ib || a.localeCompare(b)
     return a.localeCompare(b)
   })
 }
@@ -171,37 +170,28 @@ export async function readDeniedPoolsCached(
 }
 
 /**
- * 读 KV 得到「每个池被禁用的 ref」。
+ * 读 KV 得到「被禁用的 ref」，并**映射进三个能力槽位**（合并池语义，plan-keypool.md §2.3）。
+ *
+ * 数据源**只有一个** KV 键 `keydeny:keys`（逗号分隔 ref）；返回的三项内容**完全相同**：
+ *   · 调用点（index.ts 的 `applyDeniedToPool(pool, denied, "llm")`、`KeyPool.applyDenied`）零改动；
+ *   · 语义上"禁用一把 key = embed/rerank/llm 三条链路都不可用" ✓。
+ * 旧的三键（`keydeny:embed|llm|rerank`）**不再读**（线上是空集；要清可直接不管）。
+ *
  * **绝不抛错**：KV 缺失 / 读失败 / 解析失败 / env 异常 → 空集合（fail-open）。
- * rerank 默认并入 llm_pool（plan §2）：未单独配 `RERANK_POOL_KEYS` 时，rerank 池的 ref 与 llm 池
- * 按序号一一对应，故把 llm 的禁用按序号映射到 rerank——否则「下架 llm-key-0」在默认配置下
- * 对 rerank 调用不生效（rerank 默认开，是最热的路径）。
  */
-export async function readDeniedPools(kv: DenyKvStore | undefined, env: unknown = {}): Promise<DeniedPools> {
-  const out = emptyDeniedPools()
-  if (!kv) return out
+export async function readDeniedPools(kv: DenyKvStore | undefined, _env: unknown = {}): Promise<DeniedPools> {
+  if (!kv) return emptyDeniedPools()
+  let refs: string[] = []
   try {
-    const read = async (pool: PoolName): Promise<string[]> => {
-      try {
-        return parseDenyList(await kv.get(`${KEY_DENY_PREFIX}${pool}`))
-      } catch {
-        return []
-      }
-    }
-    const [embed, llm, rerank] = await Promise.all([read("embed"), read("llm"), read("rerank")])
-    out.embed = embed
-    out.llm = llm
-    const ownRerankKeys = Boolean(envString(env, "RERANK_POOL_KEYS"))
-    out.rerank = ownRerankKeys ? rerank : mapPoolRefs("llm", "rerank", llm)
-    return out
+    refs = parseDenyList(await kv.get(KEY_DENY_KEY))
   } catch {
-    // 任何意外（含 Promise.all 之外的同步异常）→ 无禁用
-    return emptyDeniedPools()
+    refs = [] // 读失败 → 视为无禁用（fail-open）
   }
+  return { embed: refs, llm: refs, rerank: refs }
 }
 
 /**
- * 上架/禁用一把 key 的**运行时效**：更新 KV 里的 `keydeny:<pool>`。
+ * 上架/禁用一把 key 的**运行时效**：更新 KV 里的 `keydeny:keys`（合并池只有这一个键）。
  * `enabled=true` → 从集合移除；`enabled=false` → 加入集合。
  * **绝不抛错**（fail-open）：KV 缺失 / 写失败 / ref 非法 → `{ ok:false, refs:[] }`，
  * 调用方据此回 `runtime_applied:false`，但请求本身仍成功（DB 已记 disabled）。
@@ -209,34 +199,29 @@ export async function readDeniedPools(kv: DenyKvStore | undefined, env: unknown 
  */
 export async function setKeyDenied(
   kv: DenyKvStore | undefined,
-  pool: PoolName,
   keyRef: string,
   enabled: boolean,
 ): Promise<{ ok: boolean; refs: string[] }> {
   if (!kv || !isSafeKeyRef(keyRef)) return { ok: false, refs: [] }
   try {
-    const current = parseDenyList(await kv.get(`${KEY_DENY_PREFIX}${pool}`))
+    const current = parseDenyList(await kv.get(KEY_DENY_KEY))
     const next = new Set(current.filter((r) => r !== keyRef))
     if (!enabled) next.add(keyRef)
     const refs = dedupeSorted([...next])
-    await kv.put(`${KEY_DENY_PREFIX}${pool}`, serializeDenyList(refs))
+    await kv.put(KEY_DENY_KEY, serializeDenyList(refs))
     return { ok: true, refs }
   } catch {
     return { ok: false, refs: [] }
   }
 }
 
-/** env 里某池配置的 key ref（**只出 ref**；secret 绝不离开本函数）。 */
-export function poolRefsFromEnv(env: unknown, pool: PoolName): string[] {
-  // rerank 默认并入 llm_pool（plan §2），与 KeyPool 构造里的取法保持一致。
-  const raw =
-    pool === "embed"
-      ? envString(env, "EMBED_POOL_KEYS")
-      : pool === "rerank"
-        ? (envString(env, "RERANK_POOL_KEYS") ?? envString(env, "LLM_POOL_KEYS"))
-        : envString(env, "LLM_POOL_KEYS")
+/**
+ * env 里配置的 key ref（**只出 ref**；secret 绝不离开本函数）。
+ * 合并池后与 `pool` 无关（三个能力入口同一份），参数保留只是为了让既有调用点零改动。
+ */
+export function poolRefsFromEnv(env: unknown, _pool?: PoolName): string[] {
   try {
-    return parsePoolKeys(raw, pool).map((k) => k.ref)
+    return parseMergedKeys(env, () => undefined).map((k) => k.ref)
   } catch {
     return []
   }
@@ -244,17 +229,19 @@ export function poolRefsFromEnv(env: unknown, pool: PoolName): string[] {
 
 /** 一池的对外视图（`configured` = ref 数量）。 */
 export interface AdminPoolInfo {
-  pool: PoolName
+  /** 合并池后恒为 `"keys"` */
+  pool: string
   configured: number
   refs: string[]
 }
 
-/** `GET /admin/keys` 的 `pools[]`：三个池的 ref 清单（**只有 ref，没有 secret**）。 */
+/**
+ * `GET /admin/keys` 的 `pools[]`：合并池后**只有一项** `{pool:"keys", configured:N, refs:[...]}`。
+ * watchdog ④ 与 `/admin` 前端都是"遍历 pools[] 判 configured < 2"，因此无需改动即继续有效。
+ */
 export function buildPoolInfos(env: unknown): AdminPoolInfo[] {
-  return POOL_NAMES.map((pool) => {
-    const refs = poolRefsFromEnv(env, pool)
-    return { pool, configured: refs.length, refs }
-  })
+  const refs = poolRefsFromEnv(env)
+  return [{ pool: MERGED_POOL_NAME, configured: refs.length, refs }]
 }
 
 /** provider_keys 行的对外投影（脱敏）。 */
@@ -311,7 +298,7 @@ export function toAdminKeyRow(row: ProviderKeyDbRow): AdminKeyRow {
   const updatedAt = num(row.updated_at)
   return {
     key_ref: keyRef,
-    pool: str(row.pool, "embed"),
+    pool: str(row.pool, MERGED_POOL_NAME),
     status: str(row.status, "active"),
     success_count: num(row.success_count),
     failure_count: num(row.failure_count),
@@ -351,7 +338,7 @@ export async function fetchProviderKeyRows(db: D1Database): Promise<AdminKeyRow[
  */
 export async function upsertProviderKey(
   db: D1Database,
-  input: { pool: PoolName; keyRef: string; enabled: boolean; nowMs?: number },
+  input: { pool: string; keyRef: string; enabled: boolean; nowMs?: number },
 ): Promise<void> {
   const now = input.nowMs ?? Date.now()
   const enabledFlag = input.enabled ? 1 : 0

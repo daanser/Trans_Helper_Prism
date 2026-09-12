@@ -12,6 +12,7 @@ import { app, makeKeyUsageDb } from "../src/index"
 import { issueSession } from "../src/auth"
 import type { Env } from "../src/types"
 import type { KeyPoolDb, UsageRecord } from "../src/keypool"
+import { poolKeysEnv } from "./poolKeysEnv"
 
 // 捕获 runSearch 交给 embedding provider 的 KeyPoolDb（见下方 /search 接线用例）。
 // 注意：embeddings.ts 目前**只持有**这个 db、从不调 recordUsage（key_usage 里只有 chat 行，
@@ -236,8 +237,7 @@ function routeEnv(db: D1Database, over: Partial<Env> = {}): Env {
     INGEST_QUEUE: undefined as never,
     QDRANT_URL: "https://qdrant.example",
     QDRANT_API_KEY: "qdrant-test-key",
-    EMBED_POOL_KEYS: "sk-fake-embed-0001,sk-fake-embed-0002",
-    LLM_POOL_KEYS: "sk-fake-llm-0001",
+    ...poolKeysEnv(["sk-fake-embed-0001", "sk-fake-embed-0002", "sk-fake-llm-0001"]),
     EMBEDDING_DIM: "8",
     REQUIRE_LOGIN: "0", // 匿名也走完整检索（否则提前 fallback，不产生 embedding 调用）
     JWT_SECRET: "j".repeat(64),
@@ -341,8 +341,8 @@ describe("POST /api/v1/chat：LLM 记账落到账号（端到端）", () => {
     // 记账归属：llm 池的 key_ref + account_id = JWT sub
     expect(inserts).toHaveLength(1)
     expect(inserts[0][1]).toBe("acc-1")
-    expect(inserts[0][2]).toBe("llm")
-    expect(inserts[0][3]).toBe("llm-key-0")
+    expect(inserts[0][2]).toBe("llm") // **能力**标签仍是 llm（分能力统计不丢）
+    expect(inserts[0][3]).toBe("pool-key-0") // 合并池的 ref
     expect(inserts[0][4]).toBe("chat")
     expect(inserts[0][8]).toBe(12)
     expect(inserts[0][9]).toBe(34)

@@ -156,7 +156,7 @@ jobs:
               low=$(printf '%s' "$body" | jq -r '[.pools[]? | select(((.configured|tonumber) > 0) and ((.configured|tonumber) < 2)) | "\(.pool)(\(.configured))"] | join(", ")' 2>/dev/null || echo "")
               summary=$(printf '%s' "$body" | jq -r '[.pools[]? | "\(.pool)=\(.configured)"] | join(" ")' 2>/dev/null || echo "解析失败")
               if [ -n "$zero" ]; then
-                problems+=("④ key 池**没有可用 key**：${zero} → 该能力已不可用，必须立刻补货（EMBED_POOL_KEYS / LLM_POOL_KEYS，逗号分隔）")
+                problems+=("④ key 池**没有可用 key**：${zero} → 全部能力都不可用，必须立刻在 CF 控制台补 `POOL_KEYS_0`（多把再加 POOL_KEYS_1/2…）")
               elif [ -n "$low" ]; then
                 echo "::warning::④ key 池无冗余：${low} → 建议补到 ≥2 把（单把 key 被限流/失效时只能降级，AI 伴读会不可用但检索不受影响）"
                 notes+=("④ key 池可用但无冗余（${low}；建议补到 ≥2 把）")

@@ -3,7 +3,15 @@
 // 供应商锁定：硅基流动中国站 bge 系列。抽象为接口以保留切换能力（§8.5 逃生通道）。
 // 所有 key 走 KeyPool（embed_pool）；401/403/429/超时自动换 key 重试一次；失败抛错给上层降级。
 
-import { KeyPool, PoolKey, withKeyRetry, KeyPoolDb, KeyPoolOptions, shouldRetryStatus } from "./keypool"
+import {
+  KeyPool,
+  PoolKey,
+  withKeyRetry,
+  KeyPoolDb,
+  KeyPoolOptions,
+  shouldRetryStatus,
+  envString,
+} from "./keypool"
 
 /** 调用方向：query（检索）或 document（入库）。二者共用同一 instruction prefix（§5.3）。 */
 export interface EmbedOpts {
@@ -292,7 +300,11 @@ export class SiliconFlowEmbedding implements EmbeddingProvider {
 
 /** 用 env 构造 KeyPool 后实例化硅基流动 embedding provider 的工厂。 */
 export function createEmbeddingProvider(
-  env: { EMBED_POOL_KEYS?: string; LLM_POOL_KEYS?: string; RERANK_POOL_KEYS?: string; EMBEDDING_ENDPOINT?: string; EMBEDDING_MODEL?: string; EMBEDDING_DIM?: string; EMBED_TIMEOUT_MS?: string },
+  /**
+   * 任意 env 形状：密钥来自 `POOL_KEYS_<n>`（动态前缀扫描，见 keypool.ts），
+   * 其余配置项用 `envString()` 读 —— 所以这里不再逐个声明字段。
+   */
+  env: unknown,
   db: KeyPoolDb,
   fetchImpl: typeof fetch = defaultFetch,
   /**
@@ -304,10 +316,10 @@ export function createEmbeddingProvider(
   const pool = new KeyPool(env, db, options)
   const provider = new SiliconFlowEmbedding(
     {
-      model: env.EMBEDDING_MODEL ?? "BAAI/bge-m3",
-      dim: parseInt(env.EMBEDDING_DIM ?? "1024", 10),
-      endpoint: env.EMBEDDING_ENDPOINT,
-      timeoutMs: parseTimeoutMsSafe(env.EMBED_TIMEOUT_MS),
+      model: envString(env, "EMBEDDING_MODEL") ?? "BAAI/bge-m3",
+      dim: parseInt(envString(env, "EMBEDDING_DIM") ?? "1024", 10),
+      endpoint: envString(env, "EMBEDDING_ENDPOINT"),
+      timeoutMs: parseTimeoutMsSafe(envString(env, "EMBED_TIMEOUT_MS")),
     },
     pool,
     fetchImpl,

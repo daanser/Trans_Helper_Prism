@@ -8,7 +8,10 @@
 # 需要在仓库 Settings → Secrets and variables → Actions 配置：
 #   QDRANT_URL        Qdrant Cloud 地址（https://xxx.cloud.qdrant.io）
 #   QDRANT_API_KEY    Qdrant API key
-#   EMBED_POOL_KEYS   硅基流动 embedding key（可逗号分隔多个）
+#   POOL_KEYS_0       硅基流动 key（**单池**：embedding/rerank/LLM 共用，见 plan-keypool.md）
+#   POOL_KEYS_1       可选：第二把 key（**建议至少有 2 把**，一把被限流/失效时才有退路）
+#   POOL_KEYS_2       可选：第三把
+#                     ⚠️ 再加 key = 加一个同名 secret + 下面 env 里加一行（数字不要求连续）
 #   ADMIN_API_KEY     可选：摄取跑完把摘要上报给 Worker（它代笔写 D1 ingest_runs，
 #                     后台 /admin 才看得见摄取历史），并读写"零 chunk 文件集合"
 #                     （/admin/ingest/files，技术债 #5）；未配置则这两件事自动跳过，摄取不受影响
@@ -64,7 +67,10 @@ jobs:
         env:
           QDRANT_URL: ${{ secrets.QDRANT_URL }}
           QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
-          EMBED_POOL_KEYS: ${{ secrets.EMBED_POOL_KEYS }}
+          # 密钥：一个变量一把（多把 = 多加一个 secret + 加一行；数字不要求连续，删中间一把不影响其它 ref）
+          POOL_KEYS_0: ${{ secrets.POOL_KEYS_0 }}
+          POOL_KEYS_1: ${{ secrets.POOL_KEYS_1 }}
+          POOL_KEYS_2: ${{ secrets.POOL_KEYS_2 }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # 让脚本把每个 wiki 的结果写成机器可读摘要，供下一步上报（见 scripts/ingest-incremental.ts 文件头）
           INGEST_SUMMARY_PATH: ${{ runner.temp }}/ingest-summary.json

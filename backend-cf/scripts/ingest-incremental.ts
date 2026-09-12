@@ -13,7 +13,7 @@
 //   4. 不变的文件零请求、零 embedding
 //
 // 用法：
-//   QDRANT_URL=... QDRANT_API_KEY=... EMBED_POOL_KEYS=... GITHUB_TOKEN=... \
+//   QDRANT_URL=... QDRANT_API_KEY=... POOL_KEYS_0=... GITHUB_TOKEN=... \
 //     npx tsx scripts/ingest-incremental.ts [--only=mtf-wiki] [--full] [--dry-run]
 //
 // 可选（技术债 #5，见 src/ingestfiles.ts 文件头）：`ADMIN_API_KEY` + `API_BASE` 同时存在时，
@@ -45,7 +45,7 @@ import {
 import { createEmbeddingProvider } from "../src/embeddings"
 import { ensureCollection, upsertPoints, type QdrantPoint } from "./one-shot-import"
 import { shouldProcessFile } from "../src/ingestfiles"
-import type { KeyPoolDb } from "../src/keypool"
+import { parseMergedKeys, type KeyPoolDb } from "../src/keypool"
 
 // ── CLI ──
 const argv = process.argv.slice(2)
@@ -56,7 +56,8 @@ const ONLY = argv.find((a) => a.startsWith("--only="))?.split("=")[1]
 // ── 环境 ──
 const QDRANT_URL = (process.env.QDRANT_URL ?? "").trim().replace(/\/+$/, "")
 const QDRANT_API_KEY = (process.env.QDRANT_API_KEY ?? "").trim()
-const EMBED_POOL_KEYS = (process.env.EMBED_POOL_KEYS ?? "").trim()
+// 密钥：`POOL_KEYS_0` / `POOL_KEYS_1` / ……（与 src 用**同一份**解析函数扫描 process.env，别再各写一份）
+const POOL_KEYS = parseMergedKeys(process.env)
 const GITHUB_TOKEN = (process.env.GITHUB_TOKEN ?? "").trim()
 const EMBEDDING_DIM = parseInt(process.env.EMBEDDING_DIM ?? "1024", 10)
 // 零 chunk 集合（技术债 #5）：两个都配了才启用；任一缺失 → 静默退化为"照旧复核"
@@ -65,7 +66,9 @@ const API_BASE = (process.env.API_BASE ?? "").trim().replace(/\/+$/, "")
 const ZERO_CHUNK_ENABLED = ADMIN_API_KEY !== "" && API_BASE !== ""
 
 if (!QDRANT_URL) throw new Error("缺少 QDRANT_URL")
-if (!EMBED_POOL_KEYS) throw new Error("缺少 EMBED_POOL_KEYS")
+if (POOL_KEYS.length === 0) {
+  throw new Error("缺少密钥：请配置 POOL_KEYS_0（形如 POOL_KEYS_0=sk-...；多把就再加 POOL_KEYS_1/2…）")
+}
 
 const noopDb: KeyPoolDb = { async recordUsage() {} }
 
@@ -354,7 +357,8 @@ async function runWiki(wikiId: string): Promise<WikiSummary> {
   if (chunks.length > 0) {
     await ensureCollection(QDRANT_URL, QDRANT_API_KEY, collection, EMBEDDING_DIM, fetch)
     await ensureTextIndex(collection) // 回退分支（Qdrant 全文检索）依赖此索引
-    const { provider } = createEmbeddingProvider({ EMBED_POOL_KEYS }, noopDb)
+    // 直接把手边的 env（含 POOL_KEYS_<n>）交给工厂 —— 工厂内部用同一个 parseMergedKeys 解析
+    const { provider } = createEmbeddingProvider(process.env, noopDb)
     const batchSize = 32
     for (let i = 0; i < chunks.length; i += batchSize) {
       const batch = chunks.slice(i, i + batchSize)

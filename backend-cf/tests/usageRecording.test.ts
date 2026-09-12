@@ -7,6 +7,7 @@ import { describe, it, expect, vi } from "vitest"
 import { createEmbeddingProvider } from "../src/embeddings"
 import { createRerankProvider } from "../src/rerank"
 import type { KeyPoolDb, UsageRecord } from "../src/keypool"
+import { poolKeysEnv } from "./poolKeysEnv"
 
 function makeDb() {
   const records: UsageRecord[] = []
@@ -18,7 +19,7 @@ function makeDb() {
   return { db, records }
 }
 
-const ENV = { EMBED_POOL_KEYS: "sk-test-embed-a", LLM_POOL_KEYS: "sk-test-llm-a" }
+const ENV = poolKeysEnv(["sk-test-embed-a", "sk-test-llm-a"])
 
 describe("检索链路记账（embeddings / rerank）", () => {
   it("embedding 成功后写 key_usage：pool=embed、endpoint=embeddings、status=ok", async () => {
@@ -36,7 +37,7 @@ describe("检索链路记账（embeddings / rerank）", () => {
     expect(records[0].pool).toBe("embed")
     expect(records[0].endpoint).toBe("embeddings")
     expect(records[0].status).toBe("ok")
-    expect(records[0].keyRef).toMatch(/^embed-key-\d+$/)
+    expect(records[0].keyRef).toMatch(/^pool-key-\d+$/)
     expect(typeof records[0].tokensIn).toBe("number")
   })
 
