@@ -57,16 +57,18 @@
       </button>
     </div>
 
-    <!-- 下层过滤控制：**确定性的两行**（不再依赖 flex 自动换行 —— 那会把标签挤成孤行、
-         把控件顶出卡片、并让按钮错位，三次翻车的根因）
-         第一行 = 知识库（标签 + 四个按钮，独占整行因此永远不会被挤压）
-         第二行 = 参数控件（返回条数 / 精准重排 / AI 伴读，靠右） -->
+    <!-- 下层过滤控制（2026-09-12 用户定稿）：
+         **同一行 = 左「知识库」芯片组 + 右「高级」按钮**（justify-between）。
+         · 「高级」永不换行、永不压缩（shrink-0 + whitespace-nowrap）
+         · 只有**芯片区**会在空间不足时收缩/换行，绝不挤压右侧按钮
+         · 宽度**真的不够**（<640px）才降级成两行：芯片一行、高级一行（右对齐） -->
     <div class="mt-5 space-y-3 border-t border-slate-100 pt-4 dark:border-slate-800">
-      <!-- 第一行：知识源筛选（四个按钮与标签**同一行**，且四个按钮本身永不拆行） -->
-      <div class="flex flex-wrap items-center gap-x-3 gap-y-2" role="group" aria-label="知识库范围">
+      <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+      <!-- 左：知识源筛选（标签 + 四个按钮；标签不压缩，芯片不够时在自己的区域内换行） -->
+      <div class="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-2" role="group" aria-label="知识库范围">
         <span class="shrink-0 text-xs font-medium text-slate-500 dark:text-slate-400">知识库：</span>
 
-        <div class="flex flex-wrap items-center gap-2 sm:flex-nowrap">
+        <div class="flex flex-wrap items-center gap-2">
           <button
           v-for="c in corporaOptions"
           :key="c.id"
@@ -98,12 +100,12 @@
         </div>
       </div>
 
-      <!-- 第二行：**只放一个「高级」折叠按钮**（返回条数 + 精准重排收进面板，默认收起）。
-           首屏因此只有：搜索框 + 知识库 + 高级；参数不抢视线。 -->
-      <div class="flex items-center justify-end">
+      <!-- 右：「高级」折叠按钮（返回条数 + 精准重排收进面板，默认收起）。
+           shrink-0 + whitespace-nowrap：空间不足时先让芯片区换行，而不是把它挤成两行。 -->
+      <div class="flex shrink-0 justify-end">
         <button
           type="button"
-          class="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-800 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:border-slate-600"
+          class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-medium text-slate-600 transition-colors hover:border-slate-300 hover:text-slate-800 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:border-slate-600"
           :aria-expanded="advancedOpen"
           aria-controls="prism-advanced-panel"
           @click="toggleAdvanced"
@@ -123,6 +125,7 @@
             <path d="m6 9 6 6 6-6" />
           </svg>
         </button>
+      </div>
       </div>
 
       <!-- 高级面板（默认收起；展开状态持久化在 usePrefs.advancedOpen）：
