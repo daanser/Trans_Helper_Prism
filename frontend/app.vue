@@ -169,6 +169,13 @@
           <span aria-hidden="true">·</span>
           <NuxtLink to="/about" class="text-primary hover:underline">关于与免责</NuxtLink>
           <span aria-hidden="true">·</span>
+          <!-- 从搜索卡下方移到页脚：主操作与推荐查询之间不再被合规行切断；
+               首次访问仍有免责弹窗做显式确认，这里是常驻的"随时可查"入口 -->
+          <span>
+            继续使用本站即表示你已阅读并同意
+            <NuxtLink to="/about" class="text-primary hover:underline">免责声明与使用须知</NuxtLink>
+          </span>
+          <span aria-hidden="true">·</span>
           <a
             href="https://transprism.chengxi.moe"
             target="_blank"

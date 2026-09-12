@@ -4,7 +4,10 @@
      - 正文中的 `[来源n]` 渲染为可点击引用，点击回跳对应命中卡片
      - 追问面板：同一 session_id 多轮（桌面右栏 / 移动端结果上方） -->
 <template>
-  <div class="rounded-2xl border border-surface-border bg-surface p-5 shadow-card lg:sticky lg:top-20">
+  <div
+    class="rounded-2xl border border-surface-border bg-surface shadow-card lg:sticky lg:top-20"
+    :class="answer || streaming || notice ? 'p-5' : 'px-5 py-4'"
+  >
     <div class="mb-3 flex items-center justify-between border-b border-surface-border pb-3">
       <div class="flex items-center gap-2">
         <div class="flex h-6 w-6 items-center justify-center rounded-md bg-primary-subtle text-primary">
@@ -35,12 +38,8 @@
       </div>
     </div>
 
-    <!-- 未出结果前：**收成一行**（用户反馈 #2）。规则只写在这里（紧挨开关），
-         顶栏只保留余额百分比，不重复堆额度说明（反馈 #4）。 -->
-    <p v-if="!answer && !streaming && !notice" class="text-xs leading-relaxed text-ink-sub">
-      <template v-if="active">已开启：检索完自动提炼<b>要点</b>并标注<b>可点击引用</b>；总结与追问会消耗额度。</template>
-      <template v-else>开启后：检索完自动提炼<b>要点</b>并标注<b>可点击引用</b>；总结与追问会消耗额度。</template>
-    </p>
+    <!-- 未出结果前：**整张卡只剩一行**——标题 + 状态 + 右上开关（用户反馈 #3）。
+         说明与额度提示都不在这里，等检索完成后再随正文一起展开，避免首屏堆文字。 -->
 
     <!-- 流式骨架屏 -->
     <div v-if="streaming && !answer" class="animate-pulse space-y-2.5 py-2">
@@ -93,7 +92,7 @@
       class="mt-3 border-t border-surface-border pt-2.5 text-[11px] leading-relaxed text-ink-muted"
     >
       内容由 AI 生成，<span class="font-medium text-ink-sub">可能出错或过时，不能替代医生建议</span>；
-      请以 <span class="font-medium text-ink-sub">[来源n]</span> 指向的原文为准。
+      请以 <span class="font-medium text-ink-sub">[来源n]</span> 指向的原文为准 · 每次总结与追问都会消耗额度。
       <NuxtLink to="/about" class="text-primary hover:underline">了解详情</NuxtLink>
     </p>
 

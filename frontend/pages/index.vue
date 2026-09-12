@@ -35,12 +35,6 @@
         >
         </SearchBox>
 
-        <!-- 合规告知（搜索框正下方）：一句话 + 指回 /about 的完整免责声明与使用须知。
-             与弹窗（DisclaimerDialog）互补：弹窗负责"首次知情"，这行常驻负责"随时可查"。 -->
-        <p class="mt-3 text-center text-[11px] leading-relaxed text-ink-muted sm:text-xs">
-          继续使用即表示你已阅读并同意
-          <NuxtLink to="/about" class="font-medium text-primary underline-offset-2 hover:underline">免责声明与使用须知</NuxtLink>
-        </p>
 
         <!-- 移动端 AI 伴读卡位 -->
         <div v-if="hasSearched" class="mt-6 lg:hidden">
@@ -114,10 +108,11 @@
         <!-- 空态与引导 -->
         <template v-else>
           <!-- 初始未搜索引导 -->
-          <!-- 未搜索（首屏）：**不再用大方框/虚线框占位**（用户反馈 #1）。
+          <!-- 未搜索（首屏）：紧贴搜索卡下方作为空状态引导（用户反馈 #2：不要贴近页脚）。
+               也不再有大方框/虚线占位。
                这里同时承担「大家常搜」的落点 —— 它已从表单卡里搬出来（反馈 #3），
                作为搜索前的推荐，而不是和「知识库 / 返回条数」挤在同一张表单里。 -->
-          <div v-if="!hasSearched" class="mt-10">
+          <div v-if="!hasSearched" class="mt-5">
             <p class="text-center text-xs text-ink-muted">试试这些：</p>
             <div class="mt-3 flex flex-wrap items-center justify-center gap-2">
               <button
