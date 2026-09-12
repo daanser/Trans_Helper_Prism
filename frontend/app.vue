@@ -255,7 +255,9 @@ const quotaTitle = computed(() => {
   const pct = remainingPct.value
   if (pct === null) return "尚未读取到配额信息"
   const reset = when ? `本窗口${when}重置。` : ""
-  return `本窗口剩余额度 ${pct.toFixed(1)}%；低于 10% 时提示。${reset}回退检索不消耗额度。`
+  // 顶栏只讲"余额 + 何时重置"；额度规则（什么消耗、什么不消耗）归到对应功能旁边（用户反馈 #4）
+  return `本窗口剩余额度 ${pct.toFixed(1)}%。${reset}`
+
 })
 
 function onLogout() {

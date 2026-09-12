@@ -33,21 +33,6 @@
           :cooldown-sec="cooldownRemaining"
           @submit="doSearch"
         >
-          <!-- 快捷检索建议词 -->
-          <template v-if="!hasSearched" #examples>
-            <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-surface-border pt-4">
-              <span class="text-xs text-ink-muted">大家常搜：</span>
-              <button
-                v-for="ex in quickExamples"
-                :key="ex"
-                type="button"
-                class="rounded-lg border border-surface-border bg-canvas-subtle px-3 py-1.5 text-xs text-ink-body transition-all hover:border-primary hover:bg-surface hover:text-primary"
-                @click="onQuickSearch(ex)"
-              >
-                {{ ex }}
-              </button>
-            </div>
-          </template>
         </SearchBox>
 
         <!-- 合规告知（搜索框正下方）：一句话 + 指回 /about 的完整免责声明与使用须知。
@@ -129,17 +114,22 @@
         <!-- 空态与引导 -->
         <template v-else>
           <!-- 初始未搜索引导 -->
-          <div v-if="!hasSearched" class="mt-8 rounded-2xl border border-dashed border-surface-border p-8 text-center sm:p-12">
-            <div class="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-primary-subtle text-primary">
-              <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="11" cy="11" r="8" />
-                <path d="m21 21-4.3-4.3" />
-              </svg>
+          <!-- 未搜索（首屏）：**不再用大方框/虚线框占位**（用户反馈 #1）。
+               这里同时承担「大家常搜」的落点 —— 它已从表单卡里搬出来（反馈 #3），
+               作为搜索前的推荐，而不是和「知识库 / 返回条数」挤在同一张表单里。 -->
+          <div v-if="!hasSearched" class="mt-10">
+            <p class="text-center text-xs text-ink-muted">试试这些：</p>
+            <div class="mt-3 flex flex-wrap items-center justify-center gap-2">
+              <button
+                v-for="ex in quickExamples"
+                :key="ex"
+                type="button"
+                class="rounded-full border border-surface-border bg-surface px-3.5 py-1.5 text-xs text-ink-body shadow-card transition-all hover:border-primary hover:text-primary"
+                @click="onQuickSearch(ex)"
+              >
+                {{ ex }}
+              </button>
             </div>
-            <p class="text-sm font-semibold text-ink-title">在上方输入关键词开启检索</p>
-            <p class="mx-auto mt-2 max-w-md text-xs leading-relaxed text-ink-sub">
-              支持激素方案、证件姓名变更、心理诊断、嗓音训练及社群真实生活经验。检索结果直溯官方文档原文。
-            </p>
           </div>
 
           <!-- 无匹配结果（限流时改由上方提示卡说明，不在这里误报「未发现」） -->

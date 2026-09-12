@@ -35,14 +35,11 @@
       </div>
     </div>
 
-    <p v-if="!answer && !streaming && !notice" class="mb-3 text-xs leading-relaxed text-ink-sub">
-      <template v-if="active">
-        <b>已开启</b>：检索后会自动提炼<b>要点</b>，并标注<b>可点击的引用来源</b>（点击可回跳原文）。
-        每次总结与追问都会消耗配额，可用右上开关随时关闭。
-      </template>
-      <template v-else>
-        结合本次检索命中的文献，提炼要点并标注可点击的引用来源。用右上开关打开「AI 伴读」即可使用；每次总结与追问都会消耗配额。
-      </template>
+    <!-- 未出结果前：**收成一行**（用户反馈 #2）。规则只写在这里（紧挨开关），
+         顶栏只保留余额百分比，不重复堆额度说明（反馈 #4）。 -->
+    <p v-if="!answer && !streaming && !notice" class="text-xs leading-relaxed text-ink-sub">
+      <template v-if="active">已开启：检索完自动提炼<b>要点</b>并标注<b>可点击引用</b>；总结与追问会消耗额度。</template>
+      <template v-else>开启后：检索完自动提炼<b>要点</b>并标注<b>可点击引用</b>；总结与追问会消耗额度。</template>
     </p>
 
     <!-- 流式骨架屏 -->
