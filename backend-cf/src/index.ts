@@ -29,6 +29,7 @@ import {
   formatPct,
   getQuota,
   grantQuota,
+  limitTokens,
   resetQuota,
   toQuotaResponse,
 } from "./quota"
@@ -69,6 +70,7 @@ import { SCHEMA_MIGRATIONS, SCHEMA_STATEMENTS, isToleratedSchemaError } from "./
 import { clampIngestRunsLimit, insertIngestRun, listIngestRuns, parseIngestRunInput } from "./ingestruns"
 import { applyIngestFilesPlan, listZeroChunkFiles, parseIngestFilesInput } from "./ingestfiles"
 import { runFallback, type FallbackResponse } from "./fallback"
+import { fetchUsageSummary, parseUsageDays } from "./usagestats"
 import {
   buildPrompt,
   createChatProvider,
@@ -1091,6 +1093,29 @@ api.get("/admin/usage", async (c) => {
   } catch {
     // 不把 SQL 细节回显给客户端；日志只留泛化信息。
     console.warn("[admin] usage aggregation failed")
+    return c.json({ error: "db-unavailable" }, 503)
+  }
+})
+
+// GET /admin/usage/summary?days=30 —— 上游用量汇总（M4-W3 月账原料）
+//   只读聚合（key_usage 按 endpoint/按天 + quotas 当前窗口 + ingest_runs），不写库、不占配额。
+//   单价由人填（硅基流动/CF 控制台），这里只如实报量。
+//   缺 D1 → 503（管理员诊断接口不该假装成功，与检索路径的 fail-open 不同）。
+api.get("/admin/usage/summary", async (c) => {
+  const auth = await adminAuthorize(c)
+  if (auth.denied) return auth.denied
+  if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
+
+  const days = parseUsageDays(c.req.query("days"))
+  try {
+    const summary = await fetchUsageSummary(c.env.DB, {
+      days,
+      nowMs: Date.now(),
+      limitTokens: limitTokens(c.env),
+    })
+    return c.json(summary)
+  } catch {
+    // 不回显 SQL/驱动细节
     return c.json({ error: "db-unavailable" }, 503)
   }
 })
