@@ -179,6 +179,13 @@
      ② 别信 `/tmp` 里上一次请求留下的响应体（`curl -o` 失败时文件不会被覆盖，会给你"旧的成功响应"，看起来像服务是好的）。
    - 恢复后无需任何补救动作：部署本身早已完成（`git push` 成功即触发），只是**验收**得推迟。
 
+47. **`git push ... && echo "✅ 已推送"` 这种写法会**静默吞掉失败**（2026-09-11 踩到，代价是白等一次部署）：
+   网络整段失效时循环重试 5 次全失败，但命令**什么都不打印**，我据此以为推送成功、还去"等部署 55 秒"，
+   实际上**功能提交根本没上去**。**正确写法**：重试循环里显式判断结果并打印失败，例如
+   `for i in 1..5; do git push -q origin main && { echo pushed; break; } || echo "push failed ($i)"; sleep 6; done`，
+   之后用 `git log --oneline origin/main..HEAD`（**必须为空**）或 `git status -sb` 复核"真的推上去了"。
+   **原则：部署类操作要有正向证据（远端 ref 比对），不能靠"命令没报错"推断。**
+
 ## 6. 前端现状（2026-09-08 全量重写 UI/UX；2026-09-09 已上线 Pages）
 - **设计语言已彻底换掉**：不再是照搬 `vitepress-theme-project-trans` 的 indigo 色板。现为自定「温润学术检索」风——浅底 `#F8FAFC` / 深底 `#0B1120`，品牌蓝 `#2563EB`（深 `#3B82F6`），token 全走 `assets/css/main.css` 的 CSS 变量（`--bg-canvas/--bg-surface/--text-*/--primary*`），`tailwind.config.ts` 只做语义映射（`canvas/surface/primary/ink`）。
 - **用户明确否决过的方向（别再走回头路）**：① 高饱和四色彩虹 wiki 徽章（粉/天蓝/紫/翠绿）——太 AI 味；② 纯黑 `bg-slate-900` 实色选中块——太凝重死寂；③ 全大写英文终端风标签（`ARCHIVE RETRIEVAL //`、`SEARCH`、`PERF //`）——读不懂。现方案：四库**统一中性**选中态（淡蓝底 `bg-blue-50/80` + 勾选 `✓`，无彩色区分），中文标签，`max-w-7xl` 宽屏。
