@@ -32,7 +32,6 @@
           :logged-in="isLoggedIn"
           :cooldown-sec="cooldownRemaining"
           @submit="doSearch"
-          @update:use-llm="onLlmToggle"
         >
           <!-- 快捷检索建议词 -->
           <template v-if="!hasSearched" #examples>
@@ -69,6 +68,8 @@
             :notice="aiNotice"
             :followup-busy="aiStreaming"
             :followup-enabled="llmEnabled && results.length > 0"
+            :enabled="llmEnabled"
+            @update:enabled="onLlmToggle"
             @cite="onCite"
             @followup="onFollowUp"
           />
@@ -238,6 +239,8 @@
           :notice="aiNotice"
           :followup-busy="aiStreaming"
           :followup-enabled="llmEnabled && results.length > 0"
+          :enabled="llmEnabled"
+          @update:enabled="onLlmToggle"
           @cite="onCite"
           @followup="onFollowUp"
         />

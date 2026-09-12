@@ -98,8 +98,10 @@
         </div>
       </div>
 
-      <!-- 第二行：参数开关（返回条数 & 精准重排 & AI 伴读），整行内靠右 -->
-      <div class="flex flex-wrap items-center justify-end gap-x-6 gap-y-3">
+      <!-- 第二行：**检索参数**（返回条数 + 精准重排）—— 只保留"数量"与"排序"两类设置。
+           「AI 伴读」属于"生成"，主开关在右侧卡片；这里**只做被动状态展示**，
+           杜绝同一功能两处开关不同步（截图反馈 #1 / #6）。 -->
+      <div class="flex flex-wrap items-center gap-x-6 gap-y-3">
         <!-- 返回条数（plan-topk.md §3.4）：登录 1–50；未登录只允许 1–5，并提示登录后可用 50 -->
         <div class="flex items-center gap-2">
           <label for="prism-topk" class="text-xs font-medium text-slate-500 dark:text-slate-400">返回条数</label>
@@ -124,19 +126,21 @@
         </div>
 
         <ToggleMini v-model="useReranker" label="精准重排" hint="已激活 BAAI/bge-reranker-v2-m3 二次重排序" />
-        <ToggleMini
-          :model-value="useLlm"
-          label="AI 伴读"
-          @update:model-value="onLlmToggle"
-        />
+
+        <!-- AI 伴读：被动状态（不可交互）→ 唯一主开关在右侧「AI 伴读与要点总结」卡片里 -->
+        <span
+          v-if="useLlm"
+          class="inline-flex items-center gap-1.5 rounded-lg bg-primary-subtle px-2 py-1 text-xs font-medium text-primary"
+        >
+          <span class="h-1.5 w-1.5 rounded-full bg-primary"></span>AI 伴读已开启
+        </span>
       </div>
     </div>
 
-    <!-- 成本口径文案（plan-topk.md §3.4：**只讲质量**，不写"条数越多越贵"——纯检索成本恒定 200，那是假话） -->
-    <p class="mt-3 text-[11px] leading-relaxed text-slate-400 dark:text-slate-500">
-      返回条数越多，结果里不相关的内容也可能越多；<strong class="font-medium text-slate-500 dark:text-slate-400">开启 AI 重排会把最相关的排到前面</strong>。
-      开启 AI 重排会消耗更多额度。
-    </p>
+    <!-- 短提示：**只在打开了会额外消耗额度的功能时出现**，且一行说完 ——
+         长文案会打断「筛选区 → 大家常搜」的视觉流（截图反馈 #5）。
+         命名统一用「精准重排」，不再出现第二名字（截图反馈 #2）。 -->
+    <p v-if="costHint" class="mt-2.5 text-[11px] leading-relaxed text-ink-muted">{{ costHint }}</p>
 
     <!-- 快捷建议插槽 -->
     <slot name="examples" />
@@ -170,7 +174,6 @@ const props = withDefaults(
 )
 const emit = defineEmits<{
   (e: "submit", p: Pick<SearchRequest, "query" | "corpora" | "use_reranker" | "use_llm" | "top_k">): void
-  (e: "update:useLlm", v: boolean): void
 }>()
 const { pushToast } = useToast()
 const { prefs, load: loadPrefs, save: savePrefs } = usePrefs()
@@ -179,6 +182,14 @@ const query = ref("")
 const searchInput = ref<HTMLInputElement | null>(null)
 const selectedCorpora = ref<string[]>(["mtf-wiki", "ftm-wiki", "rle-wiki", "miomtfwiki"])
 const useReranker = ref(true)
+
+/** 一行短提示：只在开了"会多耗额度"的功能时出现（命名统一为「精准重排」） */
+const costHint = computed(() => {
+  const parts: string[] = []
+  if (useReranker.value) parts.push("精准重排会把更相关的结果提前，可能多消耗额度")
+  if (props.useLlm) parts.push("AI 伴读会在右侧卡片生成要点总结，每次总结与追问都消耗额度")
+  return parts.length ? parts.join("；") + "。" : ""
+})
 const corporaOptions: CorpusOption[] = DEFAULT_CORPORA_OPTIONS
 
 /**
@@ -220,9 +231,7 @@ function toggleCorpus(id: string) {
   }
 }
 
-function onLlmToggle(next: boolean) {
-  emit("update:useLlm", next)
-}
+
 
 function clear() {
   query.value = ""

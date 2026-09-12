@@ -17,7 +17,15 @@ export interface PrismPrefs {
    * 未登录时前端**只允许 1–5**（后端也会夹取，两侧一致）；因此本地存的值在未登录态展示时会被夹到 5。
    */
   topK: number
+  /**
+   * 偏好结构版本。v1（无该字段）曾把"未登录被夹到 5"或用户手输的过小值持久化下来
+   * （实测有人停在 2 条）→ v2 起做一次性修正：旧版本一律回到默认 10。
+   */
+  version: number
 }
+
+/** 当前偏好结构版本（<2 的历史数据会在 sanitize 里一次性修正） */
+export const PREFS_VERSION = 2
 
 export const PREFS_KEY = "prism_prefs"
 
@@ -28,7 +36,7 @@ export const TOP_K_DEFAULT = 10
 export const TOP_K_ANON_MAX = 5
 
 export function defaultPrefs(): PrismPrefs {
-  return { corpora: [...ALL_CORPUS_IDS], reranker: true, llm: false, topK: TOP_K_DEFAULT }
+  return { corpora: [...ALL_CORPUS_IDS], reranker: true, llm: false, topK: TOP_K_DEFAULT, version: PREFS_VERSION }
 }
 
 /** 夹到 [1, 50] 的整数；非法 → 默认 10。 */
@@ -45,12 +53,16 @@ function sanitize(raw: unknown): PrismPrefs {
   const corpora = Array.isArray(obj.corpora)
     ? obj.corpora.filter((c): c is string => typeof c === "string" && ALL_CORPUS_IDS.includes(c))
     : []
+  const storedVersion = typeof obj.version === "number" ? obj.version : 0
+  // v1 及更早（无版本号）：topK 可能残留过小值（实测 2 条）→ 一次性提升到默认 10；
+  // 之后用户再手动改小就是他的明确选择，不再干预。
+  const topK = storedVersion < PREFS_VERSION ? base.topK : obj.topK === undefined ? base.topK : clampTopK(obj.topK)
   return {
     corpora: corpora.length ? corpora : base.corpora,
     reranker: typeof obj.reranker === "boolean" ? obj.reranker : base.reranker,
     llm: typeof obj.llm === "boolean" ? obj.llm : base.llm,
-    // 老版本存的偏好没有 topK 字段 → 回默认 10（向后兼容）
-    topK: obj.topK === undefined ? base.topK : clampTopK(obj.topK),
+    topK,
+    version: PREFS_VERSION,
   }
 }
 

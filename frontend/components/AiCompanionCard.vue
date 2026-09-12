@@ -23,11 +23,26 @@
           {{ statusLabel }}
         </span>
       </div>
-      <span v-if="model" class="max-w-[8rem] truncate font-mono text-xs text-ink-muted" :title="model">{{ model }}</span>
+      <div class="flex shrink-0 items-center gap-3">
+        <span v-if="model" class="max-w-[8rem] truncate font-mono text-xs text-ink-muted" :title="model">{{ model }}</span>
+        <!-- 主开关：AI 伴读唯一入口（搜索面板那边只做被动状态展示） -->
+        <ToggleMini
+          :model-value="active"
+          label="AI 伴读"
+          hide-label
+          @update:model-value="(v: boolean) => emit('update:enabled', v)"
+        />
+      </div>
     </div>
 
     <p v-if="!answer && !streaming && !notice" class="mb-3 text-xs leading-relaxed text-ink-sub">
-      结合本次检索命中的文献，为你提炼要点并标注可点击的引用来源。在搜索面板打开「AI 伴读」开关即可使用，每次总结与追问都会消耗配额。
+      <template v-if="active">
+        <b>已开启</b>：检索后会自动提炼<b>要点</b>，并标注<b>可点击的引用来源</b>（点击可回跳原文）。
+        每次总结与追问都会消耗配额，可用右上开关随时关闭。
+      </template>
+      <template v-else>
+        结合本次检索命中的文献，提炼要点并标注可点击的引用来源。用右上开关打开「AI 伴读」即可使用；每次总结与追问都会消耗配额。
+      </template>
     </p>
 
     <!-- 流式骨架屏 -->
@@ -118,6 +133,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from "vue"
 import { renderAnswer } from "~/utils/markdown"
+import ToggleMini from "./ToggleMini.vue"
 
 const props = defineProps<{
   answer?: string
@@ -131,14 +147,24 @@ const props = defineProps<{
   followupBusy?: boolean
   /** 是否显示追问面板（仅 AI 伴读开启且有结果时） */
   followupEnabled?: boolean
+  /**
+   * AI 伴读开关状态（**单一数据源**：与搜索面板共用父组件同一个状态）。
+   * 加这个 prop 之前，卡片只按 `status` 判断"未开启"，导致开关已开、卡片仍显示未开启（截图反馈 #1）。
+   */
+  enabled?: boolean
 }>()
 
 const emit = defineEmits<{
   (e: "cite", ref: string): void
   (e: "followup", question: string): void
+  /** 卡片内的主开关（开启仍需父组件走二次确认） */
+  (e: "update:enabled", v: boolean): void
 }>()
 
 const question = ref("")
+
+/** 开关是否已开（单一数据源，来自父组件） */
+const active = computed(() => props.enabled === true)
 
 const statusLabel = computed(() => {
   switch (props.status) {
@@ -149,7 +175,8 @@ const statusLabel = computed(() => {
     case "unavailable":
       return "不可用"
     case "idle":
-      return "未开启"
+      // 关键修复：开关开着就必须显示「已开启」，不能一边开一边显示未开启
+      return active.value ? "已开启" : "未开启"
     default:
       return ""
   }
@@ -163,6 +190,8 @@ const statusClass = computed(() => {
       return "bg-canvas-subtle text-ink-sub"
     case "unavailable":
       return "bg-amber-100 text-amber-800 dark:bg-amber-900/50 dark:text-amber-200"
+    case "idle":
+      return active.value ? "bg-primary-subtle text-primary" : "bg-canvas-subtle text-ink-muted"
     default:
       return "bg-canvas-subtle text-ink-muted"
   }
