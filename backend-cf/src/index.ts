@@ -84,6 +84,7 @@ import { clampIngestRunsLimit, insertIngestRun, listIngestRuns, parseIngestRunIn
 import { applyIngestFilesPlan, listZeroChunkFiles, parseIngestFilesInput } from "./ingestfiles"
 import { runFallback, type FallbackResponse } from "./fallback"
 import { PROMO_TIMEOUT_NO_THINKING_MS } from "./promo"
+import { GUARD_NOTICE, guardUserQuestion } from "./guard"
 import { fetchUsageSummary, parseUsageDays } from "./usagestats"
 import { normalizeChatEndpoint } from "./llm"
 import {
@@ -989,6 +990,17 @@ api.post("/search/stream", async (c) => {
           return
         }
 
+        // 提示注入/越界提问的**确定性拦截**（src/guard.ts，2026-09-13）：
+        // 命中就**根本不调上游**——促销期 AI 摘要是花钱的，不能让人拿它当免费通用 LLM；
+        // 提示词可以被绕过，这一层不依赖模型的服从性。检索本身不受影响（结果已在上面的 hits 事件里）。
+        const guardReason = guardUserQuestion(question)
+        if (guardReason) {
+          console.warn(`[guard] 拦截 AI 摘要 question-guard=${guardReason}`)
+          controller.enqueue(sse("notice", { code: `guard-${guardReason}`, notice: GUARD_NOTICE }))
+          controller.enqueue(sse("done", { llm: false, guarded: true }))
+          return
+        }
+
         const ctx = await createSession(
           c.env.DB,
           session.sub,
@@ -1131,6 +1143,13 @@ api.post("/chat", async (c) => {
         tokens_out: out.tokens_out,
         estimated: out.estimated,
       })
+    }
+
+    // 提示注入/越界提问：追问同样拦截（不调上游、不扣额度、不写会话历史）
+    const guardReason = guardUserQuestion(question)
+    if (guardReason) {
+      console.warn(`[guard] 拦截追问 question-guard=${guardReason}`)
+      return c.json({ text: GUARD_NOTICE, citations: [], model: "", tokens_in: 0, tokens_out: 0, estimated: false, guarded: true })
     }
 
     // 促销优先（与 /search/stream 同一条链）；失败/额度尽 → 免费链（追问不能因为促销挂了就失败）
