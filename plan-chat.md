@@ -5,7 +5,7 @@
 > 关联：`plan.md` §8.3/§8.4（LLM 功能范围与成本控制）、`plan-ratelimit.md`（分档限流）、`plan-keypool.md`（密钥池）、
 > `plan-topk.md`（返回条数与计费）、`TODO.md` §4（本功能的原始需求）、`tmp.md`（用户提供的前端建议，已并入 §5）。
 > 目标站点：`chat.chengxi.moe`（与 `search.chengxi.moe` **同一个 Pages 项目、同一个 Worker**）。
-> 实施完成后需在 `history.md` 追加坑 51（agent 循环与子请求/CPU 预算的实测结论）。
+> 实施完成后需在 `history.md` 追加一条坑（**编号按当时最大值顺延**；2026-09-13 已用到 54）：agent 循环与子请求/CPU 预算的实测结论。
 
 ---
 
