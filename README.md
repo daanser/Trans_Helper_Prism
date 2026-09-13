@@ -30,6 +30,7 @@
 | 分档限流 | 按来源分档（见下）；**突发 20 次/10 秒 → 硬封 60 秒**；全局匿名熔断**软 300 / 硬 600** |
 | 自带模型 | 用户自配 OpenAI 兼容端点，api_key **AES-GCM 加密落库**，SSRF 校验 |
 | 管理端 | 用量总览与**上游调用汇总** / key 池健康与上下架（只出 `key_ref`）/ 摄取历史 / 分档限流观测 / 封禁 / 加额 / 审计 |
+| **开业酬宾** | 限时（默认 30 天）让**登录用户**默认使用 DeepSeek V4.1 Flash（`deepseek-flash`，经基元律动）；额度展示 **4×（≈1M/5h）**；可开**深度思考**（默认关）；**按真实 usage 自算成本**，累计达预算（默认 ¥136）自动收闸并**回退免费模型**；一键 KV 关闭 |
 | 运维探活 | `watchdog.yml` **每 30 分钟 6 项检查**（含一次真实匿名检索），失败即发邮件 |
 | 合规 | `/about` 说明数据来源、隐私处理与**医疗免责**；首次访问弹免责确认（可「以后不再提示」） |
 
@@ -139,6 +140,9 @@ npm run typecheck && npm run generate
 | 名称 | 用途 | 存放 |
 |---|---|---|
 | **`POOL_KEYS_0` / `POOL_KEYS_1` / …** | 硅基流动密钥池（**一把一个变量、数字递增、不要求连续**）。代码按前缀扫描 env；ref 由变量名派生（`POOL_KEYS_3` → `pool-key-3`），**加 key 只需新建一个变量，永不重打已有** | Worker Secret + GH Actions Secret |
+| **`DS_POOL_KEY_0` / `DS_POOL_KEY_1` / …** | **开业酬宾专用池**（基元律动 tokenrhythm，与 `POOL_KEYS_<n>` **绝不混用**）。ref = `ds-pool-key-<n>` | Worker Secret |
+| `DS_ENDPOINT` / `DS_MODEL` | 促销上游地址（**可写基础 URL**，代码会补 `/chat/completions`）与模型 id | `wrangler.jsonc` vars |
+| `PROMO_ENABLED` / `PROMO_BUDGET_CNY` / `PROMO_DAYS` / `PROMO_QUOTA_WINDOW_TOKENS` / `PROMO_LLM_MAX_TOKENS` | 促销总开关 / 预算（默认 ¥136）/ 期限天数（30）/ 促销期配额（1M = 4×）/ 促销输出上限（4000） | `wrangler.jsonc` vars |
 | `QDRANT_URL` / `QDRANT_API_KEY` | Qdrant Cloud 地址与 key | Worker Secret + GH Actions Secret |
 | `ADMIN_API_KEY` | 运维端点认证（`/admin/*`） | Worker Secret + GH Actions Secret（供摄取/探活上报） |
 | `PROXY_SHARED_SECRET` | Pages Function 与 Worker 之间的信任凭据（签名客户端 IP/国家/ASN，**必须配置**） | Worker Secret + Pages 环境变量 |
@@ -178,6 +182,7 @@ npm run typecheck && npm run generate
 | GET/POST | `/api/v1/admin/keys` | key 池健康 / 上下架（**只出 `key_ref`，绝不回显密钥**） |
 | GET | `/api/v1/admin/audit` | 审计日志 |
 | GET | `/api/v1/admin/whoami` | 诊断：解析到的 IP / 档位 / 限额 / 代理信任状态 |
+| GET | `/api/v1/admin/dsping` | 诊断：**从 Worker 内部**探促销上游（主机可达性 + 一次真实调用状态/耗时；不含密钥） |
 | GET | `/api/v1/admin/d1bench` | 诊断（临时）：直连量一次 D1 读/写/批与 KV get/put 的真实耗时，用于定位延迟瓶颈 |
 | POST | `/api/v1/admin/db/apply-schema` | 幂等应用 D1 schema + 迁移（wrangler 不可用时的 bootstrap 通道） |
 | POST | `/api/v1/admin/accounts/:id/ban` / `/quota` | 封禁（`?unban=1`）/ 加额或重置窗口 |
