@@ -1485,55 +1485,60 @@ api.post("/admin/accounts/:id/quota", async (c) => {
   return c.json({ ok: true, quota: view, quota_display: formatPct(view.used_pct) })
 })
 
-// GET /admin/dsping —— 【临时诊断】从 **Worker 内部**打一次促销上游，回报状态码/耗时/错误片段
-//   为什么需要：2026-09-13 线上出现"促销链静默回退"，本地探测却正常 → 必须确认 **CF 出口到上游**的真实情况。
-//   只回报诊断信息，**绝不回显密钥**；诊断完可删。
+// GET /admin/dsping —— 【临时诊断】从 **Worker 内部**探促销上游（短超时，绝不拖到 CF 上限）
+//   回报：① 主机根路径 GET 是否可达 ② 用第一把 key 打 chat/completions 的状态/耗时/错误名
+//   **绝不回显密钥**。定位完即删。
 api.get("/admin/dsping", async (c) => {
   const auth = await adminAuthorize(c)
   if (auth.denied) return auth.denied
   const { promoKeys, PROMO_ENDPOINT_DEFAULT, PROMO_MODEL_DEFAULT } = await import("./promo")
+  const rawEnv = c.env as unknown as Record<string, string | undefined>
+  const endpointRaw = (rawEnv.DS_ENDPOINT ?? "").trim() || PROMO_ENDPOINT_DEFAULT
+  const modelName = (rawEnv.DS_MODEL ?? "").trim() || PROMO_MODEL_DEFAULT
+  const endpoint = normalizeChatEndpoint(endpointRaw)
+  const origin = new URL(endpointRaw).origin
+  const out: Record<string, unknown> = { endpoint, model: modelName, origin }
+
+  // ① 主机根路径（区分"域名不可达"与"接口被拒"）
+  const t0 = Date.now()
+  try {
+    const r = await fetch(origin + "/", { method: "GET", signal: AbortSignal.timeout(6000) })
+    out.host = { status: r.status, ms: Date.now() - t0, ok: r.ok }
+  } catch (e) {
+    out.host = { ms: Date.now() - t0, error: e instanceof Error ? `${e.name}: ${e.message.slice(0, 120)}` : String(e).slice(0, 120) }
+  }
+
+  // ② 只探第一把 key，8s 超时（务必远小于 CF 的 30s 墙钟）
   let keys: Array<{ ref: string; secret: string }> = []
   try {
     keys = promoKeys(c.env) as Array<{ ref: string; secret: string }>
   } catch {
     keys = []
   }
-  const rawEnv = c.env as unknown as Record<string, string | undefined>
-  const endpointRaw = (rawEnv.DS_ENDPOINT ?? "").trim() || PROMO_ENDPOINT_DEFAULT
-  const modelName = (rawEnv.DS_MODEL ?? "").trim() || PROMO_MODEL_DEFAULT
-  if (keys.length === 0) return c.json({ ok: false, reason: "no-ds-key", endpoint: normalizeChatEndpoint(endpointRaw), model: modelName })
-  const endpoint = normalizeChatEndpoint(endpointRaw)
-  const out: Record<string, unknown>[] = []
-  for (const k of keys.slice(0, 2)) {
-    const t0 = Date.now()
+  out.key_count = keys.length
+  if (keys.length > 0) {
+    const k = keys[0]
+    const t1 = Date.now()
     try {
-      const resp = await fetch(endpoint, {
+      const r = await fetch(endpoint, {
         method: "POST",
         headers: { Authorization: `Bearer ${k.secret}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: modelName,
-          messages: [{ role: "user", content: "只回答两个字：收到" }],
-          max_tokens: 32,
-          enable_thinking: false,
-        }),
-        signal: AbortSignal.timeout(25_000),
+        body: JSON.stringify({ model: modelName, messages: [{ role: "user", content: "hi" }], max_tokens: 16, enable_thinking: false }),
+        signal: AbortSignal.timeout(8000),
       })
-      const text = await resp.text()
+      const text = await r.text()
       let model: unknown = null
-      let content = ""
       try {
-        const j = JSON.parse(text) as { model?: unknown; choices?: Array<{ message?: { content?: string } }> }
-        model = j.model ?? null
-        content = j.choices?.[0]?.message?.content ?? ""
+        model = (JSON.parse(text) as { model?: unknown }).model ?? null
       } catch {
-        /* 非 JSON 就只回报片段 */
+        /* 非 JSON */
       }
-      out.push({ ref: k.ref, status: resp.status, ms: Date.now() - t0, ok: resp.ok, model, content: content.slice(0, 40), snippet: resp.ok ? "" : text.slice(0, 200) })
+      out.chat = { ref: k.ref, status: r.status, ms: Date.now() - t1, ok: r.ok, model, snippet: text.slice(0, 160) }
     } catch (e) {
-      out.push({ ref: k.ref, ms: Date.now() - t0, ok: false, error: e instanceof Error ? e.name + ": " + e.message.slice(0, 160) : String(e).slice(0, 160) })
+      out.chat = { ref: k.ref, ms: Date.now() - t1, error: e instanceof Error ? `${e.name}: ${e.message.slice(0, 120)}` : String(e).slice(0, 120) }
     }
   }
-  return c.json({ endpoint, model: modelName, key_count: keys.length, results: out })
+  return c.json(out)
 })
 
 // GET /admin/d1bench —— 【临时诊断】直接量 D1 的读/写/批成本（用于定位延迟瓶颈；定位完可删）
