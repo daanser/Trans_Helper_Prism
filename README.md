@@ -142,7 +142,7 @@ npm run typecheck && npm run generate
 | **`POOL_KEYS_0` / `POOL_KEYS_1` / …** | 硅基流动密钥池（**一把一个变量、数字递增、不要求连续**）。代码按前缀扫描 env；ref 由变量名派生（`POOL_KEYS_3` → `pool-key-3`），**加 key 只需新建一个变量，永不重打已有** | Worker Secret + GH Actions Secret |
 | **`DS_POOL_KEY_0` / `DS_POOL_KEY_1` / …** | **开业酬宾专用池**（基元律动 tokenrhythm，与 `POOL_KEYS_<n>` **绝不混用**）。ref = `ds-pool-key-<n>` | Worker Secret |
 | `DS_ENDPOINT` / `DS_MODEL` | 促销上游地址（**可写基础 URL**，代码会补 `/chat/completions`）与模型 id | `wrangler.jsonc` vars |
-| `PROMO_ENABLED` / `PROMO_BUDGET_CNY` / `PROMO_DAYS` / `PROMO_QUOTA_WINDOW_TOKENS` / `PROMO_LLM_MAX_TOKENS` | 促销总开关 / 预算（默认 ¥136）/ 期限天数（30）/ 促销期配额（1M = 4×）/ 促销输出上限（4000） | `wrangler.jsonc` vars |
+| `PROMO_ENABLED` / `PROMO_BUDGET_CNY` / `PROMO_DAYS` / `PROMO_QUOTA_WINDOW_TOKENS` / `PROMO_LLM_MAX_TOKENS` / `PROMO_TIMEOUT_MS` | 促销总开关 / 预算（默认 ¥136）/ 期限天数（30）/ 促销期配额（1M = 4×）/ 促销输出上限（4000）/ **促销链上游超时（默认 60s；不思考固定 25s 快速回退）** | `wrangler.jsonc` vars |
 | `QDRANT_URL` / `QDRANT_API_KEY` | Qdrant Cloud 地址与 key | Worker Secret + GH Actions Secret |
 | `ADMIN_API_KEY` | 运维端点认证（`/admin/*`） | Worker Secret + GH Actions Secret（供摄取/探活上报） |
 | `PROXY_SHARED_SECRET` | Pages Function 与 Worker 之间的信任凭据（签名客户端 IP/国家/ASN，**必须配置**） | Worker Secret + Pages 环境变量 |
