@@ -9,6 +9,19 @@ import { cors } from "hono/cors"
 import { Env, SearchRequest, SearchResponse } from "./types"
 import { runSearch, validate, SearchValidationError } from "./search"
 import { ANON_TOP_K_WARNING, clampTopKForAnon } from "./topk"
+import {
+  addPromoSpendCny,
+  closePromo,
+  kvPromoStore,
+  promoCostCny,
+  promoDaysLeft,
+  promoDeniedRefs,
+  readPromoState,
+  promoKeys,
+  reconcileSpentCny,
+  setPromoKeyDenied,
+  type PromoState,
+} from "./promo"
 import { listWikis, collectionName, isValidCorpus, buildCorporaResponse } from "./wiki_registry"
 import { fetchAllChunks, buildTree, QdrantScrollError } from "./tree"
 import { ingestWiki, type IngestMessage } from "./ingest/incremental"
@@ -74,10 +87,13 @@ import { fetchUsageSummary, parseUsageDays } from "./usagestats"
 import {
   buildPrompt,
   createChatProvider,
+  createPromoChatProvider,
   isLlmUnavailable,
   LLM_UNAVAILABLE_NOTICE,
   type ChatMessage,
   type LlmHit,
+  type LlmStream,
+  type LlmSummary,
   type LlmUsage,
 } from "./llm"
 import { appendRound, createSession, historyToMessages, isMaxRounds, loadContext } from "./chat"
@@ -163,6 +179,93 @@ function chatProviderFor(env: Env, accountId: string | undefined) {
 }
 
 /**
+ * 构造"这次请求该用哪个 chat provider"（plan-promo.md §5.2 / §5.3）。
+ *
+ * ── 规则 ──
+ *   · **仅登录用户**：匿名拿不到促销（后端不接受、前端无入口）；
+ *   · 促销开启（env 配置 + KV flag + 未过期 + 未超预算）→ 用促销链；
+ *   · 否则（或促销链失败）→ 免费链，**用户无感失败**（只有一行"已切回标准模型"提示）。
+ * `accountId` = undefined 即匿名 → 永远 false。
+ */
+async function resolveChatPlan(
+  c: Context<{ Bindings: Env }>,
+  accountId: string | undefined,
+): Promise<{ promo: PromoState; usePromo: boolean }> {
+  const promo = await readPromoState(kvPromoStore(c.env.SEARCH_CACHE), c.env, Date.now())
+  return { promo, usePromo: promo.enabled && Boolean(accountId) && promo.keyCount > 0 }
+}
+
+/**
+ * 促销的 chat provider（记账 pool='ds'、流式带真实 usage、按 usage 自算成本）。
+ * `accountId` 决定 key_usage 归属（登录用户；匿名走不到这里）。
+ */
+function promoProviderFor(env: Env, accountId: string | undefined, promo: PromoState) {
+  return createPromoChatProvider(
+    env,
+    makeKeyUsageDb(env, accountId),
+    { model: promo.model, endpoint: promo.endpoint, maxTokens: promo.maxTokens },
+    undefined,
+    { costOf: (u) => promoCostCny({ promptTokens: u.tokens_in, cachedTokens: u.cached_tokens, completionTokens: u.tokens_out }) },
+  )
+}
+
+/**
+ * 把"已取出的第一块"接回流的迭代器（用于促销链的**预检**）：
+ * 先 `next()` 一次，成功 → 交给调用方继续消费（首块不丢）；抛错 → 还没吐过一个字，可以**静默换免费链**。
+ */
+function prependFirstChunk(stream: LlmStream, first: IteratorResult<string>, it: AsyncIterator<string>): LlmStream {
+  let consumed = false
+  return {
+    citations: stream.citations,
+    model: stream.model,
+    usage: stream.usage,
+    [Symbol.asyncIterator]: () => ({
+      async next(): Promise<IteratorResult<string>> {
+        if (!consumed) {
+          consumed = true
+          return first
+        }
+        return it.next()
+      },
+    }),
+  }
+}
+
+/**
+ * 促销调用结束后：① 累计花销（KV，waitUntil）② 上游 401/403/402（key 坏/欠费/无权限）→ **立刻收闸**。
+ *
+ * ⚠️ 两件事必须分开判断：**收闸不依赖 usage** —— 401 恰好就是"调不通、拿不到 usage"的情形，
+ * 早期版本写成 `if (!kv || !usage) return` 会把收闸一起吃掉（上游欠费时会一直重试）。
+ */
+function settlePromoSpend(c: Context<{ Bindings: Env }>, usage: LlmUsage | null, err?: unknown): void {
+  const kv = kvPromoStore(c.env.SEARCH_CACHE)
+  if (!kv) return
+  const waitUntil = ctxWaitUntil(c)
+  const fire = (p: Promise<unknown>) => {
+    if (waitUntil) waitUntil(p.catch(() => undefined))
+    else void p.catch(() => undefined)
+  }
+
+  if (usage) {
+    const delta = promoCostCny({
+      promptTokens: usage.tokens_in,
+      cachedTokens: usage.cached_tokens,
+      completionTokens: usage.tokens_out,
+    })
+    if (delta > 0) fire(addPromoSpendCny(kv, delta, Date.now()))
+  }
+  if (err && isPromoFatal(err)) {
+    fire(closePromo(kv, `upstream-${(err as { status?: number }).status ?? "error"}`, Date.now()))
+  }
+}
+
+/** 促销链的**致命**错误（key 坏/欠费：重试无意义，直接收闸回退免费链）。 */
+function isPromoFatal(err: unknown): boolean {
+  const status = (err as { status?: number })?.status
+  return status === 401 || status === 402 || status === 403
+}
+
+/**
  * T3.3 运行时效：读 KV 的「admin 下架 key」集合（fail-open）。
  * 读 KV / 解析 / 任何异常 → 空集合（视为无禁用），**绝不影响检索与 LLM**。
  *
@@ -175,7 +278,7 @@ async function loadDeniedKeys(env: Env): Promise<DeniedPools> {
   try {
     return await readDeniedPoolsCached(kvDenyStore(env.SEARCH_CACHE), env)
   } catch {
-    return { embed: [], llm: [], rerank: [] }
+    return { embed: [], llm: [], rerank: [], ds: [] }
   }
 }
 
@@ -740,6 +843,9 @@ api.get("/me", async (c) => {
   if (acc.status !== "active") return c.json({ error: "account-" + acc.status }, 403)
 
   const quota = await getQuota(c.env.DB, session.sub, Date.now(), c.env)
+  // 开业酬宾状态（plan-promo.md §5.4/§5.8）：前端**只在这里**得知"促销是否可用"，
+  // 因此"仅登录用户可见/可用"这条约束由服务端决定，UI 不会出现匿名也能看到的入口。
+  const promoState = await readPromoState(kvPromoStore(c.env.SEARCH_CACHE), c.env, Date.now())
   // 免责声明同意态（前端 DisclaimerDialog 据此决定"登录用户已确认过就不再弹"）：
   //   · `disclaimer_ack_at` 毫秒时间戳，NULL = 从未确认；
   //   · `disclaimer_ack` 是它的布尔投影，前端判空更方便（老部署无该字段 → undefined → 视为未确认）。
@@ -749,6 +855,17 @@ api.get("/me", async (c) => {
     user: { account_id: session.sub, handle: session.handle, role: session.role, created_at: acc.created_at },
     quota,
     quota_display: formatPct(quota.used_pct),
+    // 促销（对外只给"能不能用 + 用什么模型 + 何时结束 + 额度口径"，**不含**任何预算/账单细节）
+    promo: {
+      enabled: promoState.enabled,
+      model: promoState.model,
+      reason: promoState.reason,
+      ends_at: promoState.endsAt,
+      /** 促销期 5h 额度窗口（加权 token）：前端只用于"额度已提升到 4×"这句提示的判定 */
+      quota_window_tokens: promoState.enabled ? promoState.quotaWindowTokens : null,
+      /** 是否可用「深度思考」（仅促销链支持；免费链忽略该参数） */
+      thinking_available: promoState.enabled,
+    },
     disclaimer_ack_at: ackAt,
     disclaimer_ack: ackAt !== null,
   })
@@ -880,9 +997,36 @@ api.post("/search/stream", async (c) => {
         )
         if (ctx) controller.enqueue(sse("session", { session_id: ctx.id, max_rounds: 10 }))
 
-        const chat = chatProviderFor(c.env, session.sub)
-        applyDeniedToPool(chat.pool, denied, "llm")
-        const llm = chat.provider.streamSummary(llmHits, question)
+        // ── 开业酬宾（plan-promo.md §5.2/§5.3）：登录用户优先走促销链，失败/额度尽则**静默回退**免费链 ──
+        const thinking = req.thinking === true
+        const plan = await resolveChatPlan(c, session.sub)
+        let llm: LlmStream | null = null
+        let promoDowngraded = false
+
+        if (plan.usePromo) {
+          const promoProv = promoProviderFor(c.env, session.sub, plan.promo)
+          promoProv.pool.setDenied("ds", promoDeniedRefs())
+          const candidate = promoProv.provider.streamSummary(llmHits, question, { thinking })
+          const it = candidate[Symbol.asyncIterator]()
+          try {
+            // 先取第一块：拿不到（key 坏/欠费/上游挂）→ **还没吐过一个字**，可以静默换免费链
+            const first = await it.next()
+            llm = prependFirstChunk(candidate, first, it)
+          } catch (e) {
+            promoDowngraded = true
+            settlePromoSpend(c, null, e) // 401/402/403 → 立刻把促销闸门关掉（KV），下次不再尝试
+          }
+        }
+
+        if (!llm) {
+          const chat = chatProviderFor(c.env, session.sub)
+          applyDeniedToPool(chat.pool, denied, "llm")
+          llm = chat.provider.streamSummary(llmHits, question)
+        }
+        if (promoDowngraded) {
+          // 不静默降级（plan-promo.md §5.6）：前端据此显示一行"已切回标准模型"
+          controller.enqueue(sse("notice", { code: "promo-unavailable", notice: "酬宾模型暂不可用，已切回标准模型" }))
+        }
         controller.enqueue(sse("citations", { citations: llm.citations, model: llm.model }))
         let text = ""
         for await (const delta of llm) {
@@ -896,6 +1040,8 @@ api.post("/search/stream", async (c) => {
           /* 用量结算失败不阻断 */
         }
         if (ctx && text) await appendRound(c.env.DB, ctx.id, "assistant", text, Date.now())
+        // 促销调用：把手里的真实 usage 折算成钱累加进预算闸（KV + waitUntil，不阻塞流）
+        settlePromoSpend(c, usage)
         if (usage) {
           await chargeQuota(
             c.env.DB,
@@ -938,7 +1084,7 @@ api.post("/chat", async (c) => {
   })
   if (gate.deny) return rateLimitedResponse(c, gate.deny)
 
-  let body: { session_id?: string; question?: string } = {}
+  let body: { session_id?: string; question?: string; thinking?: boolean } = {}
   try {
     body = await c.req.json()
   } catch {
@@ -982,9 +1128,27 @@ api.post("/chat", async (c) => {
       })
     }
 
-    const chat = chatProviderFor(c.env, session.sub)
-    applyDeniedToPool(chat.pool, await loadDeniedKeys(c.env), "llm")
-    const out = await chat.provider.summarize(ctx.initialHits, question, { history })
+    // 促销优先（与 /search/stream 同一条链）；失败/额度尽 → 免费链（追问不能因为促销挂了就失败）
+    const thinking = body.thinking === true
+    const plan = await resolveChatPlan(c, session.sub)
+    let promoDowngraded = false
+    let out: LlmSummary | null = null
+    if (plan.usePromo) {
+      const promoProv = promoProviderFor(c.env, session.sub, plan.promo)
+      promoProv.pool.setDenied("ds", promoDeniedRefs())
+      try {
+        out = await promoProv.provider.summarize(ctx.initialHits, question, { history, thinking })
+      } catch (e) {
+        promoDowngraded = true
+        settlePromoSpend(c, null, e)
+      }
+    }
+    if (!out) {
+      const chat = chatProviderFor(c.env, session.sub)
+      applyDeniedToPool(chat.pool, await loadDeniedKeys(c.env), "llm")
+      out = await chat.provider.summarize(ctx.initialHits, question, { history })
+    }
+    settlePromoSpend(c, { tokens_in: out.tokens_in, tokens_out: out.tokens_out, estimated: out.estimated })
     await appendRound(c.env.DB, sessionId, "assistant", out.text, Date.now())
     await chargeQuota(
       c.env.DB,
@@ -1000,6 +1164,8 @@ api.post("/chat", async (c) => {
       tokens_in: out.tokens_in,
       tokens_out: out.tokens_out,
       estimated: out.estimated,
+      // 不静默降级（plan-promo.md §5.6）：促销链挂了/额度尽了 → 明确告诉前端"已切回标准模型"
+      ...(promoDowngraded ? { promo_downgraded: true, notice: "酬宾模型暂不可用，已切回标准模型" } : {}),
     })
   } catch (e) {
     if (isLlmUnavailable(e)) {
@@ -1109,12 +1275,46 @@ api.get("/admin/usage/summary", async (c) => {
 
   const days = parseUsageDays(c.req.query("days"))
   try {
+    const nowMs = Date.now()
     const summary = await fetchUsageSummary(c.env.DB, {
       days,
-      nowMs: Date.now(),
+      nowMs,
       limitTokens: limitTokens(c.env),
     })
-    return c.json(summary)
+    // ── 开业酬宾一节（plan-promo.md §5.6 / §7 验收 10）：已花 ¥X / 剩余 ¥Y / 按近 24h 速度还能撑 N 天 ──
+    //   数据源：`key_usage` 里 pool='ds' 的自算成本（D1 = **真值**）。
+    //   顺带做一次"KV 计数 ← D1 真值"的对账（只在管理员看这一页时发生，热路径零成本）：
+    //   KV 少算（并发丢更新）时往上修正，让预算闸更准；多算不回退（宁早不晚）。
+    const kv = kvPromoStore(c.env.SEARCH_CACHE)
+    const dbSpent = summary.promo.cost_cny_sum
+    const promoState = await readPromoState(kv, c.env, nowMs)
+    const recon = await reconcileSpentCny(kv, dbSpent, nowMs)
+    const spent = Math.max(dbSpent, recon.spentCny)
+    return c.json({
+      ...summary,
+      promo: {
+        ...summary.promo,
+        // 预算口径（元）
+        budget_cny: promoState.budgetCny,
+        spent_cny: Number(spent.toFixed(6)),
+        remaining_cny: Number(Math.max(0, promoState.budgetCny - spent).toFixed(6)),
+        /** 按近 24h 花销速度还能撑几天（null = 24h 内没花钱，无法预计） */
+        days_left_at_24h_rate: promoDaysLeft(spent, promoState.budgetCny, summary.promo.cost_cny_24h),
+        enabled: promoState.enabled,
+        reason: promoState.reason,
+        model: promoState.model,
+        ends_at: promoState.endsAt,
+        key_count: promoState.keyCount,
+        kv_spent_cny: Number(recon.spentCny.toFixed(6)),
+        kv_reconciled: recon.wrote,
+        /** 预计会在 ends_at 之前烧完 → 建议加钱或提前收尾（watchdog 第 ⑥ 项可据此告警） */
+        budget_runs_out_before_end:
+          promoState.endsAt !== null && promoDaysLeft(spent, promoState.budgetCny, summary.promo.cost_cny_24h) !== null
+            ? (promoDaysLeft(spent, promoState.budgetCny, summary.promo.cost_cny_24h) as number) <
+              (promoState.endsAt - nowMs) / 86_400_000
+            : false,
+      },
+    })
   } catch {
     // 不回显 SQL/驱动细节
     return c.json({ error: "db-unavailable" }, 503)
@@ -1183,10 +1383,12 @@ api.post("/admin/keys", async (c) => {
   const pool = normalizePoolName(poolRaw)
   const enabled = body.enabled !== false
 
+  // 促销独立池（plan-promo.md §5.1）：`pool:"ds"` 时禁用集写 `keydeny:ds`，与合并池的 `keydeny:keys` 互不影响
+  const isDsPool = poolRaw === "ds"
   if (!c.env.DB) return c.json({ error: "db-unconfigured" }, 503)
   const nowMs = Date.now()
   try {
-    await upsertProviderKey(c.env.DB, { pool, keyRef, enabled, nowMs })
+    await upsertProviderKey(c.env.DB, { pool: isDsPool ? "ds" : pool, keyRef, enabled, nowMs })
   } catch {
     console.warn("[admin] provider_keys upsert failed")
     return c.json({ error: "db-unavailable" }, 503)
@@ -1202,8 +1404,10 @@ api.post("/admin/keys", async (c) => {
   })
 
   // 运行时效（fail-open）：KV 缺失/读写失败 → runtime_applied:false，请求仍 200。
-  const runtime = await setKeyDenied(kvDenyStore(c.env.SEARCH_CACHE), keyRef, enabled)
-  const configured = poolRefsFromEnv(c.env).includes(keyRef)
+  const runtime = isDsPool
+    ? await setPromoKeyDenied(kvPromoStore(c.env.SEARCH_CACHE), keyRef, enabled)
+    : await setKeyDenied(kvDenyStore(c.env.SEARCH_CACHE), keyRef, enabled)
+  const configured = (isDsPool ? promoKeys(c.env).map((k) => k.ref) : poolRefsFromEnv(c.env)).includes(keyRef)
   return c.json({
     ok: true,
     key_ref: keyRef,
@@ -1213,6 +1417,8 @@ api.post("/admin/keys", async (c) => {
     configured,
     /** KV 里的禁用集合（写入后的真值；KV 不可用时为空数组） */
     disabled_refs: runtime.refs,
+    /** 运行时禁用集落在哪个 KV 键（keys → keydeny:keys；ds → keydeny:ds） */
+    deny_key: isDsPool ? "keydeny:ds" : "keydeny:keys",
     /** 运行时效是否生效（KV 不可用/写失败 → false，此时只有 DB 记了禁用） */
     runtime_applied: runtime.ok,
     audit_written: auditWritten,

@@ -51,6 +51,18 @@
     "X_OAUTH_SCOPES": "users.read tweet.read",
     "QUOTA_WINDOW_TOKENS": "300000",
     "QUOTA_WINDOW_HOURS": "5",
+    // ── 开业酬宾：限时 DeepSeek V4.1 Flash（plan-promo.md）──
+    // 密钥（DS_POOL_KEY_0 / DS_POOL_KEY_1）放 Worker Secrets，**不写在这里**。
+    "DS_ENDPOINT": "https://tokenrhythm.studio/v1",
+    "DS_MODEL": "deepseek-flash",
+    // 总开关：紧急关闭改这里（需重新部署）或直接改 KV `promo:ds` 的 enabled=false（**不用部署**）
+    "PROMO_ENABLED": "true",
+    "PROMO_BUDGET_CNY": "136",
+    "PROMO_QUOTA_WINDOW_TOKENS": "1000000",
+    "PROMO_LLM_MAX_TOKENS": "4000",
+    "PROMO_DAYS": "30",
+    // 免费链输出上限（A7：800 → 1000；env 只能在硬上限 8192 内调）
+    "LLM_MAX_TOKENS": "1000",
     // 匿名也允许向量检索（仅靠限流挡滥用）；要改成"仅回退"把这里设 "1"
     "REQUIRE_LOGIN": "0",
     // ⚠️ KV 限流只是「粗兜底」：真正的分档判定在 D1（rate_counters，见 plan-ratelimit.md §4/§5）。

@@ -36,6 +36,21 @@ export interface UsageDayRow {
   tokens_out: number
 }
 
+/** 开业酬宾（`pool='ds'`）的聚合行：花销从 usage **自算**（上游 `cost_cny` 未结算时是 0，只能对账）。 */
+export interface PromoUsageRow {
+  calls: number
+  ok: number
+  failed: number
+  tokens_in: number
+  tokens_out: number
+  cached_tokens: number
+  /** `key_usage.cost` 累计（元，由 Worker 按单价自算写入） */
+  cost_cny_sum: number
+  /** 近 24h 的 `key_usage.cost` 累计（元）—— 用于估算"还能撑几天" */
+  cost_cny_24h: number
+  last_call_at: number | null
+}
+
 export interface UsageSummary {
   days: number
   since: number
@@ -45,6 +60,8 @@ export interface UsageSummary {
   totals: { calls: number; tokens_in: number; tokens_out: number; failed: number }
   quota_window: { accounts: number; used_tokens: number; limit_tokens: number }
   ingest: { runs: number; failed: number; points_upserted: number; last_success_at: number | null }
+  /** 开业酬宾：DS 池用量（plan-promo.md §5.6 / §7 验收 10） */
+  promo: PromoUsageRow
 }
 
 /** 解析 `?days=`：非法/缺失回默认，超上限夹取。 */
@@ -52,6 +69,18 @@ export function parseUsageDays(raw: string | undefined, fallback: number = USAGE
   const n = Number.parseInt(String(raw ?? ""), 10)
   if (!Number.isFinite(n) || n <= 0) return fallback
   return Math.min(n, USAGE_MAX_DAYS)
+}
+
+/** D1 返回的促销聚合行（列名即 SQL 别名）。 */
+interface PromoAggRow {
+  calls?: unknown
+  ok?: unknown
+  failed?: unknown
+  tokens_in?: unknown
+  tokens_out?: unknown
+  cost_cny_sum?: unknown
+  cost_cny_24h?: unknown
+  last_call_at?: unknown
 }
 
 /** D1 返回的聚合行（列名即 SQL 别名）。 */
@@ -93,6 +122,8 @@ export function shapeUsageSummary(args: {
   quota: QuotaAggRow | null
   ingest: IngestAggRow | null
   limitTokens: number
+  /** DS 池聚合（缺省 = 全 0：从没跑过促销） */
+  promo?: PromoAggRow | null
 }): UsageSummary {
   const by_endpoint: UsageEndpointRow[] = (args.endpoints ?? []).map((r) => ({
     endpoint: String(r.endpoint ?? ""),
@@ -136,7 +167,26 @@ export function shapeUsageSummary(args: {
       points_upserted: num(args.ingest?.points_upserted),
       last_success_at: args.ingest?.last_success_at ?? null,
     },
+    promo: {
+      calls: num(args.promo?.calls),
+      ok: num(args.promo?.ok),
+      failed: num(args.promo?.failed),
+      tokens_in: num(args.promo?.tokens_in),
+      tokens_out: num(args.promo?.tokens_out),
+      // ⚠️ key_usage 表只有 tokens_in/tokens_out（没有 cached 列）：缓存命中量在**成本**里已体现
+      // （命中单价 ¥0.04/M vs 未命中 ¥2/M），故此处置 0，不要假装有这个数。
+      cached_tokens: 0,
+      cost_cny_sum: numFloat(args.promo?.cost_cny_sum),
+      cost_cny_24h: numFloat(args.promo?.cost_cny_24h),
+      last_call_at: args.promo?.last_call_at == null ? null : num(args.promo.last_call_at),
+    },
   }
+}
+
+/** 浮点聚合（成本是小数元，不能用整数版 num()）。 */
+function numFloat(v: unknown): number {
+  const n = typeof v === "number" ? v : Number(v)
+  return Number.isFinite(n) && n > 0 ? n : 0
 }
 
 /**
@@ -197,6 +247,23 @@ export async function fetchUsageSummary(
     .bind(since)
     .first<IngestAggRow>()
 
+  // 开业酬宾：DS 池单独聚合（pool='ds'），**成本自算值来自 key_usage.cost**（Worker 写入）
+  const promo = await db
+    .prepare(
+      `SELECT COUNT(*) AS calls,
+              SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok,
+              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+              SUM(tokens_in) AS tokens_in,
+              SUM(tokens_out) AS tokens_out,
+              SUM(cost) AS cost_cny_sum,
+              SUM(CASE WHEN created_at >= ? THEN cost ELSE 0 END) AS cost_cny_24h,
+              MAX(created_at) AS last_call_at
+         FROM key_usage
+        WHERE pool = 'ds'`,
+    )
+    .bind(opts.nowMs - 24 * 3600 * 1000)
+    .first<PromoAggRow>()
+
   return shapeUsageSummary({
     days: opts.days,
     since,
@@ -206,5 +273,6 @@ export async function fetchUsageSummary(
     quota: quota ?? null,
     ingest: ingest ?? null,
     limitTokens: opts.limitTokens,
+    promo: promo ?? null,
   })
 }

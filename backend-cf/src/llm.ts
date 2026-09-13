@@ -18,8 +18,10 @@ import {
   type KeyPoolDb,
   type PoolKey,
   type ResponseLike,
+  type PoolName,
 } from "./keypool"
 import { defaultFetch, estimateTokens } from "./embeddings"
+import { promoKeyVarOptions } from "./promo"
 
 // ─────────────────────────────────────────────
 // 常量（可调项集中在此，单测直接断言）
@@ -31,8 +33,20 @@ export const LLM_DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 export const LLM_DEFAULT_ENDPOINT = "https://api.siliconflow.cn/v1/chat/completions"
 /** 单次上游调用硬超时（毫秒，env `LLM_TIMEOUT_MS` 可覆盖）。 */
 export const LLM_DEFAULT_TIMEOUT_MS = 20_000
-/** 输出 token 上限（§8.4 成本控制）。 */
-export const LLM_MAX_TOKENS = 800
+/**
+ * 免费链输出 token 上限（§8.4 成本控制）。
+ * 2026-09-13（plan-promo.md §1.5 A7）：**800 → 1000**（实测偶有长总结被截断）。
+ */
+export const FREE_LLM_MAX_TOKENS = 1000
+/** 兼容旧名（= 免费链默认值）。 */
+export const LLM_MAX_TOKENS = FREE_LLM_MAX_TOKENS
+/** 促销链输出上限（§1.5 A7：4000；思考会吃掉一大截，实测 1000 里 936 是思考）。 */
+export const PROMO_LLM_MAX_TOKENS = 4000
+/**
+ * 输出上限的**硬天花板**（env 只能在此之内调，绝不允许无上限放大 —— 那是直接的烧钱口子）。
+ * 8192 = 促销上游实测接受的最大值（§3 第 5 项）。
+ */
+export const LLM_MAX_TOKENS_CEILING = 8192
 /** 单次总结最多塞入的 hit 条数（§8.4）。 */
 export const LLM_MAX_HITS = 6
 /** 每条 hit 正文最大字符数（§8.4）。 */
@@ -112,6 +126,10 @@ export interface LlmUsage {
   tokens_in: number
   tokens_out: number
   estimated: boolean
+  /** 命中缓存的输入 token（促销上游 `prompt_tokens_details.cached_tokens`；免费链无此字段） */
+  cached_tokens?: number
+  /** 思考 token（促销 `completion_tokens_details.reasoning_tokens`；已含在 tokens_out 内） */
+  reasoning_tokens?: number
 }
 
 /** 非流式补全结果（含真实/估算 token 用量）。 */
@@ -157,6 +175,12 @@ export interface LlmCallOptions {
   timeoutMs?: number
   /** 多轮历史（最近 N 条，超出由 buildPrompt 截断） */
   history?: ChatMessage[]
+  /**
+   * 本次调用是否开启思考（**按请求**决定，覆盖 provider 的静态默认）。
+   * 免费链默认 false（env `LLM_ENABLE_THINKING=omit` 时 undefined = 完全不发该字段）；
+   * 促销链由前端「深度思考」开关逐请求透传（plan-promo.md §5.5）。
+   */
+  thinking?: boolean
 }
 
 /** 可识别错误码：调用方按码降级，不必解析文案。 */
@@ -379,6 +403,45 @@ export function extractDeltaContent(data: string): string {
   }
 }
 
+/** 上游 usage 块（流式末块 / 非流式响应都有）→ LlmUsage；拿不到返回 null。 */
+export interface UpstreamUsageShape {
+  prompt_tokens?: number
+  completion_tokens?: number
+  prompt_tokens_details?: { cached_tokens?: number } | null
+  completion_tokens_details?: { reasoning_tokens?: number } | null
+}
+
+/**
+ * 把上游 usage 转成 `LlmUsage`（**真实计数**，estimated=false）。
+ * 促销上游（TokenRhythm）实测：流式末块带完整 usage，含 `cached_tokens` 与 `reasoning_tokens`（plan-promo.md §3 第 4 项）。
+ */
+export function usageFromUpstream(u: UpstreamUsageShape | null | undefined): LlmUsage | null {
+  if (!u || typeof u !== "object") return null
+  const inTok = Number(u.prompt_tokens)
+  const outTok = Number(u.completion_tokens)
+  if (!Number.isFinite(inTok) && !Number.isFinite(outTok)) return null
+  const cached = Number(u.prompt_tokens_details?.cached_tokens)
+  const reasoning = Number(u.completion_tokens_details?.reasoning_tokens)
+  return {
+    tokens_in: Number.isFinite(inTok) ? inTok : 0,
+    tokens_out: Number.isFinite(outTok) ? outTok : 0,
+    estimated: false,
+    ...(Number.isFinite(cached) && cached > 0 ? { cached_tokens: cached } : {}),
+    ...(Number.isFinite(reasoning) && reasoning > 0 ? { reasoning_tokens: reasoning } : {}),
+  }
+}
+
+/** 从一条 SSE data 里取 usage（非 usage 块 → null）。 */
+export function extractUsage(data: string): LlmUsage | null {
+  if (!data || data === "[DONE]") return null
+  try {
+    const j = JSON.parse(data) as { usage?: UpstreamUsageShape | null }
+    return usageFromUpstream(j.usage)
+  } catch {
+    return null
+  }
+}
+
 /**
  * 逐事件迭代 SSE 响应体。`onChunk` 在每次收到原始字节后回调（流式空闲超时重置用）。
  * 非流式/无 body 时抛 LLMError，由调用方降级。
@@ -448,6 +511,15 @@ export class SiliconFlowChat implements ChatProvider {
   private readonly maxTokens: number
   /** undefined = 请求体不带 `enable_thinking` 字段（部分非 Qwen 模型不接受该参数）。 */
   private readonly enableThinking: boolean | undefined
+  /** key_usage.pool 记在哪个池（`llm` = 免费链；`ds` = 开业酬宾的促销链）。 */
+  private readonly poolName: PoolName
+  /**
+   * 是否在请求体带 `stream_options: {include_usage: true}`。
+   * 促销上游流式末块会回**完整 usage**（§3 第 4 项）→ 记账精确；免费链保持原样（不改其请求形状）。
+   */
+  private readonly includeStreamUsage: boolean
+  /** 由 usage 换算成本（元）写进 `key_usage.cost`；缺省 = 不记成本（免费链本来也不花钱）。 */
+  private readonly costOf?: (usage: LlmUsage) => number
 
   constructor(
     cfg: {
@@ -456,6 +528,12 @@ export class SiliconFlowChat implements ChatProvider {
       timeoutMs?: number
       maxTokens?: number
       enableThinking?: boolean | undefined
+      /** key_usage.pool（默认免费链 `llm`） */
+      poolName?: PoolName
+      /** 流式是否要上游回 usage（促销：true；免费链：false = 保持原请求形状） */
+      includeStreamUsage?: boolean
+      /** usage → 成本（元）；促销链传 promoCostCny 的适配器，免费链不传 */
+      costOf?: (usage: LlmUsage) => number
     },
     pool: KeyPool,
     fetchImpl: typeof fetch = defaultFetch,
@@ -465,6 +543,9 @@ export class SiliconFlowChat implements ChatProvider {
     this.timeoutMs = cfg.timeoutMs ?? LLM_DEFAULT_TIMEOUT_MS
     this.maxTokens = cfg.maxTokens ?? LLM_MAX_TOKENS
     this.enableThinking = cfg.enableThinking
+    this.poolName = cfg.poolName ?? "llm"
+    this.includeStreamUsage = cfg.includeStreamUsage === true
+    this.costOf = cfg.costOf
     this.pool = pool
     this.fetchImpl = fetchImpl
   }
@@ -484,14 +565,21 @@ export class SiliconFlowChat implements ChatProvider {
         Authorization: `Bearer ${key.secret}`,
       },
       signal: controller.signal,
+      // ⚠️ 请求体**只放上游认识的字段**：促销网关（TokenRhythm）严格校验未知字段，
+      //    实测 `thinking_budget` → 400 UNKNOWN_FIELD（plan-promo.md §3 第 2 项）。
+      //    允许出现的只有：model / messages / max_tokens / stream / enable_thinking / stream_options。
       body: JSON.stringify({
         model: this.model,
         messages,
         max_tokens: Math.min(opts.maxTokens ?? this.maxTokens, this.maxTokens),
         stream,
-        // 关思考链：Qwen3.5-4B 走非推理路径，省 token 省延迟（§8.4）。
-        // undefined（env LLM_ENABLE_THINKING=omit）时整个字段不发送，兼容不接受该参数的模型。
-        ...(this.enableThinking === undefined ? {} : { enable_thinking: this.enableThinking }),
+        // 思考控制：**按请求**优先（前端「深度思考」开关），否则用 provider 静态默认。
+        // undefined（env LLM_ENABLE_THINKING=omit 且未按请求指定）→ 整个字段不发送，兼容不接受该参数的模型。
+        ...((opts.thinking ?? this.enableThinking) === undefined
+          ? {}
+          : { enable_thinking: opts.thinking ?? this.enableThinking }),
+        // 促销链才带这个（要真实 usage 才能"用完即止"）；免费链保持原请求形状不变。
+        ...(this.includeStreamUsage && stream ? { stream_options: { include_usage: true } } : {}),
       }),
     })
     return {
@@ -514,7 +602,7 @@ export class SiliconFlowChat implements ChatProvider {
     usage?: LlmUsage,
   ): Promise<void> {
     return this.pool.recordUsage({
-      pool: "llm",
+      pool: this.poolName,
       keyRef,
       endpoint: "chat",
       model: this.model,
@@ -523,6 +611,7 @@ export class SiliconFlowChat implements ChatProvider {
       tokensIn: usage?.tokens_in,
       tokensOut: usage?.tokens_out,
       latencyMs,
+      cost: usage && this.costOf ? this.costOf(usage) : undefined,
     })
   }
 
@@ -570,17 +659,13 @@ export class SiliconFlowChat implements ChatProvider {
     const data = (await (resp.json ? resp.json() : Promise.resolve(undefined))) as ChatCompletionResponse | undefined
     const text = (data?.choices?.[0]?.message?.content ?? "").trim()
     // 用量：优先上游 usage；缺失则按字符数估算并标 estimated（配额侧要知道可信度）。
-    const usage: LlmUsage = data?.usage
-      ? {
-          tokens_in: data.usage.prompt_tokens ?? 0,
-          tokens_out: data.usage.completion_tokens ?? 0,
-          estimated: false,
-        }
-      : {
-          tokens_in: estimateTokens(messages.map((m) => m.content)),
-          tokens_out: estimateTokens([text]),
-          estimated: true,
-        }
+    // 用量：优先上游 usage（**含 cached/reasoning 明细**，促销链靠它自算成本）；缺失则按字符数估算并标 estimated
+    const upstream = usageFromUpstream(data?.usage)
+    const usage: LlmUsage = upstream ?? {
+      tokens_in: estimateTokens(messages.map((m) => m.content)),
+      tokens_out: estimateTokens([text]),
+      estimated: true,
+    }
     if (!text) {
       await this.record(keyRef, "failed", statusCode, Date.now() - started, usage)
       throw new LLMError("llm-empty", "llm-empty-response")
@@ -614,6 +699,10 @@ export class SiliconFlowChat implements ChatProvider {
     const built = buildPrompt(hits, question, opts.history)
     const pool = this.pool
     const model = this.model
+    // ⚠️ 流式路径有自己的 record 闭包（生成器里 this 会丢）：池名与成本函数必须一并捕获，
+    //    否则促销调用会被记成免费链的 pool='llm'（钱算进免费池、预算闸永远不动）——实测踩过。
+    const poolName = this.poolName
+    const costOf = this.costOf
     const defaultTimeout = this.timeoutMs
     // 生成器是普通函数，this 会丢；显式捕获实例引用。
     const self = this
@@ -638,7 +727,7 @@ export class SiliconFlowChat implements ChatProvider {
       usage?: LlmUsage,
     ) =>
       pool.recordUsage({
-        pool: "llm",
+        pool: poolName,
         keyRef,
         endpoint: "chat",
         model,
@@ -647,6 +736,7 @@ export class SiliconFlowChat implements ChatProvider {
         tokensIn: usage?.tokens_in,
         tokensOut: usage?.tokens_out,
         latencyMs,
+        cost: usage && costOf ? costOf(usage) : undefined,
       })
 
     /** 把 keypool / fetch 的异常映射为可识别 LLMError（与 chat 同规则）。 */
@@ -667,6 +757,8 @@ export class SiliconFlowChat implements ChatProvider {
       let keyRef = "unknown"
       let statusCode: number | undefined
       let acc = ""
+      /** 上游末块回的真实 usage（促销链；拿不到则为 null → 退回估算） */
+      let upstreamUsage: LlmUsage | null = null
       let settled = false
       const finish = (u: LlmUsage) => {
         if (settled) return
@@ -678,11 +770,12 @@ export class SiliconFlowChat implements ChatProvider {
         settled = true
         failUsage(e)
       }
-      const usageSoFar = (): LlmUsage => ({
-        tokens_in: promptTokensIn(),
-        tokens_out: estimateTokens([acc]),
-        estimated: true,
-      })
+      const usageSoFar = (): LlmUsage =>
+        upstreamUsage ?? {
+          tokens_in: promptTokensIn(),
+          tokens_out: estimateTokens([acc]),
+          estimated: true,
+        }
 
       try {
         let resp: ResponseLike
@@ -719,6 +812,9 @@ export class SiliconFlowChat implements ChatProvider {
         let emitted = 0
         for await (const ev of iterateSse(raw.body, bump)) {
           if (ev.data === "[DONE]") break
+          // usage 可能随最后一块到达（促销链带了 stream_options.include_usage）→ 先收下来
+          const u = extractUsage(ev.data)
+          if (u) upstreamUsage = u
           const delta = extractDeltaContent(ev.data)
           if (delta) {
             acc += delta
@@ -806,8 +902,53 @@ export function createChatProvider(
       model: e.LLM_MODEL?.trim() || LLM_DEFAULT_MODEL,
       endpoint: e.LLM_ENDPOINT,
       timeoutMs: parsePositiveInt(e.LLM_TIMEOUT_MS, LLM_DEFAULT_TIMEOUT_MS),
-      maxTokens: Math.min(parsePositiveInt(e.LLM_MAX_TOKENS, LLM_MAX_TOKENS), LLM_MAX_TOKENS),
+      // env 只能在此之内调（默认 1000，硬上限 8192）—— 绝不放开成无上限（那是直接的烧钱口子）
+      maxTokens: Math.min(parsePositiveInt(e.LLM_MAX_TOKENS, FREE_LLM_MAX_TOKENS), LLM_MAX_TOKENS_CEILING),
       enableThinking: parseThinkingFlag(e.LLM_ENABLE_THINKING),
+    },
+    pool,
+    fetchImpl,
+  )
+  return { pool, provider }
+}
+
+/** env 里的促销字段（plan-promo.md §1.5 A2：密钥来自 `DS_POOL_KEY_<n>`）。 */
+export interface PromoChatConfig {
+  model: string
+  endpoint: string
+  maxTokens: number
+  timeoutMs?: number
+}
+
+/**
+ * 构造促销链的 chat provider（独立池 `DS_POOL_KEY_<n>`，记账 `pool='ds'`）。
+ *
+ * 与免费链的三处差异（其余复用同一实现）：
+ *   · 密钥来自**另一个上游**的独立池（绝不混 `POOL_KEYS_<n>`，否则必 401 且记账混）；
+ *   · 流式带 `stream_options:{include_usage:true}` → 末块回**真实 usage** → 记账精确、可"用完即止"；
+ *   · 按 usage **自算成本**（`costOf`）写进 `key_usage.cost`。
+ * 思考由**每次请求**的 `opts.thinking` 决定（默认 false）；这里不做静态默认。
+ */
+export function createPromoChatProvider(
+  env: unknown,
+  db: KeyPoolDb,
+  cfg: PromoChatConfig,
+  fetchImpl: typeof fetch = defaultFetch,
+  opts: { costOf?: (usage: LlmUsage) => number; denied?: Iterable<string> } = {},
+): { pool: KeyPool; provider: ChatProvider } {
+  const pool = new KeyPool(env, db, { keyVar: promoKeyVarOptions() })
+  if (opts.denied) pool.setDenied("ds", opts.denied)
+  const provider = new SiliconFlowChat(
+    {
+      model: cfg.model,
+      endpoint: cfg.endpoint,
+      timeoutMs: cfg.timeoutMs ?? LLM_DEFAULT_TIMEOUT_MS,
+      maxTokens: Math.min(cfg.maxTokens, LLM_MAX_TOKENS_CEILING),
+      poolName: "ds",
+      includeStreamUsage: true,
+      costOf: opts.costOf,
+      // 促销链的思考由请求参数决定：静态默认给 false（未显式传时就是"不思考"，与前端默认一致）
+      enableThinking: false,
     },
     pool,
     fetchImpl,

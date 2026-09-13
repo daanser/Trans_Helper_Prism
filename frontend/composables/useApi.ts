@@ -60,9 +60,27 @@ export interface MeUser {
 }
 
 /** GET /api/v1/me 返回体 */
+/** 开业酬宾状态（后端 /me 的 `promo` 字段；plan-promo.md §5.8）。 */
+export interface PromoState {
+  /** 促销是否可用（仅登录用户会看到 true；匿名拿不到这个字段的值） */
+  enabled: boolean
+  /** 促销模型 id（如 deepseek-flash）——前端「模型：」显示与文案用 */
+  model: string
+  /** 关闭原因（enabled / disabled-by-env / no-keys / expired / budget-exhausted / disabled-by-flag） */
+  reason?: string
+  /** 结束时间戳（ms）；null = 未设期限 */
+  ends_at?: number | null
+  /** 促销期 5h 额度窗口（加权 token）；关掉促销时后端给 null */
+  quota_window_tokens?: number | null
+  /** 是否可用「深度思考」开关（仅促销链支持） */
+  thinking_available?: boolean
+}
+
 export interface MeResponse {
   user: MeUser
   quota: QuotaState
+  /** 开业酬宾（老部署没有该字段 → undefined = 视为未开启，前端不显示任何促销入口） */
+  promo?: PromoState
   /**
    * 免责声明确认时刻（epoch ms）；`null` = 从未确认。
    * 字段可选：老部署没有这两列时前端视为"未确认"（只是会弹一次，不影响任何功能）。
@@ -97,6 +115,11 @@ export interface SearchRequest {
   session_id?: string
   top_k?: number
   model_id?: string
+  /**
+   * 「深度思考」（开业酬宾专用，plan-promo.md §5.5）：透传给促销上游的 `enable_thinking`。
+   * 免费链 / 匿名请求会忽略它；默认不传（= 不思考）。
+   */
+  thinking?: boolean
 }
 
 /** POST /api/v1/search 返回体 */
@@ -322,6 +345,11 @@ export function isRateLimited(err: unknown): boolean {
 /** SSE 流式回调（POST /api/v1/search/stream）
  *  实际后端事件：event: hits|session|citations|delta|done|error，payload 均在 `data:` 行。
  */
+/** 流式请求附加字段（开业酬宾的「深度思考」；免费链忽略） */
+export interface SearchStreamExtras {
+  thinking?: boolean
+}
+
 export interface SearchStreamHandlers {
   /** 增量文本：兼容 `{text}` / `{delta}` / `{content}` */
   onDelta?: (delta: string) => void
@@ -555,10 +583,11 @@ export function useApi() {
    * 多轮追问（POST /api/v1/chat，T3.4）。非流式 JSON：`{text, citations, model}`。
    * `session_id` 来自流式总结的 `event: session`；后端负责最近 N 轮上下文与 10 轮上限。
    */
-  async function chat(sessionId: string, question: string): Promise<ChatResponse> {
+  async function chat(sessionId: string, question: string, opts: { thinking?: boolean } = {}): Promise<ChatResponse> {
     const res = await request<ChatResponse>("/v1/chat", {
       method: "POST",
-      body: JSON.stringify({ session_id: sessionId, question }),
+      // `thinking` 与总结同源（同一个开关），追问也走促销链 → 免得"总结思考、追问不思考"的怪状态
+      body: JSON.stringify({ session_id: sessionId, question, ...(opts.thinking ? { thinking: true } : {}) }),
     })
     // citations 可能是 {index,label} 对象，统一成 "来源n" 标签
     if (Array.isArray(res.citations)) res.citations = normalizeCitations(res.citations)

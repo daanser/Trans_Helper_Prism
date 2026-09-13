@@ -212,8 +212,11 @@
           :followup-enabled="llmEnabled && results.length > 0"
           :enabled="llmEnabled"
           :collapsed="aiCollapsed"
+          :promo="promo"
+          :deep-thinking="deepThinking"
           @update:enabled="onLlmToggle"
           @update:collapsed="onAiCollapsedChange"
+          @update:deep-thinking="onDeepThinkingChange"
           @cite="onCite"
           @followup="onFollowUp"
         />
@@ -269,7 +272,10 @@
             :followup-enabled="llmEnabled && results.length > 0"
             :enabled="llmEnabled"
             :collapsed="false"
+            :promo="promo"
+            :deep-thinking="deepThinking"
             @update:enabled="onLlmToggle"
+            @update:deep-thinking="onDeepThinkingChange"
             @cite="onCiteFromDrawer"
             @followup="onFollowUp"
           />
@@ -308,6 +314,7 @@ import TimingsBar from "~/components/TimingsBar.vue"
 import AiCompanionCard from "~/components/AiCompanionCard.vue"
 import ConfirmDialog from "~/components/ConfirmDialog.vue"
 import { TOP_K_ANON_MAX, TOP_K_MAX } from "~/composables/usePrefs"
+import type { PromoState } from "~/composables/useApi"
 
 type AiStatus = "idle" | "streaming" | "done" | "unavailable"
 
@@ -398,6 +405,14 @@ const showLlmConfirm = ref(false)
 const aiStatus = ref<AiStatus>("idle")
 const aiAnswer = ref("")
 const aiModel = ref("")
+/**
+ * 开业酬宾状态（来自后端 `/me` 的 `promo`；plan-promo.md §5.8）。
+ * ⚠️ 前端**不猜**促销是否可用：只有后端说 enabled 才显示酬宾标识与「深度思考」按钮
+ * （匿名 / 未配置 / 额度用完 → 这里始终是 null/false，UI 上就没有任何入口）。
+ */
+const promo = ref<PromoState | null>(null)
+/** 「深度思考」（持久化在 usePrefs.deepThinking；仅促销链会真的用到它） */
+const deepThinking = ref(false)
 const aiNotice = ref("")
 const aiCitations = ref<string[]>([])
 /** 流式接口若自带 hits，用它做引用映射；否则回落到本次主检索结果 */
@@ -620,6 +635,8 @@ async function runAi(req: SearchRequest) {
     use_llm: true,
     llm_mode: "summary",
     session_id: undefined,
+    // 深度思考：只在促销可用时才带（免费链忽略该字段，但不发更干净）；逐请求显式传参便于事后核对
+    ...(promo.value?.enabled && deepThinking.value ? { thinking: true } : {}),
   }
 
   let received = ""
@@ -645,6 +662,8 @@ async function runAi(req: SearchRequest) {
         },
         onNotice: (notice) => {
           aiNotice.value = notice
+          // 促销链挂了 → 后端会发 promo-unavailable（plan-promo.md §5.6：不静默降级）
+          if (notice.includes("已切回标准模型")) pushToast(notice, "info")
         },
       },
       controller.signal,
@@ -714,7 +733,10 @@ async function onFollowUp(question: string) {
   aiNotice.value = ""
   aiAnswer.value = `${aiAnswer.value}\n\n——\n\n`
   try {
-    const res = await chat(sessionId.value, question)
+    const res = await chat(sessionId.value, question, {
+      // 追问与总结用同一个「深度思考」开关（同一会话里不该出现"总结思考、追问不思考"）
+      thinking: promo.value?.enabled === true && deepThinking.value,
+    })
     const text = (res.text ?? "").trim()
     aiAnswer.value += text || "（未返回内容）"
     if (res.citations?.length) aiCitations.value = Array.from(new Set([...aiCitations.value, ...res.citations]))
@@ -806,8 +828,28 @@ onMounted(() => {
   const saved = loadPrefs()
   llmEnabled.value = saved.llm
   aiCollapsed.value = saved.aiCollapsed === true
+  deepThinking.value = saved.deepThinking === true
+  void loadPromo()
   window.addEventListener("keydown", onDrawerKeydown)
 })
+
+/**
+ * 读促销状态（`/me` 的 `promo` 字段）。
+ * 未登录 / 老部署 / 请求失败 → 保持 null = **不显示任何促销入口**（宁可少显示，不做假控件）。
+ * 登录态变化时也要重读（登录后才可能拿到促销）。
+ */
+async function loadPromo() {
+  if (!isLoggedIn.value) {
+    promo.value = null
+    return
+  }
+  try {
+    const res = await useApi().me()
+    promo.value = res.promo ?? null
+  } catch {
+    promo.value = null
+  }
+}
 
 onBeforeUnmount(() => {
   cancelAiStream()
@@ -819,5 +861,18 @@ onBeforeUnmount(() => {
 watch(prefs, (next) => {
   llmEnabled.value = next.llm
   aiCollapsed.value = next.aiCollapsed === true
+  deepThinking.value = next.deepThinking === true
 })
+
+// 登录态变化 → 重读促销状态（匿名没有促销；登录后才可能出现「开业酬宾」与「深度思考」）
+watch(isLoggedIn, () => {
+  void loadPromo()
+})
+
+/** 深度思考开关：持久化 + 立即把当前可见的总结重新生成（让它真的生效，而不是"下次才生效"） */
+function onDeepThinkingChange(v: boolean) {
+  deepThinking.value = v
+  savePrefs({ deepThinking: v })
+  pushToast(v ? "已开启深度思考（更慢，但更深入）" : "已关闭深度思考", "info")
+}
 </script>

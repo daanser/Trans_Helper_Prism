@@ -21,14 +21,27 @@
 // 并列时按 **LRU**（最久未取用优先）而不是"稳定排序 → 永远第一把"：顺序请求也会在多把 key/多个账号间轮转，
 // 把用量摊开（正对"防上游封号"这个真实目标）。
 
-/** 能力标签：embedding / 聊天（含总结与追问）/ rerank。三者共用同一份 key（见文件头"单池 + 能力标签"）。 */
-export type PoolName = "embed" | "llm" | "rerank"
+/**
+ * 能力标签：embedding / 聊天（含总结与追问）/ rerank —— 三者共用同一份 key（`POOL_KEYS_<n>`）。
+ * `ds` 是**另一个上游**（开业酬宾的 TokenRhythm）的独立池，密钥来自 `DS_POOL_KEY_<n>`（plan-promo.md §5.1），
+ * 只用于 `key_usage.pool` 记账与禁用槽位区分，**绝不与 `POOL_KEYS_<n>` 混池**。
+ */
+export type PoolName = "embed" | "llm" | "rerank" | "ds"
 
 /** 对外暴露的**唯一**池名（`/admin/keys` 的 `pools[].pool`）。 */
 export const MERGED_POOL_NAME = "keys" as const
 
-/** 变量名形状：`POOL_KEYS_<n>`（n 为数字，不要求连续）。 */
-export const POOL_KEYS_VAR_RE = /^POOL_KEYS_(\d+)$/
+/** 变量名前缀（默认合并池）；促销池用 `DS_POOL_KEY_`（见 PROMO_KEY_VAR_PREFIX）。 */
+export const POOL_KEYS_VAR_PREFIX = "POOL_KEYS_"
+/** 促销（TokenRhythm）密钥变量前缀：`DS_POOL_KEY_0` / `DS_POOL_KEY_1` … */
+export const PROMO_KEY_VAR_PREFIX = "DS_POOL_KEY_"
+
+/** 变量名形状：`<prefix><n>`（n 为数字，不要求连续）。 */
+export function poolKeysVarRe(prefix: string = POOL_KEYS_VAR_PREFIX): RegExp {
+  return new RegExp(`^${prefix}(\\d+)$`)
+}
+/** 兼容旧引用（= 默认前缀的正则）。 */
+export const POOL_KEYS_VAR_RE = poolKeysVarRe()
 
 /** env 里一个 `POOL_KEYS_<n>` 变量的原始值。 */
 export interface PoolKeysVar {
@@ -57,10 +70,11 @@ export function envString(env: unknown, key: string): string | undefined {
  * 扫描 env，收集所有 `POOL_KEYS_<n>`，**按数字升序**返回（`_0` 在前；不要求连续）。
  * 忽略空值与非法名；非字符串值（比如误配成数字）跳过。
  */
-export function scanPoolKeyVars(env: unknown): PoolKeysVar[] {
+export function scanPoolKeyVars(env: unknown, prefix: string = POOL_KEYS_VAR_PREFIX): PoolKeysVar[] {
   const out: PoolKeysVar[] = []
+  const re = poolKeysVarRe(prefix)
   for (const [name, value] of Object.entries(asRecord(env))) {
-    const m = POOL_KEYS_VAR_RE.exec(name)
+    const m = re.exec(name)
     if (!m) continue
     if (typeof value !== "string") continue
     const index = Number(m[1])
@@ -147,16 +161,22 @@ function makeKey(ref: string, secret: string): PoolKey {
  * 去重（§2.1 第 4 条）：同一把 key 值出现多次 → **保留数字更小的那个 ref**（升序遍历天然满足），并 warn 一次。
  * `onWarn` 可注入（单测断言用）；缺省 `console.warn`，消息里**只有 ref，绝不含 key 值**。
  */
-export function parseMergedKeys(env: unknown, onWarn: (msg: string) => void = (m) => console.warn(m)): PoolKey[] {
+export function parseMergedKeys(
+  env: unknown,
+  onWarn: (msg: string) => void = (m) => console.warn(m),
+  opts: { varPrefix?: string; refPrefix?: string } = {},
+): PoolKey[] {
+  const varPrefix = opts.varPrefix ?? POOL_KEYS_VAR_PREFIX
+  const refPrefix = opts.refPrefix ?? "pool"
   const out: PoolKey[] = []
   const seen = new Map<string, string>() // secret → 已保留的 ref
-  for (const { index, raw } of scanPoolKeyVars(env)) {
+  for (const { index, raw } of scanPoolKeyVars(env, varPrefix)) {
     const secrets = raw
       .split(",")
       .map((v) => v.trim())
       .filter(Boolean)
     secrets.forEach((secret, i) => {
-      const ref = i === 0 ? `pool-key-${index}` : `pool-key-${index}#${i + 1}`
+      const ref = i === 0 ? `${refPrefix}-key-${index}` : `${refPrefix}-key-${index}#${i + 1}`
       const keptRef = seen.get(secret)
       if (keptRef !== undefined) {
         onWarn(`[keypool] 同一把 key 配了多次（${ref} 与 ${keptRef}）→ 去重，保留 ${keptRef}`)
@@ -176,6 +196,8 @@ export interface KeyPoolOptions {
    * 缺省/空集合 = 无禁用（**fail-open**）：管理面读不到禁用集时检索/LLM 必须照常工作。
    */
   denied?: Partial<Record<PoolName, Iterable<string>>>
+  /** 密钥变量前缀与 ref 前缀（默认 = 合并池 `POOL_KEYS_<n>` → `pool-key-<n>`） */
+  keyVar?: { varPrefix?: string; refPrefix?: string }
 }
 
 export class KeyPool {
@@ -194,8 +216,9 @@ export class KeyPool {
   private pickSeq = 0
 
   constructor(env: unknown, db: KeyPoolDb, options: KeyPoolOptions = {}) {
-    // 扫描 `POOL_KEYS_<n>`（数字升序）；只认这一种命名（旧变量名已移除，见文件头）
-    this.keyList = parseMergedKeys(env)
+    // 扫描密钥变量（数字升序）。默认合并池 `POOL_KEYS_<n>`；促销池传 `promoKeyVarOptions()`
+    // （见 promo.ts：`DS_POOL_KEY_<n>` → ref `ds-pool-key-<n>`）。
+    this.keyList = parseMergedKeys(env, undefined, options.keyVar)
     this.db = db
     this.applyDenied(options.denied)
     this.checkAlertLevels()
@@ -230,7 +253,7 @@ export class KeyPool {
    */
   applyDenied(map: Partial<Record<PoolName, Iterable<string>>> | null | undefined): void {
     const union = new Set<string>()
-    for (const pool of ["embed", "llm", "rerank"] as PoolName[]) {
+    for (const pool of ["embed", "llm", "rerank", "ds"] as PoolName[]) {
       const refs = map?.[pool]
       if (!refs) continue
       try {

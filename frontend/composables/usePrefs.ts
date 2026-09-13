@@ -26,17 +26,23 @@ export interface PrismPrefs {
    */
   aiCollapsed: boolean
   /**
+   * 「深度思考」（开业酬宾专用，plan-promo.md §5.5）：默认关闭。
+   * 只有促销模型支持（上游 `enable_thinking`）；免费链忽略该字段。
+   * 实测代价：不思考 7–18s / 思考 12–26s（思考会吃掉大半 max_tokens）。
+   */
+  deepThinking: boolean
+  /**
    * 偏好结构版本。
    * · v1（无该字段）/v2：曾把"未登录被夹到 5"或更早的默认 2 持久化下来（bug 产物）；
    * · v3：迁移时把 <8 的历史值一次性提升到默认 10；**≥8 的值视为用户真实偏好并保留**；
-   * · v4（当前）：只**新增** advancedOpen / aiCollapsed 两个布局字段，**不改动 topK 的任何迁移逻辑**
-   *   （迁移条件仍是 `storedVersion < 3`，见 sanitize）。
+   * · v4：只**新增** advancedOpen / aiCollapsed 两个布局字段，**不改动 topK 的任何迁移逻辑**；
+   * · v5（当前）：新增 `deepThinking`（默认关）。同样**不碰 topK**。
    */
   version: number
 }
 
-/** 当前偏好结构版本（<3 的历史数据会在 sanitize 里一次性修正 topK；v4 只新增布局字段） */
-export const PREFS_VERSION = 4
+/** 当前偏好结构版本（<3 的历史数据会在 sanitize 里一次性修正 topK；v4/v5 只新增字段） */
+export const PREFS_VERSION = 5
 
 export const PREFS_KEY = "prism_prefs"
 
@@ -54,6 +60,7 @@ export function defaultPrefs(): PrismPrefs {
     topK: TOP_K_DEFAULT,
     advancedOpen: false, // 高级区默认收起（首屏只留知识库 + AI 开关）
     aiCollapsed: false, // 要点卡默认展开
+    deepThinking: false, // 深度思考默认关（更慢，用户明确要求"默认关但按钮显眼"）
     version: PREFS_VERSION,
   }
 }
@@ -86,6 +93,7 @@ function sanitize(raw: unknown): PrismPrefs {
     // v4 新增的两个布局字段：老数据没有 → 取默认（不触发任何 topK 改写）
     advancedOpen: typeof obj.advancedOpen === "boolean" ? obj.advancedOpen : base.advancedOpen,
     aiCollapsed: typeof obj.aiCollapsed === "boolean" ? obj.aiCollapsed : base.aiCollapsed,
+    deepThinking: typeof obj.deepThinking === "boolean" ? obj.deepThinking : base.deepThinking,
     version: PREFS_VERSION,
   }
 }

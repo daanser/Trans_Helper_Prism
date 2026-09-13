@@ -45,6 +45,26 @@ export interface Env {
    */
   RERANK_MAX_CANDIDATES?: string
 
+  // ── 开业酬宾：限时 DeepSeek V4.1 Flash（plan-promo.md）──
+  // 密钥**动态命名**：`DS_POOL_KEY_0` / `DS_POOL_KEY_1` ……（独立池，**绝不与 POOL_KEYS_<n> 混**：
+  // 不同上游、不同计费，混池必然 401 且记账算不准）。同样不逐个声明，读取走 parseMergedKeys(env, "DS_POOL_KEY_")。
+  /** 促销上游端点（默认 https://tokenrhythm.studio/v1） */
+  DS_ENDPOINT?: string
+  /** 促销模型 id（默认 deepseek-flash） */
+  DS_MODEL?: string
+  /** 促销总开关：`false` = 彻底关闭（**同步生效**，也决定额度口径是否 4×）；缺省 = 配了密钥就开 */
+  PROMO_ENABLED?: string
+  /** 促销预算（元，默认 136 = 两把 ¥68；判定时留 5% 余量再收闸） */
+  PROMO_BUDGET_CNY?: string
+  /** 促销 5h 配额窗口（加权 token，默认 1_000_000 = 4×） */
+  PROMO_QUOTA_WINDOW_TOKENS?: string
+  /** 促销单次输出上限（默认 4000；免费链 LLM_MAX_TOKENS 默认 1000，硬上限 8192） */
+  PROMO_LLM_MAX_TOKENS?: string
+  /** 促销结束时间戳（ms）。未配 → 用"首次被读到"的 started_at + PROMO_DAYS（默认 30 天） */
+  PROMO_END_AT?: string
+  /** 促销默认期限天数（默认 30；仅当 PROMO_END_AT 未配时生效） */
+  PROMO_DAYS?: string
+
   // ── 超时配置（T1.3，毫秒；默认 15s）──
   EMBED_TIMEOUT_MS?: string
   RERANK_TIMEOUT_MS?: string
@@ -150,6 +170,11 @@ export interface SearchRequest {
   session_id?: string
   top_k?: number
   model_id?: string | "default"
+  /**
+   * 深度思考（开业酬宾专用，plan-promo.md §5.5）：交给促销上游的 `enable_thinking`。
+   * 免费链忽略它；匿名请求也忽略（促销仅登录用户）。默认 false。
+   */
+  thinking?: boolean
 }
 
 /** 搜索结果命中项（plan.md §3.3 返回体）。 */

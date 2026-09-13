@@ -99,6 +99,20 @@
       </ul>
     </section>
 
+    <!-- 开业酬宾（plan-promo.md §5.8）：模型、期限、额度、用完即止、数据边界、速度预期 —— 逐条如实写 -->
+    <section class="mb-8 rounded-2xl border border-border-subtle bg-surface p-5 shadow-card">
+      <h2 class="mb-3 text-base font-semibold text-ink-title">开业酬宾：限时 DeepSeek V4.1 Flash</h2>
+      <ul class="list-disc space-y-1.5 pl-5 text-sm leading-relaxed text-ink-body">
+        <li><strong>限时</strong>：登录用户的 AI 总结与追问默认使用 <span class="font-mono text-xs">deepseek-flash</span>（DeepSeek V4.1 Flash），无需任何设置。</li>
+        <li><strong>额度用完即止</strong>：酬宾由我们自费承担，预算花完（或到期）就<strong>自动结束</strong> —— 届时会切回标准模型（Qwen3.5-4B），<strong>检索与 AI 都不会失败</strong>，页面上会明确提示"已切回标准模型"。</li>
+        <li><strong>额度已提升</strong>：酬宾期间登录用户的 5 小时额度窗口提升到约 <strong>4 倍</strong>（≈100 万加权 token）；结束后自动回到标准额度。重置时刻的口径不变。</li>
+        <li><strong>「深度思考」</strong>：可以显式开启（默认关闭）。开启后模型会先做内部推理再作答，<strong>更深入但更慢</strong>（实测 12–26 秒，关闭时 7–18 秒），也更费额度。</li>
+        <li><strong>该模型较慢</strong>：酬宾模型比标准模型明显更慢；如果你在赶时间，把「深度思考」关掉、或直接使用标准模型链路（不登录时的默认就是标准链路）。</li>
+        <li><strong>数据边界不变</strong>：和标准模型完全一样 —— 只把<strong>本次命中的原文片段</strong>与你的问题发给模型服务商，不发完整语料、不发账号信息；AI 输出仅供参考，不能替代医生建议。</li>
+        <li>酬宾是给登录用户的（匿名请求不会走酬宾模型）；这既是产品取舍，也是防滥用的一道闸。</li>
+      </ul>
+    </section>
+
     <!-- 开源与致谢 -->
     <section class="mb-8 rounded-2xl border border-surface-border bg-surface p-5 shadow-card">
       <h2 class="mb-3 text-base font-semibold text-ink-title">开源与致谢</h2>

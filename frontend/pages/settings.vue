@@ -71,6 +71,10 @@
           <p v-else-if="isLowQuota" class="mt-1.5 text-xs text-danger">
             剩余额度已低于 10%，超出后将自动切换为回退检索（回退不消耗额度）。
           </p>
+          <!-- 开业酬宾：额度提升到 4× —— 不写这句用户会看不懂"为什么百分比掉得比以前慢" -->
+          <p v-if="promoQuotaHint" class="mt-1.5 text-xs text-ink-muted">
+            {{ promoQuotaHint }}
+          </p>
 
           <!-- 窗口起止与下次重置（本地时刻；R6 网格锚定 → 每次重置时刻固定可预测）
                ⚠️ 这些文案只在客户端挂载后渲染（useAuth 的 clientReady 门控），预渲染阶段为 null -->
@@ -418,6 +422,30 @@ type ModelsState = "idle" | "loading" | "ok" | "unimplemented" | "error"
 const { saveModelSettings, listModels, deleteModel } = useApi()
 const { pushToast } = useToast()
 const { prefs, load: loadPrefs, save, reset } = usePrefs()
+
+/**
+ * 开业酬宾的额度提示（plan-promo.md §5.4）：只有后端确认促销可用时显示。
+ * 文案里的倍数/窗口大小从后端字段算，不写死（促销结束或改窗口时自动消失/更新）。
+ */
+const promoQuotaHint = ref("")
+async function loadPromoHint() {
+  if (!isLoggedIn.value) {
+    promoQuotaHint.value = ""
+    return
+  }
+  try {
+    const res = await useApi().me()
+    const promo = res.promo
+    if (promo?.enabled && typeof promo.quota_window_tokens === "number" && promo.quota_window_tokens > 0) {
+      const wan = Math.round(promo.quota_window_tokens / 10_000)
+      promoQuotaHint.value = `开业酬宾期间额度已提升（约 ${wan} 万加权 token / 5 小时）；酬宾结束后自动恢复标准额度。`
+    } else {
+      promoQuotaHint.value = ""
+    }
+  } catch {
+    promoQuotaHint.value = ""
+  }
+}
 // 免责提示开关（B5）：模型 = "本设备尚未记住"（见 useDisclaimer.showOnStart）
 const { showOnStart: disclaimerShowOnStart, load: loadDisclaimer, setShowOnStart: setDisclaimerShowOnStart } = useDisclaimer()
 const {
@@ -685,6 +713,7 @@ onMounted(async () => {
   if (isLoggedIn.value) {
     await loadMe()
     await loadModels()
+    await loadPromoHint()
   }
   syncCreated()
 })

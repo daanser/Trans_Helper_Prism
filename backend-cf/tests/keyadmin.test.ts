@@ -131,19 +131,39 @@ describe("poolRefsFromEnv / buildPoolInfos（合并池：只有一项 keys）", 
     expect(poolRefsFromEnv(env, "embed")).toEqual(poolRefsFromEnv(env, "rerank"))
 
     const infos = buildPoolInfos(env)
-    expect(infos).toEqual([{ pool: "keys", configured: 4, refs: ["pool-key-0", "pool-key-1", "pool-key-2", "pool-key-3"] }])
+    // 两项：合并池 + 开业酬宾的独立池（本夹具没配 DS key → ds 为 0）
+    expect(infos).toEqual([
+      { pool: "keys", configured: 4, refs: ["pool-key-0", "pool-key-1", "pool-key-2", "pool-key-3"] },
+      { pool: "ds", configured: 0, refs: [] },
+    ])
     const json = JSON.stringify(infos)
     expect(json).not.toMatch(/sk-/)
     for (const sec of [...EMBED_SECRETS, ...LLM_SECRETS]) expect(json).not.toContain(sec)
   })
 
-  it("env 未配 key → 单项 configured 0 / refs []（不抛错）—— watchdog ④ 据此告警补货", () => {
-    expect(buildPoolInfos({})).toEqual([{ pool: "keys", configured: 0, refs: [] }])
+  it("env 未配 key → 两个池都 configured 0 / refs []（不抛错）—— watchdog ④ 据此告警补货", () => {
+    expect(buildPoolInfos({})).toEqual([
+      { pool: "keys", configured: 0, refs: [] },
+      { pool: "ds", configured: 0, refs: [] },
+    ])
     expect(buildPoolInfos(undefined)[0].refs).toEqual([])
     // 只有 `POOL_KEYS_<n>` 被识别：**其它名字一律忽略**（本次不留兼容）
-    expect(buildPoolInfos({ POOL_KEY_0: "sk-old", POOL_KEYS_X: "sk-old2", POOL_KEYS_0x: "sk-old3" })).toEqual([
-      { pool: "keys", configured: 0, refs: [] },
+    expect(buildPoolInfos({ POOL_KEY_0: "sk-old", POOL_KEYS_X: "sk-old2", POOL_KEYS_0x: "sk-old3" })[0]).toEqual({
+      pool: "keys",
+      configured: 0,
+      refs: [],
+    })
+  })
+
+  it("促销独立池：DS_POOL_KEY_<n> 单独成池（ref ds-pool-key-<n>），与合并池互不影响（plan-promo.md §5.1）", () => {
+    const infos = buildPoolInfos({ ...poolKeysEnv(["sk-a"]), DS_POOL_KEY_0: "ds-a", DS_POOL_KEY_1: "ds-b" })
+    expect(infos).toEqual([
+      { pool: "keys", configured: 1, refs: ["pool-key-0"] },
+      { pool: "ds", configured: 2, refs: ["ds-pool-key-0", "ds-pool-key-1"] },
     ])
+    const json = JSON.stringify(infos)
+    expect(json).not.toMatch(/sk-/)
+    expect(json).not.toContain("ds-a")
   })
 })
 
@@ -153,7 +173,7 @@ describe("readDeniedPools（合并池：单键 keydeny:keys，fail-open）", () 
   const env = POOL_ENV
 
   it("KV 缺失 → 全空（不抛错）", async () => {
-    expect(await readDeniedPools(undefined, env)).toEqual({ embed: [], llm: [], rerank: [] })
+    expect(await readDeniedPools(undefined, env)).toEqual({ embed: [], llm: [], rerank: [], ds: [] })
   })
 
   it("读到禁用集合：**一个键**映射进三个能力槽位（禁用 = 全能力）", async () => {
@@ -162,6 +182,7 @@ describe("readDeniedPools（合并池：单键 keydeny:keys，fail-open）", () 
       embed: ["pool-key-0", "pool-key-2"],
       llm: ["pool-key-0", "pool-key-2"],
       rerank: ["pool-key-0", "pool-key-2"],
+      ds: [], // 促销独立池：禁用集读在 promo.ts（保持 /search 热路径 KV 次数不变）
     })
   })
 
@@ -169,18 +190,18 @@ describe("readDeniedPools（合并池：单键 keydeny:keys，fail-open）", () 
     const { kv } = makeKv({
       seed: { [`${KEY_DENY_PREFIX}llm`]: "llm-key-0", [`${KEY_DENY_PREFIX}embed`]: "embed-key-1" },
     })
-    expect(await readDeniedPools(kvDenyStore(kv), env)).toEqual({ embed: [], llm: [], rerank: [] })
+    expect(await readDeniedPools(kvDenyStore(kv), env)).toEqual({ embed: [], llm: [], rerank: [], ds: [] })
   })
 
   it("KV 读抛错 / 脏值 → 视为无禁用（fail-open，绝不抛错）", async () => {
     const { kv } = makeKv({ failGet: true })
-    expect(await readDeniedPools(kvDenyStore(kv), env)).toEqual({ embed: [], llm: [], rerank: [] })
+    expect(await readDeniedPools(kvDenyStore(kv), env)).toEqual({ embed: [], llm: [], rerank: [], ds: [] })
 
     const dirty: DenyKvStore = {
       get: async () => "{not-a-list} sk-fake-embed-0001",
       put: async () => undefined,
     }
-    expect(await readDeniedPools(dirty, env)).toEqual({ embed: [], llm: [], rerank: [] })
+    expect(await readDeniedPools(dirty, env)).toEqual({ embed: [], llm: [], rerank: [], ds: [] })
   })
 })
 
@@ -253,13 +274,13 @@ describe("readDeniedPoolsCached（性能优化第二轮 B：进程内缓存）",
       put: async () => undefined,
     }
     const t0 = 1_800_000_000_000
-    expect(await readDeniedPoolsCached(kv, env, t0)).toEqual({ embed: [], llm: [], rerank: [] })
-    expect(await readDeniedPoolsCached(kv, env, t0 + 1_000)).toEqual({ embed: [], llm: [], rerank: [] })
+    expect(await readDeniedPoolsCached(kv, env, t0)).toEqual({ embed: [], llm: [], rerank: [], ds: [] })
+    expect(await readDeniedPoolsCached(kv, env, t0 + 1_000)).toEqual({ embed: [], llm: [], rerank: [], ds: [] })
     expect(gets).toBe(1) // 第二次没有再去撞 KV（等价于"这段时间视为无禁用"）
   })
 
   it("KV 缺失（无绑定）→ 空集；TTL 非法值回默认 30s", async () => {
-    expect(await readDeniedPoolsCached(undefined, env, 0)).toEqual({ embed: [], llm: [], rerank: [] })
+    expect(await readDeniedPoolsCached(undefined, env, 0)).toEqual({ embed: [], llm: [], rerank: [], ds: [] })
     expect(denyCacheTtlSec({})).toBe(30)
     expect(denyCacheTtlSec({ KEY_DENY_CACHE_TTL_SEC: "abc" })).toBe(30)
     expect(denyCacheTtlSec({ KEY_DENY_CACHE_TTL_SEC: "-5" })).toBe(0)

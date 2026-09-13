@@ -62,9 +62,45 @@
     </div>
 
     <div v-show="!collapsed" id="prism-ai-body">
-    <!-- 模型名：**放进可折叠主体**（截图反馈 #5：header 里它把标题挤换行了）。
-         弱样式小字，收起时随主体一起隐藏。 -->
-    <p v-if="model" class="mb-2 truncate font-mono text-[10px] text-ink-muted" :title="model">模型：{{ model }}</p>
+    <!-- 开业酬宾标识（plan-promo.md §5.8）：**弱样式纯文字，不做成可交互的假徽章/开关**；
+         只在促销真的可用时出现（由后端 /me 决定，前端不猜）。 -->
+    <p
+      v-if="promo?.enabled"
+      class="mb-2 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] leading-relaxed text-ink-muted"
+    >
+      <span class="rounded bg-primary-subtle px-1.5 py-0.5 text-[10px] font-medium text-primary">开业酬宾</span>
+      <span class="font-medium text-ink-sub">{{ promo.model }}</span>
+      <span>（限时，额度用完即止；{{ promoQuotaText }}）</span>
+      <span class="text-ink-muted/80">该模型较慢</span>
+    </p>
+
+    <!-- 模型名 + 深度思考（同一行区域；模型名弱样式小字，收起时随主体一起隐藏 —— 截图反馈 #5） -->
+    <div class="mb-2 flex flex-wrap items-center gap-x-3 gap-y-2">
+      <span v-if="model" class="truncate font-mono text-[10px] text-ink-muted" :title="model">模型：{{ model }}</span>
+
+      <!-- 深度思考：**显眼的胶囊按钮**（plan-promo.md §5.5；用户要求"开启按钮显眼一点"）。
+           仅登录且促销可用时出现；默认关闭；状态持久化在 usePrefs.deepThinking。 -->
+      <button
+        v-if="promo?.enabled && promo.thinking_available !== false"
+        type="button"
+        class="inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors"
+        :class="
+          deepThinking
+            ? 'border-primary bg-primary text-white hover:bg-primary-hover'
+            : 'border-primary/50 bg-primary-subtle text-primary hover:border-primary'
+        "
+        :aria-pressed="deepThinking"
+        :title="deepThinking ? '已开启深度思考（更慢，但更深入）' : '开启深度思考（更慢，但更深入）'"
+        @click="emit('update:deepThinking', !deepThinking)"
+      >
+        <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z" />
+          <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z" />
+        </svg>
+        <span>深度思考</span>
+        <span class="text-[10px] opacity-80">{{ deepThinking ? "已开启" : "更慢，但更深入" }}</span>
+      </button>
+    </div>
     <!-- 未出结果前：**整张卡只剩一行**——标题 + 状态 + 右上开关（用户反馈 #3）。
          说明与额度提示都不在这里，等检索完成后再随正文一起展开，避免首屏堆文字。 -->
 
@@ -157,6 +193,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from "vue"
 import { renderAnswer } from "~/utils/markdown"
+import type { PromoState } from "~/composables/useApi"
 import ToggleMini from "./ToggleMini.vue"
 
 const props = defineProps<{
@@ -178,6 +215,10 @@ const props = defineProps<{
   enabled?: boolean
   /** 是否收起（收起 = 只留标题行）；状态由父组件持久化在 usePrefs.aiCollapsed */
   collapsed?: boolean
+  /** 开业酬宾状态（来自 /me 的 `promo`；undefined = 老部署/未登录 → 不显示任何促销入口） */
+  promo?: PromoState | null
+  /** 「深度思考」是否开启（单一数据源来自父组件 usePrefs.deepThinking） */
+  deepThinking?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -187,12 +228,22 @@ const emit = defineEmits<{
   (e: "update:enabled", v: boolean): void
   /** 收起/展开（父组件负责持久化） */
   (e: "update:collapsed", v: boolean): void
+  /** 深度思考开关（父组件负责持久化 + 透传给 /search/stream 与 /chat） */
+  (e: "update:deepThinking", v: boolean): void
 }>()
 
 const question = ref("")
 
 /** 开关是否已开（单一数据源，来自父组件） */
 const active = computed(() => props.enabled === true)
+
+/** 促销期的额度口径文案（1M ≈ 4×；数字从后端来，前端不写死） */
+const promoQuotaText = computed(() => {
+  const tokens = props.promo?.quota_window_tokens
+  if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens <= 0) return "额度已提升"
+  const wan = Math.round(tokens / 10_000)
+  return `额度已提升至 ${wan} 万/5 小时`
+})
 
 const statusLabel = computed(() => {
   switch (props.status) {

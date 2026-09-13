@@ -23,8 +23,10 @@ import {
   LLM_DEFAULT_MODEL,
   LLM_HIT_MAX_CHARS,
   LLM_MAX_HITS,
+  FREE_LLM_MAX_TOKENS,
   LLM_MAX_HISTORY_MESSAGES,
   LLM_MAX_TOKENS,
+  LLM_MAX_TOKENS_CEILING,
   LLM_QUESTION_MAX_CHARS,
   LLM_SYSTEM_PROMPT,
   LLM_UNAVAILABLE_NOTICE,
@@ -263,7 +265,7 @@ describe("summarize：换 key 重试 + 用量记账", () => {
     expect(err.code).toBe("llm-empty")
   })
 
-  it("请求体形状：默认关思考链、max_tokens 钳制到 800、enable_thinking 可 omit", async () => {
+  it("请求体形状：默认关思考链、max_tokens 默认 1000 且 env 只能在硬上限内调、enable_thinking 可 omit", async () => {
     const db = makeDb()
     const bodies: Record<string, unknown>[] = []
     const fetchImpl = (async (_url: string, init: { body: string }) => {
@@ -273,18 +275,24 @@ describe("summarize：换 key 重试 + 用量记账", () => {
 
     await summarize(poolKeysEnv([KEY_A]), db, makeHits(1), "q", fetchImpl)
     expect(bodies[0].enable_thinking).toBe(false)
-    expect(bodies[0].max_tokens).toBe(LLM_MAX_TOKENS)
+    // 免费链默认从 800 提到 1000（plan-promo.md §1.5 A7：实测偶有长总结被截断）
+    expect(bodies[0].max_tokens).toBe(FREE_LLM_MAX_TOKENS)
+    expect(FREE_LLM_MAX_TOKENS).toBe(1000)
 
-    // LLM_MAX_TOKENS 想放大也不许超过硬上限；enable_thinking=omit 时字段不出现
+    // env 调小可以；想放大也只到**硬天花板**（绝不允许无上限放大）；enable_thinking=omit 时字段不出现
+    await summarize({ ...poolKeysEnv([KEY_A]), LLM_MAX_TOKENS: "500" }, db, makeHits(1), "q", fetchImpl)
+    expect(bodies[1].max_tokens).toBe(500)
+
     await summarize(
-      { ...poolKeysEnv([KEY_A]), LLM_MAX_TOKENS: "5000", LLM_ENABLE_THINKING: "omit" },
+      { ...poolKeysEnv([KEY_A]), LLM_MAX_TOKENS: "999999", LLM_ENABLE_THINKING: "omit" },
       db,
       makeHits(1),
       "q",
       fetchImpl,
     )
-    expect(bodies[1].max_tokens).toBe(LLM_MAX_TOKENS)
-    expect("enable_thinking" in bodies[1]).toBe(false)
+    expect(bodies[2].max_tokens).toBe(LLM_MAX_TOKENS_CEILING)
+    expect(LLM_MAX_TOKENS_CEILING).toBe(8192)
+    expect("enable_thinking" in bodies[2]).toBe(false)
   })
 
   it("上游未返回 usage → 按字符数估算并标 estimated:true", async () => {

@@ -49,6 +49,7 @@
 // 写操作返回 null，getQuota 返回「放行」视图（degraded=true，used 0 / 100%），由调用方决定打 warning。
 
 import { TOP_K_DEFAULT, rerankCandidateLimit } from "./topk"
+import { PROMO_QUOTA_WINDOW_TOKENS_DEFAULT, promoKeys } from "./promo"
 
 /**
  * 加权 token 成本表（新单位；plan §3.4 方案 A 的权重按 token 重定）。
@@ -212,7 +213,27 @@ export function gridWindowStart(createdAtMs: number, nowMs: number, windowMs: nu
 
 /** 窗口额度（加权 token）：env `QUOTA_WINDOW_TOKENS`，缺省 300000。 */
 export function limitTokens(env: unknown = {}): number {
+  // 开业酬宾（plan-promo.md §5.4）：促销**配置生效**时 5h 窗口提到 4×（默认 300k → 1M）。
+  // 判定只看 env 与"是否配了 DS_POOL_KEY_<n>"（**同步、零 KV 读**）：
+  //   热路径（chargeQuota/getQuota）每请求都要这个值，绝不能为它加一次 KV 往返。
+  //   代价（已知、可接受）：KV flag 自动收闸后，**额度口径**仍显示 1M，直到运维把
+  //   `PROMO_ENABLED=false` 配下去（或促销密钥被撤）；/me 会额外读一次促销状态并把
+  //   真实收闸结果一并返回给前端，所以用户看到的"促销已结束"是即时的。
+  if (promoConfigured(env)) {
+    return Math.floor(parsePositiveNumber(envString(env, "PROMO_QUOTA_WINDOW_TOKENS"), PROMO_QUOTA_WINDOW_TOKENS_DEFAULT))
+  }
   return Math.floor(parsePositiveNumber(envString(env, "QUOTA_WINDOW_TOKENS"), DEFAULT_LIMIT_TOKENS))
+}
+
+/** 促销是否"配置为可用"（env 开关 + 至少一把 `DS_POOL_KEY_<n>`）—— 纯同步判断，不读 KV。 */
+export function promoConfigured(env: unknown = {}): boolean {
+  const raw = envString(env, "PROMO_ENABLED")
+  if (raw !== undefined && ["false", "0", "off", "no"].includes(raw.trim().toLowerCase())) return false
+  try {
+    return promoKeys(env).length > 0
+  } catch {
+    return false
+  }
 }
 
 /** 由 used/limit 计算已用百分比（clamp 到 [0,100]，保留 1 位小数）。 */

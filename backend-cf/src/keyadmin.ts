@@ -18,6 +18,7 @@
 // D1 的读写异常则向上抛给路由（管理接口如实报 503），与检索路径无关。
 
 import { MERGED_POOL_NAME, parseMergedKeys, type PoolName } from "./keypool"
+import { promoKeys } from "./promo"
 
 /**
  * 能力标签（embedding / 聊天 / rerank）：**不再是对外的池**，只用于"从哪个能力入口调进来"。
@@ -111,12 +112,17 @@ export function kvDenyStore(kv: KVNamespace | null | undefined): DenyKvStore | u
   }
 }
 
-/** 按池的禁用集合（`/admin/usage`、`/admin/keys` 响应里也用它做只读展示时可复用）。 */
+/**
+ * 按能力/池的禁用集合（`/admin/usage`、`/admin/keys` 响应里也用它做只读展示时可复用）。
+ * 合并池（embed/llm/rerank）三槽内容相同（同一个 KV 键 `keydeny:keys`）；
+ * `ds` 是促销独立池的槽位，KV 键为 `keydeny:ds`，**在本模块不读**（由 promo.ts 按需读，
+ * 以保持 `/search` 热路径的 KV 读取次数不变）。
+ */
 export type DeniedPools = Record<PoolName, string[]>
 
 /** 空禁用集合（fail-open 的返回值）。 */
 export function emptyDeniedPools(): DeniedPools {
-  return { embed: [], llm: [], rerank: [] }
+  return { embed: [], llm: [], rerank: [], ds: [] }
 }
 
 /** 禁用集进程内缓存的默认 TTL（秒）：env `KEY_DENY_CACHE_TTL_SEC` 可覆盖。 */
@@ -187,7 +193,7 @@ export async function readDeniedPools(kv: DenyKvStore | undefined, _env: unknown
   } catch {
     refs = [] // 读失败 → 视为无禁用（fail-open）
   }
-  return { embed: refs, llm: refs, rerank: refs }
+  return { embed: refs, llm: refs, rerank: refs, ds: [] }
 }
 
 /**
@@ -236,12 +242,23 @@ export interface AdminPoolInfo {
 }
 
 /**
- * `GET /admin/keys` 的 `pools[]`：合并池后**只有一项** `{pool:"keys", configured:N, refs:[...]}`。
- * watchdog ④ 与 `/admin` 前端都是"遍历 pools[] 判 configured < 2"，因此无需改动即继续有效。
+ * `GET /admin/keys` 的 `pools[]`：
+ *   · `keys` —— 合并池（embed/rerank/LLM 共用，`POOL_KEYS_<n>`）；
+ *   · `ds`   —— **开业酬宾的独立池**（`DS_POOL_KEY_<n>`，plan-promo.md §5.1；不同上游、不同计费）。
+ * 两项都只出 ref（**绝无 secret**），watchdog ④ 与 `/admin` 前端"遍历 pools[] 判 configured"因此自动覆盖两池。
  */
 export function buildPoolInfos(env: unknown): AdminPoolInfo[] {
   const refs = poolRefsFromEnv(env)
-  return [{ pool: MERGED_POOL_NAME, configured: refs.length, refs }]
+  let dsRefs: string[] = []
+  try {
+    dsRefs = promoKeys(env).map((k) => k.ref)
+  } catch {
+    dsRefs = []
+  }
+  return [
+    { pool: MERGED_POOL_NAME, configured: refs.length, refs },
+    { pool: "ds", configured: dsRefs.length, refs: dsRefs },
+  ]
 }
 
 /** provider_keys 行的对外投影（脱敏）。 */

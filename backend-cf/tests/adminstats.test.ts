@@ -734,9 +734,10 @@ describe("GET /api/v1/admin/keys", () => {
       db_rows: number
     }
 
-    // 合并池（plan-keypool.md §2.2）：只有一个池 `keys`，ref 与"能力"无关
+    // 合并池（plan-keypool.md §2.2）：`keys`；另有开业酬宾的独立池 `ds`（本夹具未配 DS key → 0）
     expect(body.pools).toEqual([
       { pool: "keys", configured: 3, refs: ["pool-key-0", "pool-key-1", "pool-key-2"] },
+      { pool: "ds", configured: 0, refs: [] },
     ])
     expect(body.db_rows).toBe(2)
     expect(body.keys.map((k) => k.key_ref)).toEqual(["embed-key-1", "llm-key-0"]) // ORDER BY pool, key_ref（DB 里的历史行）
@@ -757,7 +758,7 @@ describe("GET /api/v1/admin/keys", () => {
     const body = (await resp.json()) as { keys: unknown[]; db_rows: number; pools: unknown[] }
     expect(body.keys).toEqual([])
     expect(body.db_rows).toBe(0)
-    expect(body.pools).toHaveLength(1) // 合并池：只有一个池 `keys`
+    expect(body.pools).toHaveLength(2) // keys（合并池）+ ds（开业酬宾独立池）
   })
 
   it("缺 D1 → 仍 200（pools 来自 env，不依赖 D1）", async () => {
@@ -773,14 +774,12 @@ describe("GET /api/v1/admin/keys", () => {
     expect(body.pools[0].refs).toEqual(["pool-key-0", "pool-key-1", "pool-key-2"])
   })
 
-  it("合并池：pools 只有一项 keys，旧能力名不再是池（ref 与能力无关）", async () => {
+  it("合并池：pools 只有 keys + ds 两项，旧能力名不再是池（ref 与能力无关）", async () => {
     const { db } = makeDb({ keyRows: [] })
     const env = makeEnv({ DB: db })
     const resp = await app.request("/api/v1/admin/keys", { headers: { Authorization: "Bearer admin-secret" } }, env)
     const body = (await resp.json()) as { pools: Array<{ pool: string; configured: number; refs: string[] }> }
-    expect(body.pools).toEqual([
-      { pool: "keys", configured: 3, refs: ["pool-key-0", "pool-key-1", "pool-key-2"] },
-    ])
+    expect(body.pools.map((p) => p.pool)).toEqual(["keys", "ds"])
     expect(body.pools.some((p) => ["embed", "llm", "rerank"].includes(p.pool))).toBe(false)
     expect(JSON.stringify(body)).not.toMatch(/sk-/)
   })

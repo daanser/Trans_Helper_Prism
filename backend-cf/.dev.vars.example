@@ -6,6 +6,18 @@
 POOL_KEYS_0=sk-xxxx
 POOL_KEYS_1=sk-yyyy
 
+# 开业酬宾（限时 DeepSeek V4.1 Flash，见 plan-promo.md）：**另一个上游**的独立池，
+# 绝不与上面的 POOL_KEYS_<n> 混（混池必然 401，且两套用量会算混）。
+DS_POOL_KEY_0=sk-ds-xxxx
+DS_POOL_KEY_1=sk-ds-yyyy
+DS_ENDPOINT=https://tokenrhythm.studio/v1
+DS_MODEL=deepseek-flash
+PROMO_ENABLED=true
+PROMO_BUDGET_CNY=136
+PROMO_QUOTA_WINDOW_TOKENS=1000000
+PROMO_LLM_MAX_TOKENS=4000
+PROMO_DAYS=30
+
 # ── Qdrant Cloud（可选，M0 探测用）──────────────────────────
 QDRANT_URL=https://your-cluster.cloud.qdrant.io:6333
 QDRANT_API_KEY=your_qdrant_api_key
