@@ -1499,14 +1499,20 @@ api.get("/admin/dsping", async (c) => {
   const origin = new URL(endpointRaw).origin
   const out: Record<string, unknown> = { endpoint, model: modelName, origin }
 
-  // ① 主机根路径（区分"域名不可达"与"接口被拒"）
-  const t0 = Date.now()
-  try {
-    const r = await fetch(origin + "/", { method: "GET", signal: AbortSignal.timeout(6000) })
-    out.host = { status: r.status, ms: Date.now() - t0, ok: r.ok }
-  } catch (e) {
-    out.host = { ms: Date.now() - t0, error: e instanceof Error ? `${e.name}: ${e.message.slice(0, 120)}` : String(e).slice(0, 120) }
+  // ① 候选主机名逐个探（找出 CF 出口能到达的那个）
+  const hosts = ["tokenrhythm.studio", "www.tokenrhythm.studio", "api.tokenrhythm.studio"]
+  const hostResults: Record<string, unknown>[] = []
+  for (const h of hosts) {
+    const t = Date.now()
+    try {
+      const r = await fetch(`https://${h}/`, { method: "GET", signal: AbortSignal.timeout(5000) })
+      hostResults.push({ host: h, status: r.status, ms: Date.now() - t, ok: r.ok })
+    } catch (e) {
+      hostResults.push({ host: h, ms: Date.now() - t, error: e instanceof Error ? e.name : String(e).slice(0, 40) })
+    }
   }
+  out.hosts = hostResults
+  out.colo = (c.req.raw as unknown as { cf?: { colo?: string } }).cf?.colo ?? null
 
   // ② 只探第一把 key，8s 超时（务必远小于 CF 的 30s 墙钟）
   let keys: Array<{ ref: string; secret: string }> = []

@@ -1,4 +1,6 @@
 {
+  // Smart Placement：让 Worker 落到更靠近上游（含促销上游）的机房，缓解跨境链路
+  "placement": { "mode": "smart" },
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "transhelper-prism-backend",
   "main": "src/index.ts",
