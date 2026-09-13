@@ -247,8 +247,8 @@
         <!-- 遮罩：点击关闭 -->
         <div class="absolute inset-0 bg-slate-900/40" @click="aiDrawerOpen = false"></div>
         <!-- 底部抽屉：内容就是同一张 AiCompanionCard（不再有内联副本） -->
-        <div class="absolute inset-x-0 bottom-0 max-h-[82vh] overflow-y-auto overscroll-contain rounded-t-2xl bg-canvas p-3 shadow-floating">
-          <div class="mb-2 flex items-center justify-between px-1">
+        <div class="absolute inset-x-0 bottom-0 flex max-h-[82vh] flex-col overflow-hidden rounded-t-2xl bg-canvas p-3 shadow-floating">
+          <div class="mb-2 flex shrink-0 items-center justify-between px-1">
             <span class="text-xs font-medium text-ink-muted">本次检索要点</span>
             <button
               type="button"

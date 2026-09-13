@@ -6,7 +6,7 @@
      - 追问面板：同一 session_id 多轮（桌面右栏 / 移动端结果上方） -->
 <template>
   <div
-    class="rounded-2xl border border-surface-border bg-surface shadow-card lg:sticky lg:top-20"
+    class="flex min-h-0 max-h-full flex-col rounded-2xl border border-surface-border bg-surface shadow-card lg:sticky lg:top-20 lg:max-h-[calc(100dvh-6.5rem)]"
     :class="answer || streaming || notice ? 'p-5' : 'px-5 py-4'"
   >
     <div class="mb-3 flex items-center justify-between border-b border-surface-border pb-3">
@@ -61,7 +61,7 @@
       </div>
     </div>
 
-    <div v-show="!collapsed" id="prism-ai-body">
+    <div v-show="!collapsed" id="prism-ai-body" class="flex min-h-0 flex-1 flex-col">
     <!-- 开业酬宾标识（plan-promo.md §5.8）：**弱样式纯文字，不做成可交互的假徽章/开关**；
          只在促销真的可用时出现（由后端 /me 决定，前端不猜）。 -->
     <p
@@ -69,14 +69,17 @@
       class="mb-2 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] leading-relaxed text-ink-muted"
     >
       <span class="rounded bg-primary-subtle px-1.5 py-0.5 text-[10px] font-medium text-primary">开业酬宾</span>
-      <span class="font-medium text-ink-sub">{{ promo.model }}</span>
+      <span class="font-medium text-ink-sub">{{ modelDisplayName(promo.model) }}</span>
       <span>（限时，额度用完即止；{{ promoQuotaText }}）</span>
       <span class="text-ink-muted/80">该模型较慢</span>
     </p>
 
     <!-- 模型名 + 深度思考（同一行区域；模型名弱样式小字，收起时随主体一起隐藏 —— 截图反馈 #5） -->
     <div class="mb-2 flex flex-wrap items-center gap-x-3 gap-y-2">
-      <span v-if="model" class="truncate font-mono text-[10px] text-ink-muted" :title="model">模型：{{ model }}</span>
+      <!-- 展示**人类可读名**（`deepseek-flash` → DeepSeek V4.1 Flash）；id 只放在 title 里兜底（用户反馈 2026-09-13） -->
+      <span v-if="model" class="truncate text-[10px] text-ink-muted" :title="`模型 id：${model}`">
+        模型：<span class="font-medium text-ink-sub">{{ modelDisplayName(model) }}</span>
+      </span>
 
       <!-- 深度思考：**显眼的胶囊按钮**（plan-promo.md §5.5；用户要求"开启按钮显眼一点"）。
            仅登录且促销可用时出现；默认关闭；状态持久化在 usePrefs.deepThinking。 -->
@@ -98,9 +101,18 @@
           <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z" />
         </svg>
         <span>深度思考</span>
-        <span class="text-[10px] opacity-80">{{ deepThinking ? "已开启" : "更慢，但更深入" }}</span>
+        <!-- 关闭态明确写「未开启」：原先写"更慢，但更深入"会被误读为"当前就是深度思考"（用户反馈 2026-09-13）。
+             "更慢，但更深入"只留在 title 提示里，不参与状态表达。 -->
+        <span class="text-[10px] opacity-90">{{ deepThinking ? "已开启" : "未开启" }}</span>
       </button>
     </div>
+    <!-- 可滚动内容区（促销行 / 模型行 / 正文 / 提示 / 引用 / 免责）：
+         卡片总高受视口约束，这里 `flex-1 min-h-0` 吃满剩余高度并**独立滚动**；
+         追问面板在它之外 → **永远可见**（用户反馈"输出长了追问框被挡住、还滑不下去"的根因：
+         原先只有正文自己 max-h 滚动，追问框在正文之外，卡片一旦高过视口就够不着了）。 -->
+    <div class="flex min-h-0 flex-1 flex-col">
+    <div ref="scrollEl" class="ai-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain pl-1 pr-3" @scroll.passive="onAnswerScroll">
+
     <!-- 未出结果前：**整张卡只剩一行**——标题 + 状态 + 右上开关（用户反馈 #3）。
          说明与额度提示都不在这里，等检索完成后再随正文一起展开，避免首屏堆文字。 -->
 
@@ -112,13 +124,7 @@
     </div>
 
     <!-- 结论正文：Markdown 渲染 + [来源n] 可点击 + **内部独立滚动**（不带动整页） -->
-    <div
-      v-if="answer"
-      ref="scrollEl"
-      class="ai-answer max-h-[58vh] overflow-y-auto overscroll-contain pl-1 pr-3 text-xs leading-relaxed text-ink-body lg:max-h-[calc(100vh-26rem)]"
-      @click="onAnswerClick"
-      @scroll.passive="onAnswerScroll"
-    >
+    <div v-if="answer" class="ai-answer text-xs leading-relaxed text-ink-body" @click="onAnswerClick">
       <!-- eslint-disable-next-line vue/no-v-html -- 输出由 markdown-it(html:false) 生成，安全边界见 utils/markdown.ts 文件头 -->
       <div class="md" v-html="renderedAnswer"></div>
       <span v-if="streaming" class="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-primary align-text-bottom"></span>
@@ -159,7 +165,11 @@
       <NuxtLink to="/about" class="text-primary hover:underline">了解详情</NuxtLink>
     </p>
 
-    <!-- 追问面板 -->
+    </div>
+    </div>
+
+    <!-- 追问面板：**常驻卡片底部**（shrink-0，不参与滚动） -->
+    <div class="shrink-0">
     <slot name="followup">
       <div v-if="followupEnabled" class="mt-4 border-t border-surface-border pt-3">
         <label class="mb-1.5 block text-xs font-medium text-ink-sub">
@@ -186,6 +196,7 @@
         </label>
       </div>
     </slot>
+    </div><!-- /追问面板（常驻底部） -->
     </div><!-- /v-show 主体 -->
   </div>
 </template>
@@ -193,6 +204,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from "vue"
 import { renderAnswer } from "~/utils/markdown"
+import { modelDisplayName } from "~/utils/modelName"
 import type { PromoState } from "~/composables/useApi"
 import ToggleMini from "./ToggleMini.vue"
 
@@ -369,26 +381,26 @@ function send() {
 /* Markdown 正文样式。
    注意：tailwind.config 的 content globs 不含 utils/，所以渲染器字符串里**不能**写工具类
    （会被 purge 掉）—— 这里用语义 token 对应的 CSS 变量，浅色/深色自动跟随。 */
-/* 滚动条：细、低调、不压字。
+/* 滚动条：细、低调、不压字。（挂在**滚动容器** `.ai-scroll` 上；`.ai-answer` 只负责 markdown 排版）
    `scrollbar-gutter: stable` 让滚动槽**始终预留**，出现/消失时文字不会左右跳动。 */
-.ai-answer {
+.ai-scroll {
   scrollbar-gutter: stable;
   scrollbar-width: thin;
   scrollbar-color: var(--border-color-hover) transparent;
 }
-.ai-answer::-webkit-scrollbar {
+.ai-scroll::-webkit-scrollbar {
   width: 10px;
 }
-.ai-answer::-webkit-scrollbar-track {
+.ai-scroll::-webkit-scrollbar-track {
   background: transparent;
 }
-.ai-answer::-webkit-scrollbar-thumb {
+.ai-scroll::-webkit-scrollbar-thumb {
   border: 3px solid transparent;
   border-radius: 9999px;
   background: var(--border-color);
   background-clip: content-box;
 }
-.ai-answer::-webkit-scrollbar-thumb:hover {
+.ai-scroll::-webkit-scrollbar-thumb:hover {
   background: var(--border-color-hover);
   background-clip: content-box;
 }
