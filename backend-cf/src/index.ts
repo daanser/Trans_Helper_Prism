@@ -84,7 +84,7 @@ import { clampIngestRunsLimit, insertIngestRun, listIngestRuns, parseIngestRunIn
 import { applyIngestFilesPlan, listZeroChunkFiles, parseIngestFilesInput } from "./ingestfiles"
 import { runFallback, type FallbackResponse } from "./fallback"
 import { PROMO_TIMEOUT_NO_THINKING_MS } from "./promo"
-import { GUARD_NOTICE, guardUserQuestion } from "./guard"
+import { guardNoticeFor, guardUserQuestion } from "./guard"
 import { fetchUsageSummary, parseUsageDays } from "./usagestats"
 import { normalizeChatEndpoint } from "./llm"
 import {
@@ -996,7 +996,7 @@ api.post("/search/stream", async (c) => {
         const guardReason = guardUserQuestion(question)
         if (guardReason) {
           console.warn(`[guard] 拦截 AI 摘要 question-guard=${guardReason}`)
-          controller.enqueue(sse("notice", { code: `guard-${guardReason}`, notice: GUARD_NOTICE }))
+          controller.enqueue(sse("notice", { code: `guard-${guardReason}`, notice: guardNoticeFor(guardReason) }))
           controller.enqueue(sse("done", { llm: false, guarded: true }))
           return
         }
@@ -1149,7 +1149,15 @@ api.post("/chat", async (c) => {
     const guardReason = guardUserQuestion(question)
     if (guardReason) {
       console.warn(`[guard] 拦截追问 question-guard=${guardReason}`)
-      return c.json({ text: GUARD_NOTICE, citations: [], model: "", tokens_in: 0, tokens_out: 0, estimated: false, guarded: true })
+      return c.json({
+        text: guardNoticeFor(guardReason),
+        citations: [],
+        model: "",
+        tokens_in: 0,
+        tokens_out: 0,
+        estimated: false,
+        guarded: true,
+      })
     }
 
     // 促销优先（与 /search/stream 同一条链）；失败/额度尽 → 免费链（追问不能因为促销挂了就失败）

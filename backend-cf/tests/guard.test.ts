@@ -2,7 +2,7 @@
 // TransHelper Prism — 提示注入/越界提问拦截（2026-09-13 线上实测回归）
 // 覆盖：真实注入案例必须被拦；**正常检索词必须放行**（宁可漏也不误伤）。
 import { describe, it, expect } from "vitest"
-import { guardUserQuestion, GUARD_NOTICE } from "../src/guard"
+import { guardNoticeFor, guardUserQuestion, GUARD_IDENTITY_NOTICE, GUARD_NOTICE } from "../src/guard"
 
 describe("guardUserQuestion：线上真实注入必须被拦", () => {
   it("用户实测的那条（忽略 prompt + 问公司/模型）", () => {
@@ -46,7 +46,16 @@ describe("guardUserQuestion：正常检索词必须放行（防误伤）", () =>
 })
 
 describe("固定文案", () => {
-  it("不来自模型、内容稳定", () => {
+  it("注入类：说明只依据片段", () => {
     expect(GUARD_NOTICE).toContain("只能依据检索到的 wiki 片段")
+    expect(guardNoticeFor("instruction-injection")).toBe(GUARD_NOTICE)
+  })
+  it("身份类：**如实回答**（不给模型编造身份的机会）", () => {
+    expect(guardNoticeFor("identity-question")).toBe(GUARD_IDENTITY_NOTICE)
+    expect(GUARD_IDENTITY_NOTICE).toContain("TransHelper Prism 的检索摘要助手")
+    // 绝不能出现其它厂商自称（线上实测曾被模型编成 "OpenAI 开发的 GPT-5.6 Terra"）
+    for (const brand of ["OpenAI", "GPT", "Google", "Anthropic", "Claude"]) {
+      expect(GUARD_IDENTITY_NOTICE).not.toContain(brand)
+    }
   })
 })

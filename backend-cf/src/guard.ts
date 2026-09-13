@@ -19,8 +19,23 @@ export const GUARD_NOTICE =
   "这条提问看起来是给模型的指令（或与检索资料无关），本次不生成 AI 要点。" +
   "这里只能依据检索到的 wiki 片段作答；如需查资料，请直接搜索关键词。"
 
+/**
+ * **身份提问**的固定回复（同样不经过模型）。
+ * 为什么单独一条：用户真心问「你是谁」时，回"这看起来像指令"是答非所问；
+ * 而让模型自己答又实测会**编造身份**（2026-09-13 实测它自称 "OpenAI 开发的 GPT-5.6 Terra"）。
+ * 所以这里直接给**如实**的固定答案 —— 由站方写死，不给模型编的机会。
+ */
+export const GUARD_IDENTITY_NOTICE =
+  "我是 TransHelper Prism 的检索摘要助手，只依据本次检索到的 wiki 片段作答；" +
+  "底层模型见页面上方的模型标注（当前为站方配置的大模型），不是其它厂商的产品。"
+
 /** 拦截原因（用于 SSE notice 的 code 与日志，便于观察是否有人在刷）。 */
 export type GuardReason = "instruction-injection" | "identity-question" | "off-topic-meta"
+
+/** 按拦截原因取对应固定文案（身份提问 → 如实回答；其余 → 说明只依据片段）。 */
+export function guardNoticeFor(reason: GuardReason): string {
+  return reason === "identity-question" ? GUARD_IDENTITY_NOTICE : GUARD_NOTICE
+}
 
 /**
  * 注入类：要求忽略/覆盖既有指令、扮演角色、进入"开发者模式"等。
