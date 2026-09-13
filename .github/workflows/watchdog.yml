@@ -68,6 +68,8 @@ jobs:
       # 只注入给 ④⑤；绝不 echo
       ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
       DAILY_CALL_LIMIT: ${{ inputs.daily_call_limit || '1000' }}
+      PROMO_LOW_REMAINING_CNY: ${{ inputs.promo_low_remaining_cny || '10' }}
+      PROMO_FAST_BURN_CNY: ${{ inputs.promo_fast_burn_cny || '30' }}
     steps:
       - name: 五项探活
         run: |
@@ -216,6 +218,40 @@ jobs:
             fi
           fi
 
+          # ── ⑦ 开业酬宾：烧钱速度与余额（plan-promo.md §5.6）──
+          #    促销花的是**真钱**（两把 ¥68 key，预算 ¥136，用完即止）。
+          #    这里盯两件事：① 余额快见底（该决定"补钱"还是"对外宣布结束"）② 24h 烧钱速度异常（可能是被刷）。
+          #    `promo.enabled=false` 时只记一行说明，**不告警**（用完即止是预期行为，不是故障）。
+          #    阈值可用 workflow_dispatch 输入覆盖，便于演练告警路径。
+          if [ -n "${ADMIN_API_KEY:-}" ]; then
+            resp=$(fetch_retry "$api_base/api/v1/admin/usage/summary?days=1" -H "Authorization: Bearer ${ADMIN_API_KEY}")
+            code=$(printf '%s' "$resp" | tail -n1)
+            body=$(printf '%s' "$resp" | sed '$d')
+            if [ "$code" != "200" ]; then
+              problems+=("⑦ 促销用量读取失败：GET $api_base/api/v1/admin/usage/summary?days=1 → HTTP ${code:-无响应}（期望 200）")
+            else
+              enabled=$(printf '%s' "$body" | jq -r '.promo.enabled // false' 2>/dev/null || echo false)
+              spent=$(printf '%s' "$body" | jq -r '.promo.spent_cny // 0' 2>/dev/null || echo 0)
+              remain=$(printf '%s' "$body" | jq -r '.promo.remaining_cny // 0' 2>/dev/null || echo 0)
+              burn24=$(printf '%s' "$body" | jq -r '.promo.cost_cny_24h // 0' 2>/dev/null || echo 0)
+              days=$(printf '%s' "$body" | jq -r '.promo.days_left_at_24h_rate // "?"' 2>/dev/null || echo "?")
+              reason=$(printf '%s' "$body" | jq -r '.promo.reason // ""' 2>/dev/null || echo "")
+              low="${PROMO_LOW_REMAINING_CNY:-10}"
+              fast="${PROMO_FAST_BURN_CNY:-30}"
+              if [ "$enabled" != "true" ]; then
+                notes+=("⑦ 促销未开启/已结束（reason=${reason:-none}）——用完即止属预期，不告警")
+              else
+                notes+=("⑦ 促销运行中：已花 ¥${spent} / 剩余 ¥${remain} / 近 24h ¥${burn24}（按此速度还能撑 ${days} 天）")
+                if awk "BEGIN{exit !(${remain} <= ${low})}" 2>/dev/null; then
+                  problems+=("⑦ **促销余额即将耗尽**：剩余 ¥${remain} ≤ 阈值 ¥${low}（已花 ¥${spent}）→ 请决定「补预算」还是「对外宣布酬宾结束」；预算耗尽会自动回退免费模型，不影响可用性")
+                fi
+                if awk "BEGIN{exit !(${burn24} >= ${fast})}" 2>/dev/null; then
+                  problems+=("⑦ **促销烧钱速度异常**：近 24h 已花 ¥${burn24} ≥ 阈值 ¥${fast}/天 → 检查是否有异常流量（/admin/ratelimit 的分档计数与 blocked 数），必要时用 KV 一键关停（promo:ds → {\"enabled\":false}）")
+                fi
+              fi
+            fi
+          fi
+
           # ── 结论 ──
           echo "──────────────────────────────────────────────"
           for n in "${notes[@]:-}"; do [ -n "$n" ] && echo "✅ $n"; done
@@ -225,4 +261,4 @@ jobs:
             echo "   排查顺序：先看①直连是否通（不通=Worker/账号问题）→ ②③反代（不通=Pages 或域名）→ ④⑤用 ADMIN_API_KEY 手工 curl 复核。"
             exit 1
           fi
-          echo "✅ 六项探活全部通过（$(date -u '+%Y-%m-%d %H:%M:%S') UTC）"
+          echo "✅ 七项探活全部通过（$(date -u '+%Y-%m-%d %H:%M:%S') UTC）"
