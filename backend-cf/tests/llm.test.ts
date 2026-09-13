@@ -7,6 +7,7 @@
 //   4) SSE 解析：`data: {...}\n\n` 流（含跨 chunk 半包）与流式总结；
 //   5) 错误信息脱敏：绝不回显 key。
 // 全部 mock，不触真实上游；断言里只有占位串，不含任何真实 key。
+import { normalizeChatEndpoint } from "../src/llm"
 import { describe, it, expect, vi, afterEach } from "vitest"
 import {
   buildPrompt,
@@ -538,5 +539,15 @@ describe("createChatProvider：pool 隔离在 llm 池", () => {
     expect(provider.model).toBe(LLM_DEFAULT_MODEL)
     const { provider: p2 } = createChatProvider({ ...poolKeysEnv([KEY_A]), LLM_MODEL: "THUDM/GLM-4-9B-0414" }, db)
     expect(p2.model).toBe("THUDM/GLM-4-9B-0414")
+  })
+})
+
+describe("normalizeChatEndpoint（2026-09-13 线上事故回归）", () => {
+  it("基础 URL → 补 /chat/completions；完整路径原样", () => {
+    expect(normalizeChatEndpoint("https://tokenrhythm.studio/v1")).toBe("https://tokenrhythm.studio/v1/chat/completions")
+    expect(normalizeChatEndpoint("https://tokenrhythm.studio/v1/")).toBe("https://tokenrhythm.studio/v1/chat/completions")
+    expect(normalizeChatEndpoint("https://api.siliconflow.cn/v1/chat/completions")).toBe("https://api.siliconflow.cn/v1/chat/completions")
+    expect(normalizeChatEndpoint("  https://a.example/v1/chat/completions/  ")).toBe("https://a.example/v1/chat/completions")
+    expect(normalizeChatEndpoint("")).toBe("https://api.siliconflow.cn/v1/chat/completions")
   })
 })

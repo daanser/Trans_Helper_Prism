@@ -53,6 +53,7 @@
     "QUOTA_WINDOW_HOURS": "5",
     // ── 开业酬宾：限时 DeepSeek V4.1 Flash（plan-promo.md）──
     // 密钥（DS_POOL_KEY_0 / DS_POOL_KEY_1）放 Worker Secrets，**不写在这里**。
+    // 可写基础 URL（代码会补 /chat/completions）或完整路径；两者皆可
     "DS_ENDPOINT": "https://tokenrhythm.studio/v1",
     "DS_MODEL": "deepseek-flash",
     // 总开关：紧急关闭改这里（需重新部署）或直接改 KV `promo:ds` 的 enabled=false（**不用部署**）

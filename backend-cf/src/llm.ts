@@ -31,6 +31,19 @@ import { promoKeyVarOptions } from "./promo"
 export const LLM_DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 /** 默认端点（硅基流动中国站，OpenAI 兼容）。 */
 export const LLM_DEFAULT_ENDPOINT = "https://api.siliconflow.cn/v1/chat/completions"
+/**
+ * 端点归一化：**同时接受"基础 URL"与"完整路径"两种写法**。
+ *
+ * 为什么需要：本仓库的 `LLM_ENDPOINT` 历史上是"完整路径"（默认值含 `/chat/completions`），
+ * 而外部文档给的上游地址惯例是**基础 URL**（如 `https://tokenrhythm.studio/v1`）。
+ * 2026-09-13 线上真实事故：`DS_ENDPOINT` 按基础 URL 配置 → POST 打到 `/v1` → 404 →
+ * **促销链每次静默回退免费链**（用户以为在跑，其实没跑）。这里做一次归一，两种写法都对。
+ */
+export function normalizeChatEndpoint(raw: string): string {
+  const base = raw.trim().replace(/\/+$/, "")
+  if (base === "") return LLM_DEFAULT_ENDPOINT
+  return /\/chat\/completions$/.test(base) ? base : `${base}/chat/completions`
+}
 /** 单次上游调用硬超时（毫秒，env `LLM_TIMEOUT_MS` 可覆盖）。 */
 export const LLM_DEFAULT_TIMEOUT_MS = 20_000
 /**
@@ -539,7 +552,7 @@ export class SiliconFlowChat implements ChatProvider {
     fetchImpl: typeof fetch = defaultFetch,
   ) {
     this.model = cfg.model
-    this.endpoint = (cfg.endpoint ?? LLM_DEFAULT_ENDPOINT).replace(/\/+$/, "")
+    this.endpoint = normalizeChatEndpoint(cfg.endpoint ?? LLM_DEFAULT_ENDPOINT)
     this.timeoutMs = cfg.timeoutMs ?? LLM_DEFAULT_TIMEOUT_MS
     this.maxTokens = cfg.maxTokens ?? LLM_MAX_TOKENS
     this.enableThinking = cfg.enableThinking
