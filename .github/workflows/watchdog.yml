@@ -50,6 +50,14 @@ on:
         description: "每日上游调用数告警阈值（留空 = 1000；上游是免费额度，超阈值只意味用量异常，不是花钱）"
         type: string
         default: ""
+      promo_low_remaining_cny:
+        description: "开业酬宾「余额即将耗尽」阈值（留空 = 10 元；填大值可演练告警路径）"
+        type: string
+        default: ""
+      promo_fast_burn_cny:
+        description: "开业酬宾「24h 烧钱过快」阈值（留空 = 30 元/天；填小值可演练告警路径）"
+        type: string
+        default: ""
 
 # 同一时刻只跑一个（探活很轻，纯粹避免手动触发与定时撞车时日志交叉）
 concurrency:
