@@ -243,16 +243,25 @@ describe("④ 状态读取 / 预算累计 / 收闸 / 对账（KV 层）", () => 
     expect(await closePromo(undefined, "x", 1)).toBe(false)
   })
 
-  it("对账：D1 真值更大时回写（KV 少算）；更小时不动（多算不回退，宁早不晚）", async () => {
+  it("对账：**双向**收敛到 D1 真值（上修 + 下修）；差异极小则跳过写", async () => {
     const { kv, store } = makeKv({ [PROMO_KV_KEY]: JSON.stringify({ spent_cny: 1 }) })
+    // 上修：KV 少算 → 写成 D1 真值
     const up = await reconcileSpentCny(kv, 5, 2)
     expect(up).toMatchObject({ ok: true, wrote: true })
     expect(up.spentCny).toBeCloseTo(5, 9)
     expect(JSON.parse(store.get(PROMO_KV_KEY)!).spent_cny).toBeCloseTo(5, 9)
 
+    // 下修（2026-09-13 修）：KV 多算（实测出现 ~2× 高估）→ 也必须回落到 D1 真值，
+    // 否则促销会在真实花费约一半时被提前砍掉。D1 的 usage.cost 汇总是唯一真值。
     const down = await reconcileSpentCny(kv, 2, 3)
-    expect(down).toMatchObject({ ok: true, wrote: false })
-    expect(down.spentCny).toBeCloseTo(5, 9)
+    expect(down).toMatchObject({ ok: true, wrote: true })
+    expect(down.spentCny).toBeCloseTo(2, 9)
+    expect(JSON.parse(store.get(PROMO_KV_KEY)!).spent_cny).toBeCloseTo(2, 9)
+
+    // 差异 < 0.0001 元 → 不写（避免为浮点/竞态噪声频繁写 KV）
+    const tiny = await reconcileSpentCny(kv, 2.00005, 4)
+    expect(tiny).toMatchObject({ ok: true, wrote: false })
+    expect(tiny.spentCny).toBeCloseTo(2, 9)
   })
 })
 

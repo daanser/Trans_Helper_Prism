@@ -433,7 +433,10 @@ export async function reconcileSpentCny(
   try {
     const flag = parsePromoFlag(await kv.get(PROMO_KV_KEY)) ?? {}
     const kvSpent = num(flag.spent_cny)
-    if (spentFromDbCny <= kvSpent) return { ok: true, spentCny: kvSpent, wrote: false }
+    // 双向收敛（2026-09-13 修）：D1 的 usage.cost 汇总才是**唯一真值**，KV 只是热路径近似。
+    // 原先"只往上修正"，导致 KV 一旦多算（实测出现 ~2× 高估）就永远降不下来 →
+    // 促销会在真实花费约一半时被提前砍掉。现在两边都对齐，差异 < 0.0001 元才跳过（避免无谓写 KV）。
+    if (Math.abs(spentFromDbCny - kvSpent) < 0.0001) return { ok: true, spentCny: kvSpent, wrote: false }
     const merged: PromoFlag = { ...flag, spent_cny: spentFromDbCny, reconciled_at: nowMs } as PromoFlag
     await kv.put(PROMO_KV_KEY, JSON.stringify(merged))
     if (promoCache) promoCache = null
