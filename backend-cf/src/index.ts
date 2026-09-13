@@ -83,6 +83,7 @@ import { SCHEMA_MIGRATIONS, SCHEMA_STATEMENTS, isToleratedSchemaError } from "./
 import { clampIngestRunsLimit, insertIngestRun, listIngestRuns, parseIngestRunInput } from "./ingestruns"
 import { applyIngestFilesPlan, listZeroChunkFiles, parseIngestFilesInput } from "./ingestfiles"
 import { runFallback, type FallbackResponse } from "./fallback"
+import { PROMO_TIMEOUT_NO_THINKING_MS } from "./promo"
 import { fetchUsageSummary, parseUsageDays } from "./usagestats"
 import { normalizeChatEndpoint } from "./llm"
 import {
@@ -200,11 +201,11 @@ async function resolveChatPlan(
  * 促销的 chat provider（记账 pool='ds'、流式带真实 usage、按 usage 自算成本）。
  * `accountId` 决定 key_usage 归属（登录用户；匿名走不到这里）。
  */
-function promoProviderFor(env: Env, accountId: string | undefined, promo: PromoState) {
+function promoProviderFor(env: Env, accountId: string | undefined, promo: PromoState, timeoutMs: number = promo.timeoutMs) {
   return createPromoChatProvider(
     env,
     makeKeyUsageDb(env, accountId),
-    { model: promo.model, endpoint: promo.endpoint, maxTokens: promo.maxTokens },
+    { model: promo.model, endpoint: promo.endpoint, maxTokens: promo.maxTokens, timeoutMs },
     undefined,
     { costOf: (u) => promoCostCny({ promptTokens: u.tokens_in, cachedTokens: u.cached_tokens, completionTokens: u.tokens_out }) },
   )
@@ -1005,7 +1006,10 @@ api.post("/search/stream", async (c) => {
         let promoDowngraded = false
 
         if (plan.usePromo) {
-          const promoProv = promoProviderFor(c.env, session.sub, plan.promo)
+          // 超时按"是否思考"分流（2026-09-13 事故）：思考实测 12–26s（偶发更久）→ 60s；
+          // 不思考 3–17s → 用 25s，**快速回退**，别让上游挂掉时用户白等一分钟。
+          const promoTimeout = thinking ? plan.promo.timeoutMs : Math.min(plan.promo.timeoutMs, PROMO_TIMEOUT_NO_THINKING_MS)
+          const promoProv = promoProviderFor(c.env, session.sub, plan.promo, promoTimeout)
           promoProv.pool.setDenied("ds", promoDeniedRefs())
           const candidate = promoProv.provider.streamSummary(llmHits, question, { thinking })
           const it = candidate[Symbol.asyncIterator]()
@@ -1135,7 +1139,9 @@ api.post("/chat", async (c) => {
     let promoDowngraded = false
     let out: LlmSummary | null = null
     if (plan.usePromo) {
-      const promoProv = promoProviderFor(c.env, session.sub, plan.promo)
+      // 同 /search/stream：超时按是否思考分流（不思考 25s 快速回退 / 思考 60s）
+      const promoTimeout = thinking ? plan.promo.timeoutMs : Math.min(plan.promo.timeoutMs, PROMO_TIMEOUT_NO_THINKING_MS)
+      const promoProv = promoProviderFor(c.env, session.sub, plan.promo, promoTimeout)
       promoProv.pool.setDenied("ds", promoDeniedRefs())
       try {
         out = await promoProv.provider.summarize(ctx.initialHits, question, { history, thinking })

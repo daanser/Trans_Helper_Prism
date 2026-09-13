@@ -65,3 +65,5 @@ CUSTOM_MODEL_ENC_KEY=
 # 只用于 scripts/probe-connectivity.ts（本地运行时读环境变量，非 Worker secret）
 PROBE_SILICONFLOW_API_KEY=sk-xxxx
 # 注意：绝不可把真实 key 提交到仓库；.dev.vars 与 .env 均被 .gitignore 排除。
+# 促销链超时（毫秒；思考时用这个，不思考固定 25s）
+PROMO_TIMEOUT_MS=60000

@@ -36,6 +36,21 @@ export const PROMO_BUDGET_CNY_DEFAULT = 136
 export const PROMO_QUOTA_WINDOW_TOKENS_DEFAULT = 1_000_000
 /** 促销单次输出上限（§1.5 A7：免费链 1000，促销 4000）。 */
 export const PROMO_MAX_TOKENS_DEFAULT = 4_000
+/**
+ * 促销链的单次上游超时（毫秒）。
+ *
+ * **2026-09-13 线上事故**：促销链原先沿用免费链的 `LLM_DEFAULT_TIMEOUT_MS`（20s），
+ * 而开启「深度思考」时上游实测要 **12–26s**（偶发更久）→ 首块预检超时 → 被判失败 →
+ * **静默回退 Qwen**（用户看到"酬宾模型一直失败"）。故促销链单独用更宽的超时（默认 60s）。
+ * 注：预检是"拿到第一块才算成功"，所以这个值要覆盖**思考阶段的等待**，不只是生成阶段。
+ */
+export const PROMO_TIMEOUT_MS_DEFAULT = 60_000
+/**
+ * **不开思考**时的促销链超时（默认 25s）。
+ * 理由：不思考实测 3–17s，25s 已有余量；而促销失败要等超时才回退免费链，
+ * 用 60s 会让"上游挂了"时用户白等一分钟 → 不开思考时用更短的窗口快速回退。
+ */
+export const PROMO_TIMEOUT_NO_THINKING_MS = 25_000
 /** 期限默认天数（`PROMO_END_AT` 未配时，从"首次被读到"起算 30 天，§1.5 A5）。 */
 export const PROMO_DAYS_DEFAULT = 30
 /** 促销状态进程内缓存 TTL（秒）。与 key 禁用集同量级：紧急关闭最多滞后这么久生效。 */
@@ -119,6 +134,8 @@ export interface PromoState {
   quotaWindowTokens: number
   /** 促销单次 max_tokens（§1.5 A7） */
   maxTokens: number
+  /** 促销链单次上游超时（ms；见 PROMO_TIMEOUT_MS_DEFAULT 的事故说明） */
+  timeoutMs: number
   /** 是否配了至少一把 `DS_POOL_KEY_<n>`（**不含**任何 secret，只判数量） */
   keyCount: number
   /** 状态来自 KV 还是仅 env（KV 不可用 → degraded；此时按 env 判定，fail-open 到"能用就用"） */
@@ -221,6 +238,8 @@ export function resolvePromoState(args: {
     envNumber(env, "PROMO_QUOTA_WINDOW_TOKENS", PROMO_QUOTA_WINDOW_TOKENS_DEFAULT),
   )
   const maxTokens = Math.floor(envNumber(env, "PROMO_LLM_MAX_TOKENS", PROMO_MAX_TOKENS_DEFAULT))
+  // 促销链超时单独配（默认 60s）：见 PROMO_TIMEOUT_MS_DEFAULT 的线上事故说明 —— 深度思考常超 20s
+  const timeoutMs = Math.max(5_000, Math.floor(envNumber(env, "PROMO_TIMEOUT_MS", PROMO_TIMEOUT_MS_DEFAULT)))
   const envEndAt = envNumber(env, "PROMO_END_AT", 0)
   const days = envNumber(env, "PROMO_DAYS", PROMO_DAYS_DEFAULT)
   // 期限：env 明确给了就按 env；否则"首次被读到"的 started_at（KV 写入）+ N 天；都没有 → 不设期限
@@ -261,6 +280,7 @@ export function resolvePromoState(args: {
     remainingCny: Math.max(0, budgetCny - spentCny),
     quotaWindowTokens,
     maxTokens,
+  timeoutMs,
     keyCount,
     degraded: args.degraded === true,
   }

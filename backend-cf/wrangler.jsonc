@@ -64,6 +64,7 @@
     "PROMO_QUOTA_WINDOW_TOKENS": "1000000",
     "PROMO_LLM_MAX_TOKENS": "4000",
     "PROMO_DAYS": "30",
+    "PROMO_TIMEOUT_MS": "60000",   // 促销链超时（思考时用；不思考固定 25s 快速回退）
     // 免费链输出上限（A7：800 → 1000；env 只能在硬上限 8192 内调）
     "LLM_MAX_TOKENS": "1000",
     // 匿名也允许向量检索（仅靠限流挡滥用）；要改成"仅回退"把这里设 "1"

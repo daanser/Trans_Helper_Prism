@@ -29,8 +29,7 @@ import {
   resetPromoCache,
   resolvePromoState,
   setPromoKeyDenied,
-  type PromoKvStore,
-} from "../src/promo"
+  type PromoKvStore, PROMO_TIMEOUT_NO_THINKING_MS, PROMO_TIMEOUT_MS_DEFAULT} from "../src/promo"
 import { parseMergedKeys } from "../src/keypool"
 import { poolKeysEnv } from "./poolKeysEnv"
 
@@ -262,6 +261,21 @@ describe("④ 状态读取 / 预算累计 / 收闸 / 对账（KV 层）", () => 
     const tiny = await reconcileSpentCny(kv, 2.00005, 4)
     expect(tiny).toMatchObject({ ok: true, wrote: false })
     expect(tiny.spentCny).toBeCloseTo(2, 9)
+  })
+})
+
+describe("促销链超时（2026-09-13 事故回归：思考常超 20s 导致静默回退）", () => {
+  it("默认 60s；PROMO_TIMEOUT_MS 可覆盖；下限 5s 兜底", async () => {
+    const st = await resolvePromoState({ kv: undefined, keys: DS_KEYS, nowMs: 1, env: {} } as never)
+    expect(st.timeoutMs).toBe(60_000)
+    const st2 = await resolvePromoState({ kv: undefined, keys: DS_KEYS, nowMs: 1, env: { PROMO_TIMEOUT_MS: "90000" } } as never)
+    expect(st2.timeoutMs).toBe(90_000)
+    const st3 = await resolvePromoState({ kv: undefined, keys: DS_KEYS, nowMs: 1, env: { PROMO_TIMEOUT_MS: "1" } } as never)
+    expect(st3.timeoutMs).toBeGreaterThanOrEqual(5_000)
+  })
+  it("不开思考时用更短的 25s 窗口（快速回退）", () => {
+    expect(PROMO_TIMEOUT_NO_THINKING_MS).toBe(25_000)
+    expect(PROMO_TIMEOUT_NO_THINKING_MS).toBeLessThan(PROMO_TIMEOUT_MS_DEFAULT)
   })
 })
 
