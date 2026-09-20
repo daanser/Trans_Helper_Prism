@@ -48,13 +48,43 @@
       </p>
     </section>
 
+    <!-- 为什么 Mio 不参与 AI 伴读（CC BY-ND 4.0）——AI 伴读卡片上的「为什么？」链接指向这里 -->
+    <section id="mio-companion" class="mb-8 rounded-2xl border border-surface-border bg-surface p-5 shadow-card">
+      <h2 class="mb-3 text-base font-semibold text-ink-title">为什么 Mio MtF Wiki 不参与 AI 伴读</h2>
+      <ul class="list-disc space-y-1.5 pl-5 text-sm leading-relaxed text-ink-body">
+        <li>
+          Mio MtF Wiki 采用 <strong>CC BY-ND 4.0</strong> 许可，其中的 <strong>ND（NoDerivatives，禁止演绎）</strong>
+          条款不允许演绎——把原文交给模型做摘要、改写或摘编，都属于演绎。
+        </li>
+        <li>
+          但<strong>检索本身不受影响</strong>：建立索引、把文章编码成向量属于技术处理，
+          不在该许可所限制的演绎之列（Mio MtF Wiki 的许可说明也是这样界定的）。
+        </li>
+        <li>
+          所以 <strong>Mio 的内容照样能被搜到、照样能点进原文</strong>，
+          但<strong>不会进入 AI 伴读的上下文</strong>，也不会出现在 <span class="font-medium">[来源n]</span> 引用里。
+        </li>
+        <li>
+          AI 要点里的引用编号因此<strong>可能不连续</strong>（例如 1、3、4、5、6、7）——
+          那是跳过了 Mio 的条目，不是显示错误。
+        </li>
+        <li>
+          其余三个 wiki（MtF / FtM / RLE）采用 <strong>CC BY-SA 4.0</strong>，允许演绎，正常参与 AI 伴读。
+        </li>
+      </ul>
+    </section>
+
     <!-- 怎么工作 -->
     <section class="mb-8 rounded-2xl border border-surface-border bg-surface p-5 shadow-card">
       <h2 class="mb-3 text-base font-semibold text-ink-title">它是怎么工作的</h2>
       <ol class="list-decimal space-y-2 pl-5 text-sm leading-relaxed text-ink-body">
         <li><strong>向量检索</strong>：用 <code class="rounded bg-canvas-subtle px-1">BAAI/bge-m3</code> 把查询与文档片段编码成向量，在 Qdrant 里找语义相近的片段（中文、长文本都适用）。</li>
         <li><strong>重排</strong>：对候选片段用 <code class="rounded bg-canvas-subtle px-1">BAAI/bge-reranker-v2-m3</code> 重新打分，把最相关的排到前面（默认开启，可在搜索面板关闭以换取更快响应）。</li>
-        <li><strong>AI 伴读</strong>：把命中的片段交给 <code class="rounded bg-canvas-subtle px-1">Qwen3.5-4B</code>，要求它<strong>只依据给定片段</strong>作答、逐条标注 <span class="font-medium">[来源n]</span>，并支持最多 10 轮追问。</li>
+        <li>
+          <strong>AI 伴读</strong>：把命中的片段交给 <code class="rounded bg-canvas-subtle px-1">Qwen3.5-4B</code>，
+          要求它<strong>只依据给定片段</strong>作答、逐条标注 <span class="font-medium">[来源n]</span>，并支持最多 10 轮追问。
+          Mio MtF Wiki 因许可原因<strong>不参与</strong>（<a href="#mio-companion" class="text-primary hover:underline">为什么？</a>）。
+        </li>
         <li><strong>降级兜底</strong>：AI 或向量服务不可用时，会自动退回关键词检索，搜索本身不会因此不可用。</li>
       </ol>
     </section>
@@ -124,6 +154,13 @@
             rel="noopener noreferrer"
             class="text-primary hover:underline"
           >daanser/Trans_Helper_Prism</a>
+        </li>
+        <li>
+          本项目采用<strong>复合许可</strong>：代码为 GPL-3.0；由本项目生成的<strong>向量索引数据</strong>按上游 wiki 的许可处理
+          —— MtF / FtM / RLE 三库为 <strong>CC BY-SA 4.0</strong>，Mio MtF Wiki 为 <strong>CC BY-ND 4.0</strong>（不分发其向量数据）。
+          向量库本身不随仓库分发（体积与付费向量服务所限），但<strong>复现方法公开</strong>：
+          用开放权重的 <code class="rounded bg-canvas-subtle px-1">BAAI/bge-m3</code> 在 <strong>1024 维</strong>
+          对各 wiki 的 <code class="rounded bg-canvas-subtle px-1">.md</code> 文件向量化即可重建。
         </li>
         <li>感谢四个 wiki 的作者、译者与维护者 —— 没有他们的整理，这个工具没有内容可检索。</li>
         <li>运行在 Cloudflare Workers / Pages（计算）、Qdrant Cloud（向量库）、硅基流动（向量、重排与对话模型）之上。</li>

@@ -89,6 +89,8 @@ import { fetchUsageSummary, parseUsageDays } from "./usagestats"
 import { normalizeChatEndpoint } from "./llm"
 import {
   buildPrompt,
+  COMPANION_NO_ELIGIBLE_SOURCE_NOTICE,
+  COMPANION_NO_FRAGMENT_NOTICE,
   createChatProvider,
   createPromoChatProvider,
   isLlmUnavailable,
@@ -99,6 +101,7 @@ import {
   type LlmSummary,
   type LlmUsage,
 } from "./llm"
+import { isCompanionEligible } from "./wiki_registry"
 import { appendRound, createSession, historyToMessages, isMaxRounds, loadContext } from "./chat"
 import {
   callCustomModel,
@@ -294,9 +297,21 @@ function applyDeniedToPool(pool: KeyPool, denied: DeniedPools, poolName: "llm" |
   }
 }
 
-/** SearchHit → LLM 输入（截断由 llm.ts 内部负责）。 */
+/**
+ * SearchHit → LLM 输入（**来源过滤**与条数截断都由 llm.ts 的 `selectHits` 负责）。
+ *
+ * 这里给每条打上它在**完整检索结果**中的 1-based 序号：过滤掉不可伴读来源（Mio）后，
+ * `[来源n]` 仍须指向结果列表里的原始位置（前端 `pool[n-1]` 回跳），因此编号**不能重排**。
+ */
 function toLlmHits(hits: SearchResponse["hits"]): LlmHit[] {
-  return hits.map((h) => ({ id: h.id, title: h.title, url: h.url, source: h.source, text: h.snippet }))
+  return hits.map((h, i) => ({
+    id: h.id,
+    title: h.title,
+    url: h.url,
+    source: h.source,
+    text: h.snippet,
+    index: i + 1,
+  }))
 }
 
 /** 未登录是否强制只走关键词回退（plan §2 登录制；REQUIRE_LOGIN=0 可关闭）。 */
@@ -1001,6 +1016,18 @@ api.post("/search/stream", async (c) => {
           return
         }
 
+        // 命中**全部来自不可伴读来源**（当前即 Mio，CC BY-ND 4.0 不允许演绎）→ 根本不调模型：
+        // 既不对禁止演绎的内容做总结/改写，也不白花一次调用。检索结果已在上面的 hits 事件里返回。
+        const companionHits = llmHits.filter((h) => isCompanionEligible(h.source))
+        if (llmHits.length > 0 && companionHits.length === 0) {
+          console.warn("[companion] 命中全部来自不可伴读来源，跳过 LLM 调用")
+          controller.enqueue(
+            sse("notice", { code: "no-companion-source", notice: COMPANION_NO_ELIGIBLE_SOURCE_NOTICE }),
+          )
+          controller.enqueue(sse("done", { llm: false, companion_excluded: true }))
+          return
+        }
+
         const ctx = await createSession(
           c.env.DB,
           session.sub,
@@ -1115,6 +1142,20 @@ api.post("/chat", async (c) => {
   if (!ctx) return c.json({ error: "session-not-found" }, 404)
   if (ctx.accountId !== session.sub) return c.json({ error: "forbidden" }, 403)
   if (isMaxRounds(ctx)) return c.json({ error: "max-rounds", notice: "已满 10 轮，请开新会话" }, 409)
+
+  // 会话里一条可伴读片段都没有（首轮命中全被来源过滤掉，如全来自 Mio）→ 不调模型、不扣额度、不写历史。
+  // 必须在 appendRound 之前返回，否则会留下一条「有问无答」的历史。
+  if (ctx.initialHits.length === 0) {
+    return c.json({
+      text: COMPANION_NO_FRAGMENT_NOTICE,
+      citations: [],
+      model: "",
+      tokens_in: 0,
+      tokens_out: 0,
+      estimated: false,
+      companion_excluded: true,
+    })
+  }
 
   const appended = await appendRound(c.env.DB, sessionId, "user", question, Date.now())
   if (!appended.ok) return c.json({ error: appended.reason }, appended.reason === "max-rounds" ? 409 : 400)

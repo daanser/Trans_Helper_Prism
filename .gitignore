@@ -25,5 +25,8 @@ coverage/
 .vscode/
 .idea/
 
+# ── AI 工作目录（本地 memory / 会话数据，不入库）──
+.workbuddy-ai/
+
 # 运行时状态（checkpoint 等）
 .ingest/

@@ -99,6 +99,8 @@ function rowToContext(row: ChatSessionRow): ChatContext {
     url: h?.url,
     source: h?.source,
     text: typeof h?.text === "string" ? h.text : "",
+    // 引用编号必须随会话一起往返：丢了它，追问时的 [来源n] 会退化成 1..n 并指到错误的卡片。
+    ...(typeof h?.index === "number" && Number.isInteger(h.index) && h.index > 0 ? { index: h.index } : {}),
   }))
   const history = safeParseArray<ChatRound>(row.history)
     .filter((r) => r && (r.role === "user" || r.role === "assistant") && typeof r.content === "string")

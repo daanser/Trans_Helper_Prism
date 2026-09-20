@@ -10,7 +10,7 @@
 - **线上站点**：<https://search.chengxi.moe>，<https://search.transhelper.org>
 - **浏览器访问的一切都在自有域名下**：`/api/*` 由 Pages Function 同源反代到 Worker（`*.workers.dev` 在墙内被拦，仅用于服务端内部调用）
 - **使用说明与免责**：<https://search.chengxi.moe/about>
-- **许可证**：[GPL-3.0-or-later](./LICENSE)
+- **许可证**：复合许可 —— 代码 [GPL-3.0-or-later](./LICENSE)，索引数据见 [`LICENSE-DATA.md`](./LICENSE-DATA.md)
 
 ---
 
@@ -25,6 +25,7 @@
 | KV 缓存 | 相同 query + 库 + 条数 **1 小时**内命中缓存，跳过 embedding 与向量检索（`timings.cached=true`） |
 | 超时熔断 / 降级 | 上游各自独立超时；单库失败不影响其它库；全挂时自动降级为 **Qdrant 全文索引**（零 embedding，`fallback:true`） |
 | AI 伴读 | `Qwen/Qwen3.5-4B`（默认关闭思考链）SSE 流式，**只依据检索片段**并逐条标 `[来源n]`（可点回原文）；多轮追问上限 10 轮 |
+| AI 伴读 · 来源白名单 | **Mio MtF Wiki 不参与伴读**（CC BY-ND 4.0 不允许演绎）：跳过其条目后**顺延补齐**到 6 条，引用编号保留原始序号（可能不连续，如 1/3/4/5/6/7）；全部命中都来自 Mio 时不调模型 |
 | 账号 | X OAuth 2.0 + PKCE → 无状态 JWT；**DB 只存 `sha256(x_id)`**，不存 X 明文，不收邮箱/手机号 |
 | 配额 | **滚动 5 小时窗口 + 加权 token**，窗口**按注册时间网格锚定**（重置时刻固定可预测）；前端只显示百分比 + 「x 小时后重置」 |
 | 分档限流 | 按来源分档（见下）；**突发 20 次/10 秒 → 硬封 60 秒**；全局匿名熔断**软 300 / 硬 600** |
@@ -289,4 +290,16 @@ curl -X POST https://search.chengxi.moe/api/v1/admin/db/apply-schema \
 
 ## 许可
 
-[GPL-3.0-or-later](./LICENSE)。条目内容版权归各 wiki 原作者所有，本项目仅做检索索引；医疗指引请以执业医生诊断为准。
+本项目采用**复合许可**（完整说明见 [`LICENSE-DATA.md`](./LICENSE-DATA.md)）：
+
+| 对象 | 许可 |
+|---|---|
+| 代码（`backend-cf/`、`frontend/`、`scripts/`、`.github/` 等） | [GPL-3.0-or-later](./LICENSE) |
+| 向量索引数据 · MtF / FtM / RLE 三库 | [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) |
+| 向量索引数据 · Mio MtF Wiki | [CC BY-ND 4.0](https://creativecommons.org/licenses/by-nd/4.0/)（**不对外分发**，且**不参与 AI 伴读**） |
+| 各 wiki 条目原文 | 版权归原作者与译者所有，本项目仅做检索索引 |
+
+**向量库不随仓库分发**（体积大 + Qdrant Cloud 按量计费、访问凭据不公开），但**复现方法公开**：
+用开放权重的 `BAAI/bge-m3` 在 **1024 维**下对各 wiki 的 `.md` 文件向量化即可重建（脚本见 `backend-cf/scripts/`）。
+
+医疗指引请以执业医生诊断为准。

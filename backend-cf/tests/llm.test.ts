@@ -97,6 +97,69 @@ describe("buildPrompt（纯函数：截断 + 防胡说约束 + 引用锚点）",
     expect(built.messages[built.messages.length - 1].content).not.toContain("【片段7】")
   })
 
+  // ── 来源过滤（Mio 的 CC BY-ND 不允许演绎 → 不进伴读上下文）──
+  it("跳过不可伴读来源并从后面顺延补齐到 6 条，引用编号保留原始序号", () => {
+    // 第 2 条来自 Mio → 跳过，由第 7 条补上；总数仍是 6（不是 5）。
+    const hits: LlmHit[] = makeHits(8).map((h, i) => ({ ...h, index: i + 1 }))
+    hits[1] = { ...hits[1], source: "miomtfwiki" }
+    const built = buildPrompt(hits, "HRT 是什么？")
+
+    expect(built.usedHits).toBe(6)
+    expect(built.excludedHits).toBe(1)
+    expect(built.droppedHits).toBe(1) // 8 条 → 剔 1 条 Mio → 7 条可用 → 取 6 → 丢 1
+    expect(built.citations.map((c) => c.index)).toEqual([1, 3, 4, 5, 6, 7])
+    expect(built.citations.map((c) => c.label)).toEqual([
+      "来源1",
+      "来源3",
+      "来源4",
+      "来源5",
+      "来源6",
+      "来源7",
+    ])
+
+    const user = built.messages[built.messages.length - 1].content
+    expect(user).toContain("【片段1】")
+    expect(user).not.toContain("【片段2】") // Mio 那条彻底不出现
+    expect(user).toContain("【片段7】") // 顺延补上来的那条
+    expect(user).not.toContain("【片段8】") // 超出 6 条上限
+  })
+
+  it("展示名（Mio MtF Wiki）同样被识别为不可伴读来源", () => {
+    const hits: LlmHit[] = [
+      { text: "甲", source: "Mio MtF Wiki", index: 1 },
+      { text: "乙", source: "mtf-wiki", index: 2 },
+    ]
+    const built = buildPrompt(hits, "问题")
+    expect(built.excludedHits).toBe(1)
+    expect(built.citations.map((c) => c.index)).toEqual([2])
+  })
+
+  it("来源缺失或未知时一律放行（fail-open，不因字段缺失让伴读瘫掉）", () => {
+    const built = buildPrompt(
+      [
+        { text: "无来源字段", index: 1 },
+        { text: "将来新增的库", source: "some-future-wiki", index: 2 },
+      ],
+      "问题",
+    )
+    expect(built.usedHits).toBe(2)
+    expect(built.excludedHits).toBe(0)
+  })
+
+  it("全部命中都不可伴读时一条也不塞入 prompt（调用方据此短路，不调模型）", () => {
+    const hits: LlmHit[] = makeHits(3).map((h, i) => ({ ...h, source: "miomtfwiki", index: i + 1 }))
+    const built = buildPrompt(hits, "问题")
+    expect(built.usedHits).toBe(0)
+    expect(built.excludedHits).toBe(3)
+    expect(built.citations).toHaveLength(0)
+    expect(built.messages[built.messages.length - 1].content).toContain("没有任何检索片段可用")
+  })
+
+  it("没有 index 时退化为片段自身序号（保持旧行为，向后兼容）", () => {
+    const built = buildPrompt(makeHits(3), "问题")
+    expect(built.citations.map((c) => c.index)).toEqual([1, 2, 3])
+  })
+
   it("每条 hit 正文截断到 600 字以内，且计数 truncatedHits", () => {
     const built = buildPrompt(makeHits(1, 2_000), "问题")
     expect(LLM_HIT_MAX_CHARS).toBe(600)

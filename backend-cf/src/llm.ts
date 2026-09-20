@@ -22,6 +22,8 @@ import {
 } from "./keypool"
 import { defaultFetch, estimateTokens } from "./embeddings"
 import { promoKeyVarOptions } from "./promo"
+// 来源可用性（哪些 wiki 允许进 LLM 上下文）由注册表统一裁决，见 wiki_registry.ts 的 `ai_companion`。
+import { isCompanionEligible } from "./wiki_registry"
 
 // ─────────────────────────────────────────────
 // 常量（可调项集中在此，单测直接断言）
@@ -70,6 +72,16 @@ export const LLM_QUESTION_MAX_CHARS = 1_000
 export const LLM_MAX_HISTORY_MESSAGES = 20
 /** 池全灭时的降级提示文案（§8.1/§8.5）。 */
 export const LLM_UNAVAILABLE_NOTICE = "AI总结暂不可用"
+/**
+ * 命中**全部来自不可伴读来源**（当前即 Mio MtF Wiki，CC BY-ND 4.0 不允许演绎）时的提示。
+ * 这种情况**根本不调用模型**：既避免演绎他人禁止演绎的内容，也不白花一次调用。
+ */
+export const COMPANION_NO_ELIGIBLE_SOURCE_NOTICE =
+  "本次命中的条目全部来自 Mio MtF Wiki（该站采用 CC BY-ND 4.0，不参与 AI 伴读），没有可用于总结的片段。" +
+  "检索结果本身不受影响，可直接查阅原文。"
+/** 会话里没有任何可伴读片段时的提示（多轮追问路径用）。 */
+export const COMPANION_NO_FRAGMENT_NOTICE =
+  "本次会话没有可用于 AI 伴读的片段（Mio MtF Wiki 不参与 AI 伴读）。检索结果不受影响。"
 
 /**
  * system prompt：防胡说硬约束。改这里前先读 plan.md §8.3 第 1 条与 tasks.md T3.4 验收
@@ -104,6 +116,15 @@ export interface LlmHit {
   text: string
   /** 来源库名（如 mtf-wiki） */
   source?: string
+  /**
+   * 该条在**完整检索结果列表**中的 1-based 序号（`toLlmHits` 赋值）。
+   *
+   * 为什么需要：不可伴读的来源（Mio，CC BY-ND）会被跳过，但**引用编号必须保留原始序号**，
+   * 否则前端 `[来源n]` 的 `pool[n-1]` 会指到错误的卡片。跳过 Mio 后的编号因此可能是
+   * `1,3,4,5,6,7` 这种不连续的序列 —— 这是**有意为之**，不是 bug。
+   * 缺省时退化为「在本次片段中的位置」（i+1），即旧行为。
+   */
+  index?: number
 }
 
 /** OpenAI 兼容消息。 */
@@ -114,7 +135,10 @@ export interface ChatMessage {
 
 /** 引用锚点：前端据 index 渲染 `[来源n]` 并回跳到对应 hit。 */
 export interface CitationRef {
-  /** 1-based，与 prompt 里的【片段n】/[来源n] 一一对应 */
+  /**
+   * 1-based，与 prompt 里的【片段n】/[来源n] 一一对应。
+   * 取 `LlmHit.index`（**完整检索结果里的原始序号**）—— 跳过不可伴读来源后**可能不连续**。
+   */
   index: number
   /** 展示标签，如 "来源1" */
   label: string
@@ -131,10 +155,12 @@ export interface PromptBuild {
   citations: CitationRef[]
   /** 实际塞入的 hit 条数（≤ LLM_MAX_HITS） */
   usedHits: number
-  /** 因超过 LLM_MAX_HITS 被丢弃的 hit 条数 */
+  /** 因超过 LLM_MAX_HITS 被丢弃的 hit 条数（**不含**被来源过滤掉的那些） */
   droppedHits: number
   /** 因超过 LLM_HIT_MAX_CHARS 被截断的 hit 条数 */
   truncatedHits: number
+  /** 因来源不可伴读（`ai_companion: false`，如 Mio 的 CC BY-ND）被**整体排除**的 hit 条数 */
+  excludedHits: number
 }
 
 /**
@@ -283,13 +309,22 @@ export function truncateText(text: string, max: number): string {
   return s.slice(0, Math.max(0, max - 1)) + "…"
 }
 
-/** 取前 LLM_MAX_HITS 条 hit 并逐条截断，返回用于 prompt 的片段。 */
+/**
+ * 选出送进 prompt 的片段：**先按来源过滤**（跳过 `ai_companion: false` 的库，如 Mio），
+ * 再从剩下的里取前 LLM_MAX_HITS 条并逐条截断。
+ *
+ * 「先过滤、再取前 N 条」就是需求里的**顺延补齐**：当第 2 条是 Mio 时，会拿第 7 条补上来，
+ * 总数仍是 6 条（而不是被削成 5 条）。编号由 `LlmHit.index` 保留**原始序号**，所以可能不连续。
+ */
 export function selectHits(hits: readonly LlmHit[]): {
   hits: LlmHit[]
   droppedHits: number
   truncatedHits: number
+  excludedHits: number
 } {
-  const usable = (hits ?? []).filter((h) => h && typeof h.text === "string" && h.text.trim() !== "")
+  const all = (hits ?? []).filter((h) => h && typeof h.text === "string" && h.text.trim() !== "")
+  const usable = all.filter((h) => isCompanionEligible(h.source))
+  const excludedHits = all.length - usable.length
   const kept = usable.slice(0, LLM_MAX_HITS)
   let truncatedHits = 0
   const out = kept.map((h) => {
@@ -297,13 +332,20 @@ export function selectHits(hits: readonly LlmHit[]): {
     if (text.length > LLM_HIT_MAX_CHARS) truncatedHits++
     return { ...h, text: truncateText(text, LLM_HIT_MAX_CHARS) }
   })
-  return { hits: out, droppedHits: Math.max(0, usable.length - kept.length), truncatedHits }
+  return { hits: out, droppedHits: Math.max(0, usable.length - kept.length), truncatedHits, excludedHits }
+}
+
+/** 引用编号：优先用 hit 自带的原始序号（`index`），缺失时退化为「本次片段中的位置」。 */
+function citationNumber(hit: LlmHit, fallback: number): number {
+  const n = hit?.index
+  return typeof n === "number" && Number.isInteger(n) && n > 0 ? n : fallback
 }
 
 /**
  * 构造总结/追问的 prompt（纯函数，无网络、无副作用）。
+ * - 来源过滤：`ai_companion: false` 的库（Mio，CC BY-ND）**整条排除**，并**顺延补齐**到 6 条；
  * - hits 截断：每条 ≤ LLM_HIT_MAX_CHARS、最多 LLM_MAX_HITS 条；
- * - 编号即 `[来源n]` 的 n，与 citations 一一对应（前端回跳用）；
+ * - 编号即 `[来源n]` 的 n，取 hits 的**原始序号**（过滤后可能不连续），与 citations 一一对应（前端回跳用）；
  * - history 只保留最近 LLM_MAX_HISTORY_MESSAGES 条（§8.4 最多 10 轮）。
  */
 export function buildPrompt(
@@ -311,19 +353,23 @@ export function buildPrompt(
   question: string,
   history: readonly ChatMessage[] = [],
 ): PromptBuild {
-  const { hits: kept, droppedHits, truncatedHits } = selectHits(hits)
+  const { hits: kept, droppedHits, truncatedHits, excludedHits } = selectHits(hits)
+
+  // 引用编号 = 该条在**完整检索结果**里的原始序号（跳过不可伴读来源后可能不连续，如 1,3,4,5,6,7）。
+  // 绝不重排成 1..n —— 前端 `[来源n]` 靠 `pool[n-1]` 回跳，重排会指到错误卡片。
+  const numbers = kept.map((h, i) => citationNumber(h, i + 1))
 
   const citations: CitationRef[] = kept.map((h, i) => ({
-    index: i + 1,
-    label: `来源${i + 1}`,
-    title: (h.title ?? "").trim() || `片段${i + 1}`,
+    index: numbers[i],
+    label: `来源${numbers[i]}`,
+    title: (h.title ?? "").trim() || `片段${numbers[i]}`,
     url: h.url,
     id: h.id,
   }))
 
   const fragmentLines: string[] = []
   kept.forEach((h, i) => {
-    const n = i + 1
+    const n = numbers[i]
     const head = [`【片段${n}】`, h.title ? `标题：${h.title.trim()}` : "", h.source ? `来源库：${h.source}` : "", h.url ? `链接：${h.url}` : ""]
       .filter(Boolean)
       .join(" ")
@@ -332,7 +378,8 @@ export function buildPrompt(
 
   const contextBlock =
     kept.length > 0
-      ? `检索片段如下（共 ${kept.length} 条，引用时写 [来源1]…[来源${kept.length}]）：\n\n${fragmentLines.join("\n\n")}`
+      ? `检索片段如下（共 ${kept.length} 条；编号是各片段在完整检索结果中的原始序号，**可能不连续**，` +
+        `引用时照写 [来源n]）：\n\n${fragmentLines.join("\n\n")}`
       : "本次没有任何检索片段可用。按硬性规则第 4 条，直接回答「根据现有片段无法回答」。"
 
   const userContent = `${contextBlock}\n\n【用户问题】\n${truncateText(question, LLM_QUESTION_MAX_CHARS)}`
@@ -355,6 +402,7 @@ export function buildPrompt(
     usedHits: kept.length,
     droppedHits,
     truncatedHits,
+    excludedHits,
   }
 }
 

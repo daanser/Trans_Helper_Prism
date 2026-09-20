@@ -3,10 +3,12 @@
 // 覆盖：collectionName 映射（横杠→下划线）、四库配置齐全且非空、isValidCorpus 判真/假、listWikis 稳定排序。
 import { describe, it, expect } from "vitest"
 import {
+  COMPANION_EXCLUDED_WIKI_IDS,
   DEFAULT_WIKIS,
   VALID_WIKI_IDS,
   collectionName,
   getWiki,
+  isCompanionEligible,
   isValidCorpus,
   listWikis,
   buildCorporaResponse,
@@ -59,6 +61,38 @@ describe("四库默认配置", () => {
       miomtfwiki: "main",
     }
     for (const w of DEFAULT_WIKIS) expect(w.branch).toBe(branchById[w.id])
+  })
+})
+
+describe("AI 伴读资格（ai_companion）", () => {
+  it("只有 Mio 被排除，其余三库可伴读", () => {
+    const byId = new Map(DEFAULT_WIKIS.map((w) => [w.id, w]))
+    expect(byId.get("mtf-wiki")?.ai_companion).toBe(true)
+    expect(byId.get("ftm-wiki")?.ai_companion).toBe(true)
+    expect(byId.get("rle-wiki")?.ai_companion).toBe(true)
+    // CC BY-ND 4.0（不允许演绎）→ 不参与 AI 伴读
+    expect(byId.get("miomtfwiki")?.ai_companion).toBe(false)
+  })
+
+  it("COMPANION_EXCLUDED_WIKI_IDS 由 ai_companion:false 派生", () => {
+    expect([...COMPANION_EXCLUDED_WIKI_IDS]).toEqual(["miomtfwiki"])
+  })
+
+  it("isCompanionEligible：id 与展示名都识别，未知/空来源放行", () => {
+    expect(isCompanionEligible("miomtfwiki")).toBe(false)
+    expect(isCompanionEligible("Mio MtF Wiki")).toBe(false)
+    expect(isCompanionEligible("mtf-wiki")).toBe(true)
+    expect(isCompanionEligible("ftm-wiki")).toBe(true)
+    expect(isCompanionEligible("rle-wiki")).toBe(true)
+    expect(isCompanionEligible("")).toBe(true)
+    expect(isCompanionEligible(undefined)).toBe(true)
+    expect(isCompanionEligible(null)).toBe(true)
+    expect(isCompanionEligible("some-future-wiki")).toBe(true)
+  })
+
+  it("检索侧白名单不受影响：Mio 仍是合法 corpus", () => {
+    expect(VALID_WIKI_IDS).toContain("miomtfwiki")
+    expect(isValidCorpus("miomtfwiki")).toBe(true)
   })
 })
 
