@@ -168,6 +168,22 @@ describe("chat_sessions：创建 / 读取 / 轮次上限 / 截断 / 缺 D1 降�
     expect(JSON.parse(String(row.corpora))).toEqual(["mtf-wiki", "rle-wiki"])
   })
 
+  it("创建会话：跳过不可伴读来源（Mio）并保留引用原始序号，loadContext 往返不丢 index", async () => {
+    const { db } = makeChatDb()
+    const hits: LlmHit[] = [
+      { id: "h1", title: "甲", url: "https://mtf.wiki/a", source: "mtf-wiki", text: "正文1", index: 1 },
+      { id: "h2", title: "乙", url: "https://mio.chengxi.moe/b", source: "miomtfwiki", text: "正文2", index: 2 },
+      { id: "h3", title: "丙", url: "https://rle.wiki/c", source: "rle-wiki", text: "正文3", index: 3 },
+    ]
+    const ctx = await createSession(db, "acc-1", "default", ["mtf-wiki", "miomtfwiki", "rle-wiki"], hits, 0)
+    expect(ctx!.initialHits.map((h) => h.source)).toEqual(["mtf-wiki", "rle-wiki"])
+    // 编号保留原始序号（1、3），绝不重排成 1、2 —— 否则追问时 [来源n] 会指到错误的卡片
+    expect(ctx!.initialHits.map((h) => h.index)).toEqual([1, 3])
+
+    const loaded = await loadContext(db, ctx!.id)
+    expect(loaded!.initialHits.map((h) => h.index)).toEqual([1, 3])
+  })
+
   it("缺 D1 / 缺 accountId → createSession 返回 null，不抛错", async () => {
     expect(await createSession(null, "acc-1", "default", [], makeHits(1), 1)).toBeNull()
     expect(await createSession(undefined, "acc-1", "default", [], makeHits(1), 1)).toBeNull()

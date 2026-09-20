@@ -377,7 +377,10 @@ describe("D1 往返次数（性能验收：/search ≤ 5）", () => {
       model_id: "default",
       corpora: "[]",
       round_count: 0,
-      initial_hits: "[]",
+      // 会话必须带**可伴读的**首轮片段，否则会命中「无片段 → 短路 200」的新分支，走不到 LLM 调用。
+      initial_hits: JSON.stringify([
+        { id: "h1", title: "标题", url: "https://mtf.wiki/x", source: "mtf-wiki", text: "正文", index: 1 },
+      ]),
       history: "[]",
       created_at: NOW_MS,
       updated_at: NOW_MS,

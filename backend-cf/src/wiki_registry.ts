@@ -21,6 +21,14 @@ export interface WikiConfig {
   branch: string
   content_dir: string
   site_url: string
+  /**
+   * 该 wiki 的片段是否允许进入 **AI 伴读**（LLM 总结 / 多轮追问）的上下文。
+   *
+   * `false` = 上游许可**不允许演绎**（如 CC BY-ND 4.0）——「把原文交给模型总结/改写」属于演绎，
+   * 所以它的片段既不能进 prompt，也不能成为 `[来源n]` 引用。**检索本身不受影响**
+   * （建立检索索引/向量化属于技术处理，不属于演绎；Mio MtF Wiki 的许可说明亦如此界定）。
+   */
+  ai_companion: boolean
   /** 分块最大字符数（可省略：ingest 侧另有 chunk{maxChars,overlap} 参数，此字段仅为注册表备注项）。 */
   chunk_max_chars?: number
   /** embedding 批次大小（可省略：ingest 侧用 CLI --batch-size，此字段仅为注册表备注项）。 */
@@ -35,6 +43,7 @@ export const DEFAULT_WIKIS: readonly WikiConfig[] = [
     branch: "master", // MtF-wiki 默认分支是 master（实测 via GitHub defaultBranch）
     content_dir: "content/zh-cn",
     site_url: "https://mtf.wiki",
+    ai_companion: true, // CC BY-SA 4.0：允许演绎
   },
   {
     id: "ftm-wiki",
@@ -42,6 +51,7 @@ export const DEFAULT_WIKIS: readonly WikiConfig[] = [
     branch: "main",
     content_dir: "content",
     site_url: "https://ftm.wiki",
+    ai_companion: true, // CC BY-SA 4.0：允许演绎
   },
   {
     id: "rle-wiki",
@@ -49,6 +59,7 @@ export const DEFAULT_WIKIS: readonly WikiConfig[] = [
     branch: "main",
     content_dir: "docs",
     site_url: "https://rle.wiki",
+    ai_companion: true, // CC BY-SA 4.0：允许演绎
   },
   {
     id: "miomtfwiki",
@@ -56,11 +67,22 @@ export const DEFAULT_WIKIS: readonly WikiConfig[] = [
     branch: "main",
     content_dir: "docs",
     site_url: "https://mio.chengxi.moe",
+    // CC BY-ND 4.0（NoDerivatives）：**不允许演绎** —— 交给模型总结/改写属于演绎，故不参与 AI 伴读。
+    // 检索不受影响：索引/向量化属于技术处理，上游许可说明亦将 ND 限定在翻译、改写这类演绎上。
+    ai_companion: false,
   },
 ] as const
 
 /** 对外白名单：全部已注册 wiki id（与 search.ts VALID_CORPORA 保持一致）。 */
 export const VALID_WIKI_IDS: readonly string[] = DEFAULT_WIKIS.map((w) => w.id) as readonly string[]
+
+/**
+ * **不参与 AI 伴读**的 wiki id（由 `ai_companion: false` 派生，当前即 Mio MtF Wiki）。
+ * 检索、`/corpora`、知识树等一律照旧；只有「送进 LLM 上下文」这一步会排除它们。
+ */
+export const COMPANION_EXCLUDED_WIKI_IDS: readonly string[] = DEFAULT_WIKIS.filter((w) => !w.ai_companion).map(
+  (w) => w.id,
+) as readonly string[]
 
 /**
  * wiki id → Qdrant collection 名：`{id 中 - 换 _}_v1`（如 mtf-wiki → mtf_wiki_v1）。
@@ -112,6 +134,20 @@ export const WIKI_DISPLAY_NAMES: Readonly<Record<string, string>> = {
   "ftm-wiki": "FtM Wiki",
   "rle-wiki": "RLE Wiki",
   miomtfwiki: "Mio MtF Wiki",
+}
+
+/**
+ * 该来源（hit 的 `source`）是否**允许进入 AI 伴读上下文**。
+ *
+ * - 同时接受 **wiki id**（`miomtfwiki`，Qdrant payload 里 `wiki_id` 的实际取值）与**展示名**（`Mio MtF Wiki`），
+ *   两者任一命中即排除 —— 免得将来 payload 字段换了名就悄悄失效。
+ * - **未知/空来源一律放行（fail-open）**：来源字段缺失时不该让整段伴读瘫掉，与既有行为一致。
+ */
+export function isCompanionEligible(source: string | null | undefined): boolean {
+  const s = (source ?? "").trim()
+  if (s === "") return true
+  if (COMPANION_EXCLUDED_WIKI_IDS.includes(s)) return false
+  return !COMPANION_EXCLUDED_WIKI_IDS.some((id) => WIKI_DISPLAY_NAMES[id] === s)
 }
 
 /**

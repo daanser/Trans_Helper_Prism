@@ -106,6 +106,14 @@
         <span class="text-[10px] opacity-90">{{ deepThinking ? "已开启" : "未开启" }}</span>
       </button>
     </div>
+
+    <!-- Mio MtF Wiki 不参与 AI 伴读（CC BY-ND 4.0 不允许演绎）：**只在伴读卡片这里说明一次**，
+         不逐个结果条目打标（太吵）。文案刻意小一号，不抢正文。原因见 /about#mio-companion。 -->
+    <p class="mb-2 text-[11px] leading-relaxed text-ink-muted">
+      <span class="font-medium text-ink-sub">Mio MtF Wiki</span> 不参与 AI 伴读，
+      <NuxtLink to="/about#mio-companion" class="text-primary hover:underline">为什么？</NuxtLink>
+    </p>
+
     <!-- 可滚动内容区（促销行 / 模型行 / 正文 / 提示 / 引用 / 免责）：
          卡片总高受视口约束，这里 `flex-1 min-h-0` 吃满剩余高度并**独立滚动**；
          追问面板在它之外 → **永远可见**（用户反馈"输出长了追问框被挡住、还滑不下去"的根因：

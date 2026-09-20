@@ -42,6 +42,16 @@
   要改回「匿名仅关键词回退」把 `REQUIRE_LOGIN` 设 `1`。
 - admin 端点鉴权 = `Bearer <ADMIN_API_KEY>` **或** `Bearer <JWT>` 且 `role=admin`；角色在**登录时写进 JWT**，改了 `ADMIN_X_IDS` 必须**重新登录**才生效。
 - 前端约束：最小栈，不引重型 UI 库 / 重型 md 库；UI/UX 走 §6 的自定「温润学术检索」风（中文标签、中性统一徽章、无高饱和彩虹色、无全大写终端风）——此为已锁方向，改前先问用户。
+- **AI 伴读来源白名单（2026-09-20 用户拍板，别改）**：**Mio MtF Wiki 不参与 AI 伴读**。
+  依据：Mio 是 **CC BY-ND 4.0**（不允许演绎），而把原文交给模型总结/改写**属于演绎**；
+  但**检索不受影响** —— 建索引、向量化属于技术处理，Mio 的 README 明确 ND 针对的是翻译、改写这类演绎，不含技术原因导致的处理。
+  实现：`src/wiki_registry.ts` 的 `WikiConfig.ai_companion`（`miomtfwiki: false`）是**唯一真相源**，
+  派生 `COMPANION_EXCLUDED_WIKI_IDS` / `isCompanionEligible()`；`src/llm.ts` 的 `selectHits` **先过滤来源、再取前 6 条**
+  （= 顺延补齐，**不是**削成 5 条）；命中全部来自 Mio 时**不调用模型**（`COMPANION_NO_ELIGIBLE_SOURCE_NOTICE`）。
+- **许可 = 复合许可（2026-09-20）**：代码 **GPL-3.0-or-later**（根 `LICENSE` 一字未动，GitHub 仍识别 GPL-3.0）；
+  向量索引数据 MtF/FtM/RLE 为 **CC BY-SA 4.0**、Mio 为 **CC BY-ND 4.0**（不对外分发，且不参与伴读）；
+  向量库**不随仓库分发**（Qdrant 按量计费、访问凭据不公开），改为公开**复现方法**
+  （开放权重 `bge-m3` / **1024 维** / 四个 wiki 的 `.md`）。完整说明见根目录 `LICENSE-DATA.md`。
 
 ## 4. 线上现状（2026-09-09）
 - **后端**：CF Workers `transhelper-prism-backend`，经 **Git 集成**从 GitHub `main` 自动部署（root dir = `/backend-cf`，deploy = `npx wrangler deploy`）；绑定 D1 `transhelper-prism` / KV `SEARCH_CACHE` / Queue（已不消费）。`/api/v1/corpora`、`/api/v1/tree/:wiki_id`、`/api/v1/search`（POST）全通。
@@ -355,3 +365,7 @@
   但实测出现过 13–20s 的尖峰，且 `cf-ray` 显示请求被分到**远端 colo**（如 WAW）——属**链路/节点调度**波动，不是代码问题。
   若用户在浏览器看到 502，优先确认是 **CF 边缘错误页** 还是我们的 `{"error":"upstream-unreachable"}`（后者 = Pages Function 的 30s 超时）。
 - **响应头 `content-encoding: br` 是 CF 边缘二次压缩**：Pages Function 会删掉上游的 `content-encoding`，边缘再按客户端的 `accept-encoding` 重新压缩并加上该头 —— 正常现象（`curl` 不加 `--compressed` 会看到乱码）。
+- **AI 要点里的引用编号会「跳号」（如 1、3、4、5、6、7）—— 这是有意设计，不是 bug**：
+  Mio 的片段不进伴读上下文（CC BY-ND，见 §3），但编号**保留该条在完整检索结果里的原始序号**；
+  前端 `pages/index.vue` 的 `resolveCitation` 靠 `pool[n-1]` 回跳，**一旦把编号重排成 1..n 就会点错卡片**。
+  同理，「搜到 10 条但要点只用了 6 条」也是预期行为（`LLM_MAX_HITS=6` + 来源过滤）。
