@@ -474,8 +474,14 @@ POST /api/v1/admin/backfill-urls              # 存量 URL 回填（分页）
 7. 模型供应商：**硅基流动中国站一家全包**（embedding bge + rerank + Qwen3-8B）。排除：自部署（服务器比 API 贵）、
    Google 免费层（RPM 灌不动全量库）、Jina/Cohere 主力（量不够/会过期）。GLM 国际站备选（没用上，Flash 逃生可切）。
 8. 实名问题：**闲鱼成品号 + Key Pool**（embed_pool/llm_pool 分池、失败自动换 key、用量记账、<2 可用 key 告警、admin 热加载；见 §8.5）。
-9. 沿用 GPL-3.0（防 DMCA；衍生兼容）。
+9. 许可：**复合许可**（2026-09-20 修订，原「沿用 GPL-3.0」）—— 代码 **GPL-3.0-or-later**（防 DMCA；衍生兼容）；
+   向量索引数据 MtF / FtM / RLE 为 **CC BY-SA 4.0**、Mio 为 **CC BY-ND 4.0**（不对外分发，且不参与 AI 伴读）。
+   详见 [`LICENSE-DATA.md`](./LICENSE-DATA.md)。
 10. 向量库：**Qdrant 不动**，用 Qdrant Cloud 免费层；装不下才考虑 Vectorize。
+11. **不引入 Jev（TypeSafe AI 的 System One Model）**（2026-09-22 评估）：它是**结构化决策**模型（**不生成文本**），
+    与本项目的模型需求（**生成** AI 伴读 / **语义相关性打分** 重排）不重叠；重排已有开放权重 `bge-reranker-v2-m3`，
+    提示注入拦截用零成本正则。且与「单供应商长期免费」「数据出境点最小化」「开放权重可自托管」三条定位冲突。
+    完整理由见 `README.md` 的「为什么没有用 Jev」。
 
 ---
 
