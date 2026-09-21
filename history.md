@@ -1,11 +1,11 @@
 # TransHelper Prism —— 跨会话交接（history.md）
 
 > 给隔壁 subagent 看的上下文。实时 multimodel 细节以 `plan.md`（v0.2）为准，任务 DAG 以 `tasks.md` 为准。
-> ⚠️ 真实 key 永不落文件：跑导入/联调要 `QDRANT_URL / QDRANT_API_KEY / EMBED_POOL_KEYS / LLM_POOL_KEYS`（内容就是硅基流动 key，逗号分隔），找用户要，mantra：只放内存环境变量、`backend-cf/.dev.vars`（gitignored）、CF Workers Secrets、GitHub Actions Secrets，绝不提交、绝不贴报告。
+> ⚠️ 真实 key 永不落文件：跑导入/联调要 `QDRANT_URL / QDRANT_API_KEY / POOL_KEYS_0 / POOL_KEYS_1 / …`（内容就是硅基流动 key，**一把一个变量、数字递增**，见 §3「Key Pool」），找用户要，mantra：只放内存环境变量、`backend-cf/.dev.vars`（gitignored）、CF Workers Secrets、GitHub Actions Secrets，绝不提交、绝不贴报告。
 > **仓库已上 GitHub**（2026-09-09）：`https://github.com/daanser/Trans_Helper_Prism`（public，`main`）。线上：前端 `https://search.chengxi.moe`（备用 `https://transhelper-prism.pages.dev`）、后端 `https://transhelper-prism-backend.transprism.workers.dev`。
 
 ## 1. 项目一句话
-重写已死的 `transhelper-transsearch`：Qdrant 向量检索四个性别/性少数中文 wiki（MtF / FtM / RLE / Mio），Cloudflare 全家桶承载，Nuxt3 前端。GPL-3.0（根 `LICENSE` 已放，DMCA 避险；新文件头加 `// SPDX-License-Identifier: GPL-3.0-or-later`）。
+重写已死的 `transhelper-transsearch`：Qdrant 向量检索四个性别/性少数中文 wiki（MtF / FtM / RLE / Mio），Cloudflare 全家桶承载，Nuxt3 前端。**代码** GPL-3.0-or-later（根 `LICENSE` 已放，DMCA 避险；新文件头加 `// SPDX-License-Identifier: GPL-3.0-or-later`）；**向量索引数据另按上游许可分层**，整体为复合许可，见 §3 与 `LICENSE-DATA.md`。
 
 ## 2. 架构（plan §2/§3）
 - **backend-cf**（Hono + TS，Cloudflare Workers）：`src/index.ts`（路由 + Cron/Queue handler 仍在但已停用）→ `src/search.ts`（`runSearch`：校验→embedding→多 collection 并行→合并去重→timings；embedding 挂了自动切 `src/fallback.ts`）→ `src/embeddings.ts`（硅基流动）+ `src/keypool.ts`（Key Pool）→ Qdrant Cloud。`src/rerank.ts`（rerank）、`src/searchcache.ts`（KV 缓存）、`src/wiki_registry.ts`（wiki 配置）、`src/wikiUrl.ts`（官网 URL 生成）、`src/backfillUrls.ts`（存量 URL 回填）、`src/tree.ts`（知识树）。auth/配额/chat/admin 仍是 501 占位（M3）。
@@ -21,7 +21,7 @@
 
 ## 3. 已锁决策（别推翻，除非用户点头）
 - 单供应商：**硅基流动中国站**。embedding `BAAI/bge-m3`（1024 维），rerank `BAAI/bge-reranker-v2-m3`（M1 已接、默认开），chat 默认 `Qwen/Qwen3.5-4B`（0.42s）备选 `GLM-4-9B-0414`——Qwen3-8B/Z1/2.5-7B 太慢已出局（plan §8.1 有实测表）。
-- **Key Pool 是消耗品逻辑**：灰产号 key 不可轮换，挂了自动剔除、`<2` 告警补货、`/admin/keys` 热加载（M3）。pool 变量：`EMBED_POOL_KEYS / LLM_POOL_KEYS`（rerank 默认并入 llm）。
+- **Key Pool 是消耗品逻辑**：灰产号 key 不可轮换，挂了自动剔除、`<2` 告警补货、`/admin/keys` 热加载（M3）。pool 变量：`POOL_KEYS_<n>`（**合并单池**，embed/llm/rerank 共用一个池；`RERANK_POOL_KEYS` 仅作可选覆盖）。
 - Qdrant Cloud **悉尼区**（唯一 APAC 免费区），collection 名**下划线 canonical**：`mtf_wiki_v1 / ftm_wiki_v1 / rle_wiki_v1 / miomtfwiki_v1`（plan §7.1）。
 - 四 wiki + 内容目录 + **分支**（实测 GitHub defaultBranch）：`project-trans/MtF-wiki@**master**`→`content/zh-cn`（只收中文，不要 ja/zh-hant/en）、`project-trans/FtM-wiki@main`→`content/`、`project-trans/rle-wiki@main`→`docs`、`KitsuMio/MioMtFWiki@main`→`docs`。
 - **URL 规则（2026-09-09 定，已取代「URL 默认 GitHub blob」）**：`payload.url` 存**各 wiki 官网**，前端「查阅官方原文」直指官网。逐库规则（`src/wikiUrl.ts`，已浏览器实测可打开）：
@@ -59,7 +59,7 @@
 - Qdrant 四库共 **1481 points**：mtf 490 / ftm 79 / rle 836 / mio 76。payload 必含 `text`（snippet/LLM context 全靠它）+ wiki_id/path/title/section/**url（官网）**/commit_sha/chunk_index/updated_at/**blob_sha（增量比对）**。
 - 真搜 P50：embed ~0.2s + search ~1.2s（本地打悉尼），四库 1.4–2.2s；`timings.cached` 命中 KV 时跳过 embed+Qdrant。
 - **摄取**：GitHub Actions `ingest`，每日 UTC 02:00（北京 10:00）+ 手动 `workflow_dispatch`（可传 `full=true` / `wiki=<id>`）。首次全量 1481 chunk ≈2 分钟；二次运行 `upserted=0`（真增量生效）。
-- **密钥落点**：CF Workers Secrets（`EMBED_POOL_KEYS / LLM_POOL_KEYS / QDRANT_URL / QDRANT_API_KEY / ADMIN_API_KEY`）；GitHub Actions Secrets（`QDRANT_URL / QDRANT_API_KEY / EMBED_POOL_KEYS`；`GITHUB_TOKEN` 自动注入）。
+- **密钥落点**：CF Workers Secrets（`POOL_KEYS_0 / POOL_KEYS_1 / … / QDRANT_URL / QDRANT_API_KEY / ADMIN_API_KEY`）；GitHub Actions Secrets（`QDRANT_URL / QDRANT_API_KEY / POOL_KEYS_0 / POOL_KEYS_1 / …`；`GITHUB_TOKEN` 自动注入）。
 - 本地联调：后端 `:8787`（`wrangler.local.jsonc`，本地 D1/KV/Queue mock）+ 前端 `:3000`。dev 进程跨轮次会被回收，死了重起（后端要 `XDG_CONFIG_HOME=/tmp/wr-home XDG_CACHE_HOME=/tmp/wr-home`，命令禁加 `| head`）。
 - **本环境 `wrangler` 子命令坏**（`deploy/d1/whoami` 全报 `Unknown arguments: <cli.js>, <cmd>`，只有 `dev` 能跑）→ 部署走 CF Dashboard 的 Git 集成，D1/Qdrant 操作用 REST API / `curl`。
 
@@ -70,8 +70,8 @@
   `GET|POST|DELETE /api/v1/settings/models[/:id]`、`GET /api/v1/admin/usage`、`GET|POST /api/v1/admin/keys`、
   `GET /api/v1/admin/audit`、`POST /api/v1/admin/accounts/:id/ban|quota`、`POST /api/v1/admin/db/apply-schema`、
   `POST /api/v1/admin/ingest/trigger`、`POST /api/v1/admin/backfill-urls`（后两个仍 ADMIN_API_KEY-only）。
-- **Secrets 清单**：Worker = `EMBED_POOL_KEYS`/`LLM_POOL_KEYS`/`QDRANT_URL`/`QDRANT_API_KEY`/`ADMIN_API_KEY`/
-  `X_CLIENT_ID`/`X_CLIENT_SECRET`/`JWT_SECRET`/`CUSTOM_MODEL_ENC_KEY`；GitHub Actions = `QDRANT_URL`/`QDRANT_API_KEY`/`EMBED_POOL_KEYS`。
+- **Secrets 清单**：Worker = `POOL_KEYS_<n>`（合并池，一把一个变量）/`DS_POOL_KEY_<n>`（促销独立池）/`QDRANT_URL`/`QDRANT_API_KEY`/`ADMIN_API_KEY`/
+  `PROXY_SHARED_SECRET`/`X_CLIENT_ID`/`X_CLIENT_SECRET`/`JWT_SECRET`/`CUSTOM_MODEL_ENC_KEY`；GitHub Actions = `QDRANT_URL`/`QDRANT_API_KEY`/`POOL_KEYS_<n>`。
 - 前端已上线三个新页面：`/login/`、`/settings/`、`/admin/`（注意 CF Pages 对预渲染路由会 308 到带尾斜杠版本）。
 
 ## 5. 踩过的坑（新人必读，单测抓不到的）
